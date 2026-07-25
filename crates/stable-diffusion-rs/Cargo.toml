@@ -1,0 +1,25 @@
+[package]
+name = "stable-diffusion-rs"
+description = "Diffusion model inference in pure Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["stable-diffusion", "diffusion", "inference", "ml"]
+categories = ["computer-vision", "science"]
+
+[dependencies]
+sd-tensor.workspace = true
+sd-loader.workspace = true
+sd-models.workspace = true
+sd-sample.workspace = true
+thiserror.workspace = true
+image.workspace = true
+
+[features]
+default = []
+cuda = ["sd-tensor/cuda", "sd-loader/cuda", "sd-models/cuda", "sd-sample/cuda"]
+metal = ["sd-tensor/metal", "sd-loader/metal", "sd-models/metal", "sd-sample/metal"]

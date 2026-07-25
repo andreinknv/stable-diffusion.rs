@@ -1,0 +1,39 @@
+// cargo-deny configuration.
+//
+// We ship MIT. The dependency tree must stay permissive: a copyleft crate
+// sneaking in would change the licensing of the whole project, and it would do
+// so silently. This check exists to make that impossible to miss.
+
+[graph]
+all-features = false
+
+[licenses]
+version = 2
+# Permissive only. Adding to this list is a licensing decision, not a build fix.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

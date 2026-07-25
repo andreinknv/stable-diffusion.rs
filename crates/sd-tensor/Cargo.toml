@@ -1,0 +1,21 @@
+[package]
+name = "sd-tensor"
+description = "Tensor/compute seam for stable-diffusion.rs. The only crate permitted to depend on candle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+mkl = ["candle-core/mkl", "candle-nn/mkl"]

@@ -1,0 +1,20 @@
+[package]
+name = "sd-models"
+description = "Diffusion model architectures (VAE, CLIP, UNet) for stable-diffusion.rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+sd-tensor.workspace = true
+sd-loader.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+cuda = ["sd-tensor/cuda", "sd-loader/cuda"]
+metal = ["sd-tensor/metal", "sd-loader/metal"]

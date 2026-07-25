@@ -1,0 +1,31 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Model weights and generated output — never commit these.
+*.safetensors
+*.gguf
+*.ckpt
+*.bin
+*.pt
+*.pth
+/models/
+/out/
+*.png
+*.jpg
+*.jpeg
+!assets/**/*.png
+
+# Golden reference tensors are large; generated locally by xtask/golden.
+/tests/golden/**/*.safetensors
+/tests/golden/**/*.npz
+
+# Python reference environment
+__pycache__/
+*.py[cod]
+/.venv/
+/xtask/golden/.venv/
+
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,35 @@
+stable-diffusion.rs
+Copyright (c) 2026 stable-diffusion.rs contributors
+
+This project is a Rust reimplementation inspired by, and in places derived
+from, the following works. Their copyright notices are retained here as
+required by their licenses.
+
+--------------------------------------------------------------------------
+stable-diffusion.cpp
+    https://github.com/leejet/stable-diffusion.cpp
+    MIT License, Copyright (c) 2023 leejet
+
+    Model architecture layouts, weight-name conversion tables, sampler
+    formulations and quantization handling in this project were informed by
+    stable-diffusion.cpp. Where logic was ported, the corresponding source
+    file is noted in a header comment.
+
+--------------------------------------------------------------------------
+candle
+    https://github.com/huggingface/candle
+    Licensed under MIT OR Apache-2.0
+    Copyright (c) 2023 HuggingFace
+
+    Used as the tensor and compute backend via `candle-core` and `candle-nn`.
+    This project elects the MIT terms. Some model implementations were
+    informed by `candle-transformers`.
+
+--------------------------------------------------------------------------
+diffusers
+    https://github.com/huggingface/diffusers
+    Apache License 2.0, Copyright (c) HuggingFace Inc.
+
+    Used as the numerical reference implementation for the golden-tensor test
+    harness (see xtask/golden/). Module layouts and parameter naming follow
+    diffusers conventions so that pretrained weights load unmodified.

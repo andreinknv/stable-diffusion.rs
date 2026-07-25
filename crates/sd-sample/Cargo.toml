@@ -1,0 +1,18 @@
+[package]
+name = "sd-sample"
+description = "Schedulers and samplers for stable-diffusion.rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+sd-tensor.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+cuda = ["sd-tensor/cuda"]
+metal = ["sd-tensor/metal"]
