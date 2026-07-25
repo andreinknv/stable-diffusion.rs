@@ -20,6 +20,7 @@ crates/sd-models/tests/golden_unet.rs (new)
 ## Files you must NOT modify
 
 ```
+crates/sd-models/tests/api_contract.rs   <-- the API contract; never edit
 crates/sd-models/tests/golden_vae.rs
 crates/sd-models/tests/golden_unet_blocks.rs
 crates/sd-models/tests/golden_unet_attention.rs

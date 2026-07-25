@@ -83,6 +83,44 @@ pub mod ops {
         let weights = softmax_last_dim(&scores)?;
         weights.matmul(&v.contiguous()?)
     }
+
+    /// Scaled dot-product attention with an additive mask.
+    ///
+    /// `q`, `k`, `v` are `[batch, heads, seq, head_dim]`. `mask` is
+    /// broadcast-added to the scores before softmax, so masked positions
+    /// should hold a large negative value (`f32::NEG_INFINITY`) and visible
+    /// positions `0.0`.
+    ///
+    /// Needed by CLIP, which is causal. Same naive full-score-matrix caveat as
+    /// [`scaled_dot_product_attention`].
+    pub fn scaled_dot_product_attention_masked(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let dim = q.dim(D::Minus1)?;
+        let scale = 1f64 / (dim as f64).sqrt();
+        let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
+        let scores = scores.broadcast_add(mask)?;
+        let weights = softmax_last_dim(&scores)?;
+        weights.matmul(&v.contiguous()?)
+    }
+
+    /// Additive causal mask of shape `[1, 1, seq, seq]`.
+    ///
+    /// Position `(i, j)` is `0.0` when `j <= i` and `f32::NEG_INFINITY`
+    /// otherwise, ready to pass to
+    /// [`scaled_dot_product_attention_masked`].
+    pub fn causal_mask(seq: usize, device: &super::Device) -> Result<Tensor> {
+        let mut data = Vec::with_capacity(seq * seq);
+        for i in 0..seq {
+            for j in 0..seq {
+                data.push(if j <= i { 0f32 } else { f32::NEG_INFINITY });
+            }
+        }
+        Tensor::from_vec(data, (1, 1, seq, seq), device)
+    }
 }
 
 /// Device selection.
@@ -110,6 +148,78 @@ pub mod device {
     /// simultaneously is how ports stall.
     pub fn cpu() -> Device {
         Device::Cpu
+    }
+}
+
+/// Deterministic, device-independent random noise.
+///
+/// candle's `Device::set_seed` does not work on CPU (it errors with "cannot
+/// seed the CPU rng"), and its GPU RNG would not match CPU output anyway. Both
+/// make `--seed 42` mean different things on different machines, which is not
+/// acceptable for a tool whose output people share and reproduce.
+///
+/// So we generate noise ourselves and upload it. Same seed produces bit-
+/// identical latents on every device and every candle version. It costs one
+/// host-to-device copy per image, which is nothing next to a denoise loop.
+///
+/// This deliberately does *not* try to match PyTorch's `randn`. Matching torch
+/// bit-for-bit is a separate problem and not worth solving to make our own
+/// output reproducible.
+pub mod rng {
+    use super::{DType, Device, Result, Tensor};
+
+    /// splitmix64 — small, fast, and good enough for sampling noise.
+    #[derive(Debug, Clone)]
+    pub struct SeededRng {
+        state: u64,
+    }
+
+    impl SeededRng {
+        pub fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// Uniform in `(0, 1]`. Never returns 0, so `ln()` below is safe.
+        fn next_f64(&mut self) -> f64 {
+            // 53 significant bits, shifted off zero.
+            let bits = self.next_u64() >> 11;
+            (bits as f64 + 1.0) / (9007199254740992.0 + 1.0)
+        }
+
+        /// Standard normal values via Box-Muller.
+        pub fn normals(&mut self, n: usize) -> Vec<f32> {
+            let mut out = Vec::with_capacity(n);
+            while out.len() < n {
+                let u1 = self.next_f64();
+                let u2 = self.next_f64();
+                let r = (-2.0 * u1.ln()).sqrt();
+                let theta = std::f64::consts::TAU * u2;
+                out.push((r * theta.cos()) as f32);
+                if out.len() < n {
+                    out.push((r * theta.sin()) as f32);
+                }
+            }
+            out
+        }
+
+        /// A tensor of standard normal noise on `device`.
+        pub fn randn<S: Into<super::Shape>>(
+            &mut self,
+            shape: S,
+            device: &Device,
+        ) -> Result<Tensor> {
+            let shape = shape.into();
+            let data = self.normals(shape.elem_count());
+            Tensor::from_vec(data, shape, device)?.to_dtype(DType::F32)
+        }
     }
 }
 

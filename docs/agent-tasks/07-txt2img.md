@@ -21,6 +21,7 @@ crates/stable-diffusion-rs/tests/pipeline_smoke.rs  (new)
 ## Files you must NOT modify
 
 ```
+crates/sd-models/tests/api_contract.rs   <-- the API contract; never edit
 crates/sd-models/**        <-- everything you need is already public
 crates/sd-sample/**
 crates/sd-tensor/**
@@ -117,13 +118,27 @@ Linear search over 1000 entries is fine — it runs 20 times per image.
 
 ### Seeding
 
-Use a deterministic PRNG so the same seed gives the same image. `rand` is
-already available via `sd-tensor`'s dependency tree — but **do not add it to
-any `Cargo.toml`**. If it is not reachable, implement a small xorshift PRNG
-inline in `txt2img.rs` and note that in your report.
+Use `sd_tensor::rng::SeededRng`. It already exists and is already tested.
 
-Matching PyTorch's `randn` bit-for-bit is explicitly **out of scope**. Same
-seed → same image *for us* is the requirement.
+```rust
+use sd_tensor::rng::SeededRng;
+
+let mut rng = SeededRng::new(cfg.seed);
+let latent = rng.randn((1, 4, cfg.height / 8, cfg.width / 8), device)?;
+// ... and inside the loop, for the ancestral noise:
+let noise = rng.randn(latent.dims(), device)?;
+```
+
+Create the `SeededRng` **once per image**, before the loop, and draw from it in
+order — initial latent first, then one noise draw per step. Creating a new one
+inside the loop makes every step use identical noise.
+
+Three things you must not do:
+
+- **Do not use `Device::set_seed`.** It returns an error on CPU.
+- **Do not add `rand` to any `Cargo.toml`.** It is not reachable and not needed.
+- **Do not try to match PyTorch's `randn`.** Explicitly out of scope. The
+  requirement is that *our* output is reproducible, not that it matches torch.
 
 ## The CLI
 

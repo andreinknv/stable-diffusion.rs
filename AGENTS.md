@@ -138,13 +138,39 @@ Tensor::from_vec(vec, shape, dev)?   Tensor::cat(&[&a, &b], dim)?
 Arithmetic: `(&a + &b)?`, `(&a * &b)?`, `(&a - &b)?`, `(&a / &b)?`,
 and with scalars: `(&a * 2.0f64)?`, `(&a + 1.0)?`.
 
+### Random noise — `use sd_tensor::rng::SeededRng`
+
+```
+SeededRng::new(seed: u64) -> SeededRng
+    .randn(shape, &device) -> Result<Tensor>   // standard normal
+    .normals(n: usize) -> Vec<f32>
+```
+
+**Use this, never `Device::set_seed`.** candle's `set_seed` returns an error on
+CPU ("cannot seed the CPU rng"), and its GPU generator would not match CPU
+output anyway. `SeededRng` gives bit-identical results across devices.
+
+Do not add `rand` to any `Cargo.toml`. It is not reachable and you do not need
+it.
+
 ### Test helpers — `use sd_tensor::testing::{...}`
 
 ```
 assert_close(&got, &expected, atol, "label") -> Result<()>
 closeness(&a, &b) -> Result<Closeness>          // Display shows shapes + max/mean diff
+max_abs_diff(&a, &b) -> Result<f64>
 DEFAULT_ATOL  // 1e-4
 DEFAULT_RTOL  // 1e-3
+```
+
+### If you doubt whether something exists
+
+`crates/sd-models/tests/api_contract.rs` exercises every API listed above. It
+compiles and passes in CI, so everything in it is real, with the exact
+signature shown. Read it before guessing.
+
+```bash
+cargo test -p sd-models --test api_contract
 ```
 
 ---

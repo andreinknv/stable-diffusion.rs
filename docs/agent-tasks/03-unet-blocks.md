@@ -21,6 +21,7 @@ crates/sd-models/tests/golden_unet_blocks.rs  (new)
 ## Files you must NOT modify
 
 ```
+crates/sd-models/tests/api_contract.rs   <-- the API contract; never edit
 crates/sd-models/tests/golden_vae.rs
 crates/sd-models/src/vae/**
 crates/sd-tensor/**            <-- everything you need already exists

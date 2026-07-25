@@ -18,6 +18,7 @@ xtask/golden/dump_reference.py            (add the `clip_tokenizer` subcommand)
 ## Files you must NOT modify
 
 ```
+crates/sd-models/tests/api_contract.rs   <-- the API contract; never edit
 crates/sd-models/tests/*        <-- especially not these
 crates/sd-tensor/**
 crates/sd-loader/**

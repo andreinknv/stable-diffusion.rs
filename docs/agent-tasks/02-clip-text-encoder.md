@@ -11,7 +11,6 @@ Turn 77 token IDs into a `[batch, 77, 768]` conditioning tensor.
 ```
 crates/sd-models/src/clip/text_encoder.rs   (new)
 crates/sd-models/src/clip/mod.rs            (add the new exports)
-crates/sd-tensor/src/lib.rs                 (ONE addition — see below)
 xtask/golden/dump_reference.py              (add `clip_encoder` subcommand)
 crates/sd-models/tests/golden_clip_encoder.rs  (new)
 ```
@@ -21,43 +20,31 @@ crates/sd-models/tests/golden_clip_encoder.rs  (new)
 ```
 crates/sd-models/tests/golden_vae.rs
 crates/sd-models/tests/golden_clip_tokenizer.rs
+crates/sd-models/tests/api_contract.rs
 crates/sd-models/src/vae/**
+crates/sd-tensor/**       <-- everything you need is already there
 crates/sd-loader/**
 any Cargo.toml
 ```
 
 ---
 
-## The one change to `sd-tensor`
+## Masked attention already exists — do not write it
 
-CLIP needs a **causal attention mask**. `ops::scaled_dot_product_attention`
-does not support masks. Add this function next to it, in
-`crates/sd-tensor/src/lib.rs`, inside `pub mod ops`:
+CLIP is causal, and the seam already provides both pieces:
 
 ```rust
-/// Scaled dot-product attention with an additive mask.
-///
-/// `q`, `k`, `v` are `[batch, heads, seq, head_dim]`.
-/// `mask` is broadcast-added to the scores before softmax, so masked
-/// positions should be a large negative number (`f32::NEG_INFINITY`) and
-/// visible positions `0.0`.
-pub fn scaled_dot_product_attention_masked(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    mask: &Tensor,
-) -> Result<Tensor> {
-    let dim = q.dim(D::Minus1)?;
-    let scale = 1f64 / (dim as f64).sqrt();
-    let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
-    let scores = scores.broadcast_add(mask)?;
-    let weights = softmax_last_dim(&scores)?;
-    weights.matmul(&v.contiguous()?)
-}
+use sd_tensor::ops;
+
+// [1, 1, 77, 77]; 0.0 where visible, -inf where masked.
+let mask = ops::causal_mask(77, device)?;
+
+// q, k, v are [batch, heads, seq, head_dim]
+let out = ops::scaled_dot_product_attention_masked(&q, &k, &v, &mask)?;
 ```
 
-**This is the only edit permitted to `sd-tensor`.** Do not add anything else
-there. Do not import candle anywhere else.
+Build the mask **once in `new()`** and store it on the struct. Do not rebuild
+it per forward call, and do not construct the mask by hand.
 
 ---
 
@@ -223,7 +210,7 @@ you *which layer* diverged first.
 
 ```rust
 #[test] fn config_sd15_has_expected_dimensions()        // no data needed
-#[test] fn causal_mask_is_lower_triangular()            // no data needed
+#[test] fn encoder_builds_with_random_weights()         // no data needed
 #[test] fn encoder_output_shape_is_batch_77_768()       // random weights
 #[test] fn matches_transformers_reference()             // skips if data absent
 ```
@@ -260,7 +247,7 @@ cargo test --workspace
 - [ ] All four tests pass at `atol = 1e-4`
 - [ ] Every `layer_NN` matches, not just the final output
 - [ ] `git diff --stat -- crates/sd-models/tests/golden_vae.rs` empty
-- [ ] `sd-tensor` diff contains **only** `scaled_dot_product_attention_masked`
+- [ ] `crates/sd-tensor/` is untouched
 - [ ] No `Cargo.toml` changed
 
 ---
