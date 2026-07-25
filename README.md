@@ -45,13 +45,14 @@ sd ──────┤   sd-sample   ├── sd-tensor ── candle
 Everything else goes through it, enforced in CI by
 [`scripts/check-seam.sh`](scripts/check-seam.sh).
 
-**Honest caveat on "pure Rust":** our code is 100% Rust, but the build is not
-entirely free of native code. `candle-core` mandatorily depends on
-`tokenizers` with the `onig` feature, which compiles `onig_sys` (the C library
-oniguruma) and `esaxx-rs` (C++, from sentencepiece). A working C/C++ compiler
-is therefore still required — you just never invoke it yourself, and there is
-no cmake or submodule ceremony. Shedding those is one more thing the seam would
-buy us if we ever move off candle.
+**Caveat on "pure Rust":** our code is 100% Rust, but one transitive dependency
+compiles C. `candle-core` depends on `tokenizers` with the `onig` feature,
+which builds `onig_sys` — the oniguruma C regex library — so a C compiler is
+required. You never invoke it yourself, and there is still no cmake or
+submodule ceremony.
+
+This is **fixable in one line upstream**, and we have verified the fix. See
+[docs/native-deps.md](docs/native-deps.md).
 
 That keeps one option open: candle is pre-1.0, maintained largely by one
 person, and — like ggml — tuned for language models rather than diffusion. If a

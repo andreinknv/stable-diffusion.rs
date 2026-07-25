@@ -56,14 +56,14 @@ when profiling proves it matters. `ops::scaled_dot_product_attention` is the
 current favourite: it materializes the full `seq × seq` score matrix, which is
 fine for VAE attention and won't be for UNet cross-attention.
 
-## A second thing the seam would buy
+## Native dependencies
 
-`candle-core` depends on `tokenizers` with the `onig` feature — not optional,
-not overridable, because cargo unifies features across the graph. That pulls
-`onig_sys` (oniguruma, C) and `esaxx-rs` (sentencepiece's esaxx, C++), both
-compiled during `cargo build`.
+`candle-core` pulls one C dependency — `onig_sys`, via `tokenizers`. It is
+fixable with a one-line change upstream, which we have verified builds and
+passes every test. Details, measurements and the workaround are in
+[native-deps.md](native-deps.md).
 
-So the project is not free of native code today, and cannot be while it depends
-on candle. The README says so plainly rather than overclaiming. Moving the seam
-to a backend without that dependency would make "pure Rust" literally true —
-worth noting, not worth doing on its own.
+Worth noting here because it is the same pattern as the ggml fork: a
+diffusion-irrelevant LLM feature (reading a tokenizer out of GGUF metadata)
+imposing a cost on every candle user. Not a reason to move off candle. A reason
+to keep the seam.

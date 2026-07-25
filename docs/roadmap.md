@@ -43,6 +43,13 @@ architecture is independent and verifiable against its own golden data.
   per backend up front is 8–15 months before anything renders.
 - **A GUI.** A good library first; someone else can build the UI.
 
+## Upstream contributions worth making
+
+- **candle: drop the `onig` C dependency.** One-line feature swap, verified to
+  build and pass every test. See [native-deps.md](native-deps.md). Better
+  still: make `tokenizers` optional in `candle-core` and feature-gate
+  `quantized::tokenizer`, which most candle users do not need.
+
 ## Good first issues
 
 - BPE tokenizer with a golden test against `transformers`
