@@ -1,37 +1,59 @@
-// cargo-deny configuration.
-//
-// We ship MIT. The dependency tree must stay permissive: a copyleft crate
-// sneaking in would change the licensing of the whole project, and it would do
-// so silently. This check exists to make that impossible to miss.
+# cargo-deny configuration.
+#
+# We ship MIT. The dependency tree must stay permissive: a copyleft or
+# proprietary crate sneaking in would change the licensing of the whole
+# project, and it would do so silently. This check exists to make that
+# impossible to miss.
+#
+# It has already earned its keep once: it caught candle's `mkl` feature pulling
+# the unlicensed `intel-mkl-src`, which is why sd-tensor does not expose it.
 
 [graph]
-all-features = false
+# Check optional backends too — users enable `cuda` and `metal`, so those
+# dependency licenses are as binding as the default ones.
+all-features = true
 
 [licenses]
 version = 2
-# Permissive only. Adding to this list is a licensing decision, not a build fix.
+# Permissive only. Adding to this list is a licensing decision, not a build
+# fix. Every entry below is actually present in the tree today; keeping it
+# exact means an unexpected license shows up as an error rather than hiding
+# behind a speculative allowance.
 allow = [
-    "MIT",
+    "0BSD",
     "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
+    # webpki-roots. Community Data License Agreement — permissive, data-only.
+    "CDLA-Permissive-2.0",
     "ISC",
+    "MIT",
+    # option-ext, via directories/tokenizers. File-level copyleft only: using
+    # it as a dependency does not affect our licensing.
+    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
-    "CC0-1.0",
-    "MPL-2.0",
 ]
 confidence-threshold = 0.9
 
 [bans]
+# Duplicate versions are a size and compile-time problem, not a correctness
+# one. Warn so it stays visible without blocking contributors.
 multiple-versions = "warn"
 wildcards = "deny"
 
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # `paste` is unmaintained (archived, not vulnerable). It reaches us
+    # transitively through candle -> gemm; there is no version we can bump to
+    # and no attack surface, since it is a compile-time proc macro.
+    # Revisit when candle's gemm stack drops it.
+    "RUSTSEC-2024-0436",
+]
 
 [sources]
 unknown-registry = "deny"
