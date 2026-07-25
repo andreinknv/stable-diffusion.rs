@@ -39,6 +39,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 safetensors = "0.6"
 memmap2 = "0.9"
 
+# CLIP tokenization. default-features = false is deliberate: the default
+# feature set pulls `onig`, which builds the oniguruma C library and would
+# undo this project's "no C toolchain" property. The pure-Rust path is enough
+# to load a tokenizer.json and encode.
+tokenizers = { version = "0.22", default-features = false }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

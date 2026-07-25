@@ -1777,6 +1777,7 @@ dependencies = [
  "sd-loader",
  "sd-tensor",
  "thiserror 2.0.19",
+ "tokenizers",
  "tracing",
 ]
 

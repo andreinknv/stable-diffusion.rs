@@ -3,8 +3,9 @@
 Diffusion model inference in pure Rust.
 
 A ground-up Rust implementation in the spirit of
-[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) — no C++
-toolchain, no cmake, no submodules. `cargo build` and you have a binary.
+[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) — no
+cmake, no git submodules, no vendored inference engine. `cargo build` and you
+have a binary.
 
 > **Status: early.** The VAE decoder is implemented and structurally verified;
 > numerical verification against `diffusers` is wired up and runs locally.
@@ -15,8 +16,8 @@ toolchain, no cmake, no submodules. `cargo build` and you have a binary.
 `stable-diffusion.cpp` is excellent, and this project exists because of it, not
 in spite of it. Three things a Rust implementation gets you:
 
-- **No build ceremony.** Cross-compiling to an ARM target is `cargo build
-  --target`, not an afternoon with cmake and a toolchain file.
+- **No build ceremony.** One `cargo build`, no cmake, no submodule init, no
+  toolchain file. Dependencies resolve through cargo like any other crate.
 - **Memory-safe model loading.** GGUF and safetensors parsers ingest files
   people download from the internet, and the C++ equivalents have a CVE
   history. Ours is safe Rust with `unsafe` confined to a single documented
@@ -43,6 +44,14 @@ sd ──────┤   sd-sample   ├── sd-tensor ── candle
 `sd-tensor` is a thin re-export surface plus the handful of ops candle lacks.
 Everything else goes through it, enforced in CI by
 [`scripts/check-seam.sh`](scripts/check-seam.sh).
+
+**Honest caveat on "pure Rust":** our code is 100% Rust, but the build is not
+entirely free of native code. `candle-core` mandatorily depends on
+`tokenizers` with the `onig` feature, which compiles `onig_sys` (the C library
+oniguruma) and `esaxx-rs` (C++, from sentencepiece). A working C/C++ compiler
+is therefore still required — you just never invoke it yourself, and there is
+no cmake or submodule ceremony. Shedding those is one more thing the seam would
+buy us if we ever move off candle.
 
 That keeps one option open: candle is pre-1.0, maintained largely by one
 person, and — like ggml — tuned for language models rather than diffusion. If a

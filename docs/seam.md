@@ -55,3 +55,15 @@ The realistic path isn't a wholesale swap, though — it's replacing *one kernel
 when profiling proves it matters. `ops::scaled_dot_product_attention` is the
 current favourite: it materializes the full `seq × seq` score matrix, which is
 fine for VAE attention and won't be for UNet cross-attention.
+
+## A second thing the seam would buy
+
+`candle-core` depends on `tokenizers` with the `onig` feature — not optional,
+not overridable, because cargo unifies features across the graph. That pulls
+`onig_sys` (oniguruma, C) and `esaxx-rs` (sentencepiece's esaxx, C++), both
+compiled during `cargo build`.
+
+So the project is not free of native code today, and cannot be while it depends
+on candle. The README says so plainly rather than overclaiming. Moving the seam
+to a backend without that dependency would make "pure Rust" literally true —
+worth noting, not worth doing on its own.
