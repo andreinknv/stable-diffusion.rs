@@ -277,10 +277,36 @@ every time still fails.
 **Consequence: SDXL at its native 1024 works on CPU and runs out of memory on
 Metal here.** Use `--cpu` for 1024. SD 1.5 at 512 is unaffected on either.
 
-Two ways out, neither taken yet: run the decode on CPU above the known-good
-latent size, or decode in tiles so no single conv needs a 9.66 GB im2col.
-Tiling is what other implementations do, and it fixes the cause rather than
-routing around it.
+**Tiling fixes the decode.** `AutoencoderKlDecoder::decode_tiled` decodes in
+overlapping 64-latent tiles and cross-fades the overlaps, so no single
+convolution needs more than one tile's im2col. Measured against a whole-image
+decode at 768px: `mean_abs` 9.96e-3, and the worst column-to-column step is
+1.53x the mean, so seams are not visible. Latents at or below one tile take
+the untiled path and are bit-identical to before. Verified standalone on
+Metal at 1024.
+
+**It is not sufficient for SDXL on this machine, and the reason is weight
+residency.** The pipeline loads fp16 checkpoints and upcasts them to f32:
+
+| component | fp16 file | resident as f32 |
+|---|---:|---:|
+| unet | 5135 MB | 10270 MB |
+| text_encoder_2 | 1389 MB | 2779 MB |
+| text_encoder | 246 MB | 492 MB |
+| vae | 167 MB | 335 MB |
+| **total** | **6938 MB** | **13876 MB** |
+
+13.9 GB of weights sit on the GPU before a single activation is allocated,
+which on a 36 GiB machine shared with other work leaves too little for the
+decode — SDXL fails at 768 as well as 1024, while the same tiled decode
+succeeds standalone.
+
+The fix is to stop upcasting: hold the UNet and text encoders in f16 and keep
+only the VAE in f32, which is what every other implementation does and what
+the SDXL VAE's known fp16 overflow requires. That halves residency to about
+7 GB. It is dtype plumbing through the pipeline rather than a one-line
+change — `timestep_embedding` and the sinusoid helpers currently produce f32
+unconditionally — so it is the next piece of work, not a footnote to this one.
 
 ## When to revisit
 

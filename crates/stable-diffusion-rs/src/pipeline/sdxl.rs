@@ -199,6 +199,9 @@ impl SdxlPipeline {
             progress(i + 1, cfg.steps, sigma);
         }
 
-        Ok(self.vae.decode(&latent)?)
+        // Tiled: SDXL's native 1024 needs a 9.66 GB conv intermediate as a
+        // single decode, which does not fit in GPU memory. See
+        // docs/backends.md.
+        Ok(self.vae.decode_tiled(&latent)?)
     }
 }

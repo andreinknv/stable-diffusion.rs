@@ -275,9 +275,11 @@ impl Txt2ImgPipeline {
 
         let latent = self.denoise(cfg, latent, &sigmas, &context, &mut rng, progress)?;
 
-        // `decode` applies the scaling factor; `decode_raw` does not. Using
-        // the latter here would double-scale.
-        Ok(self.vae.decode(&latent)?)
+        // `decode_tiled` applies the scaling factor, like `decode`, and falls
+        // through to a whole-image decode for latents that already fit — so
+        // 512px output is bit-identical to before. Above that it tiles, which
+        // is what keeps a 1024px decode inside GPU memory.
+        Ok(self.vae.decode_tiled(&latent)?)
     }
 
     /// The sampling loop, shared by txt2img and img2img.
@@ -373,7 +375,7 @@ impl Txt2ImgPipeline {
         let start = cfg.strength.start_index(base.steps);
         // Strength 0 means "return the input", and there is nothing to run.
         if start >= base.steps {
-            return Ok(self.vae.decode(&latent)?);
+            return Ok(self.vae.decode_tiled(&latent)?);
         }
 
         let mut rng = SeededRng::new(base.seed);
@@ -385,6 +387,6 @@ impl Txt2ImgPipeline {
         let latent = (latent + (noise * sigmas[start])?)?;
 
         let latent = self.denoise(base, latent, &sigmas[start..], &context, &mut rng, progress)?;
-        Ok(self.vae.decode(&latent)?)
+        Ok(self.vae.decode_tiled(&latent)?)
     }
 }

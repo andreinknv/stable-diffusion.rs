@@ -96,6 +96,89 @@ impl AutoencoderKlDecoder {
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
         self.decode_raw(&(latents / self.scaling_factor)?)
     }
+
+    /// [`Self::decode`], in overlapping tiles.
+    ///
+    /// A whole-image decode allocates a conv im2col of `cin * 9` values per
+    /// output position — 9.66 GB at 1024px, which does not fit in GPU memory
+    /// on a 36 GiB Mac. Tiling caps that at whatever one tile needs, so the
+    /// cost becomes linear in area instead of a single enormous allocation.
+    ///
+    /// The result is *close to* but not identical to a whole-image decode:
+    /// convolutions at a tile edge see padding where they would otherwise see
+    /// neighbouring pixels, which the overlap blend hides rather than
+    /// eliminates. Small latents that already fit are decoded whole, so this
+    /// is safe to call unconditionally.
+    pub fn decode_tiled(&self, latents: &Tensor) -> Result<Tensor> {
+        self.decode_raw_tiled(&(latents / self.scaling_factor)?)
+    }
+
+    /// [`Self::decode_raw`], in overlapping tiles.
+    pub fn decode_raw_tiled(&self, latents: &Tensor) -> Result<Tensor> {
+        let (_, _, lh, lw) = latents.dims4()?;
+        if lh <= TILE_LATENT_EDGE && lw <= TILE_LATENT_EDGE {
+            return self.decode_raw(latents);
+        }
+
+        let tile = TILE_LATENT_EDGE;
+        let stride = ((tile as f64) * (1.0 - TILE_OVERLAP)) as usize;
+        let stride = stride.max(1);
+        // In output pixels: the decoder upsamples by 8.
+        let scale = 8;
+        let blend_extent = (tile - stride) * scale;
+        let keep = stride * scale;
+
+        let mut rows: Vec<Vec<Tensor>> = Vec::new();
+        let mut y = 0;
+        while y < lh {
+            let h = tile.min(lh - y);
+            let mut row = Vec::new();
+            let mut x = 0;
+            while x < lw {
+                let w = tile.min(lw - x);
+                let patch = latents.narrow(2, y, h)?.narrow(3, x, w)?.contiguous()?;
+                row.push(self.decode_raw(&patch)?);
+                if x + w >= lw {
+                    break;
+                }
+                x += stride;
+            }
+            rows.push(row);
+            if y + h >= lh {
+                break;
+            }
+            y += stride;
+        }
+
+        // Blend each tile into its upper and left neighbours, then trim to the
+        // stride so the kept regions tile exactly.
+        let mut out_rows = Vec::with_capacity(rows.len());
+        for i in 0..rows.len() {
+            let mut out_row: Vec<Tensor> = Vec::with_capacity(rows[i].len());
+            for j in 0..rows[i].len() {
+                let mut t = rows[i][j].clone();
+                if i > 0 {
+                    t = blend(&rows[i - 1][j], &t, blend_extent, 2)?;
+                }
+                if j > 0 {
+                    // The *untrimmed* left neighbour, not the trimmed result
+                    // already pushed to `out_row` — those differ in height on
+                    // any row whose tiles were cut short, and blending across
+                    // that mismatch is a shape error.
+                    t = blend(&rows[i][j - 1], &t, blend_extent, 3)?;
+                }
+                let last_col = j + 1 == rows[i].len();
+                let last_row = i + 1 == rows.len();
+                let th = t.dims()[2];
+                let tw = t.dims()[3];
+                let h = if last_row { th } else { keep.min(th) };
+                let w = if last_col { tw } else { keep.min(tw) };
+                out_row.push(t.narrow(2, 0, h)?.narrow(3, 0, w)?.contiguous()?);
+            }
+            out_rows.push(Tensor::cat(&out_row, 3)?);
+        }
+        Tensor::cat(&out_rows, 2)
+    }
 }
 
 /// The encode half of `AutoencoderKL`: [`Encoder`] followed by `quant_conv`.
@@ -171,6 +254,52 @@ impl AutoencoderKlEncoder {
     pub fn latent_channels(&self) -> usize {
         self.latent_channels
     }
+}
+
+/// Latent edge of one decode tile. 64 latent = 512px, the size SD 1.5 was
+/// trained at and comfortably inside GPU memory.
+pub const TILE_LATENT_EDGE: usize = 64;
+
+/// Fraction of a tile that overlaps its neighbour.
+///
+/// The decoder is not shift-invariant — its convolutions see different
+/// padding at a tile edge than they would mid-image — so tiles must overlap
+/// and be blended, or the seams are visible as hard lines.
+const TILE_OVERLAP: f64 = 0.25;
+
+/// Linear ramp from 0 to 1 along `dim`, shaped to broadcast over `[b, c, h, w]`.
+fn ramp(extent: usize, dim: usize, device: &sd_tensor::Device) -> Result<Tensor> {
+    let values: Vec<f32> = (0..extent)
+        .map(|i| (i as f32 + 0.5) / extent as f32)
+        .collect();
+    let t = Tensor::from_vec(values, extent, device)?;
+    match dim {
+        2 => t.reshape((1, 1, extent, 1)),
+        _ => t.reshape((1, 1, 1, extent)),
+    }
+}
+
+/// Cross-fade `b` into the trailing `extent` of `a` along `dim`.
+///
+/// Returns `b` with its leading `extent` replaced by the blend. Tensors are
+/// immutable here, so this rebuilds rather than writing in place.
+fn blend(a: &Tensor, b: &Tensor, extent: usize, dim: usize) -> Result<Tensor> {
+    let a_len = a.dims()[dim];
+    let b_len = b.dims()[dim];
+    let extent = extent.min(a_len).min(b_len);
+    if extent == 0 {
+        return Ok(b.clone());
+    }
+    let w = ramp(extent, dim, a.device())?;
+    let a_tail = a.narrow(dim, a_len - extent, extent)?;
+    let b_head = b.narrow(dim, 0, extent)?;
+    // a fades out as b fades in.
+    let mixed = (a_tail.broadcast_mul(&(1.0 - &w)?)? + b_head.broadcast_mul(&w)?)?;
+    if b_len == extent {
+        return Ok(mixed);
+    }
+    let rest = b.narrow(dim, extent, b_len - extent)?;
+    Tensor::cat(&[&mixed, &rest], dim)
 }
 
 trait ForwardT {
