@@ -58,10 +58,10 @@ pub enum PipelineError {
     MissingTokenizerJson(PathBuf),
     #[error(
         "loading the VAE from {path}: {source}\n\n\
-         If the missing tensor is named `to_q`/`to_k`/`to_v`/`to_out.0`, this checkpoint uses \
-         the legacy diffusers attention names (`query`/`key`/`value`/`proj_attn`). Stock SD 1.5 \
-         VAE weights do. Converting those names belongs in sd-loader, not here — see the note \
-         in sd-models/src/lib.rs."
+         sd-loader adapts the legacy diffusers attention names \
+         (`query`/`key`/`value`/`proj_attn`) that stock SD 1.5 weights use, so a missing \
+         `to_q`-style tensor here means the checkpoint is neither layout — check it is an \
+         SD 1.5 VAE and not, say, an SDXL one."
     )]
     VaeWeights {
         path: PathBuf,

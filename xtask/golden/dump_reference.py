@@ -111,10 +111,25 @@ def dump_vae(output: pathlib.Path, model_id: str) -> None:
     weights = {k: v.detach().contiguous().clone() for k, v in vae.state_dict().items()}
     save_file(weights, str(out / "vae.safetensors"))
 
+    # Also link the *raw* checkpoint, unmodified. `vae.safetensors` above went
+    # through `state_dict()`, which silently renames the legacy attention keys
+    # on load — so it cannot catch a loader that only understands the modern
+    # names. The stock file can, and that is the file users actually have.
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    legacy = out / "vae_legacy.safetensors"
+    if legacy.is_symlink() or legacy.exists():
+        legacy.unlink()
+    legacy.symlink_to(
+        hf_hub_download(repo_id=model_id, filename="vae/diffusion_pytorch_model.safetensors")
+    )
+
     print(f"\nwrote {out / 'reference.safetensors'}")
     for k, v in sorted(tensors.items()):
         print(f"  {k:<18} {tuple(v.shape)}")
     print(f"\nwrote {out / 'vae.safetensors'} ({len(weights)} tensors)")
+    print(f"linked {legacy} -> the unmodified checkpoint")
     print(
         "\nIntermediate tensors are included on purpose: when the final image "
         "\nmismatches, they tell you *which block* diverged first."

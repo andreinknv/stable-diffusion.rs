@@ -47,7 +47,62 @@ impl Format {
     }
 }
 
+/// Attention parameter names, modern diffusers -> the legacy layout.
+///
+/// diffusers renamed the VAE's attention block at some point; checkpoints
+/// published before that — including the stock SD 1.5 VAE, which is what most
+/// people download — still use the old names. The tensors are identical, only
+/// the keys differ, so this is a pure rename with no reshape.
+///
+/// Model code stays on the modern names. Conversion belongs here: see the note
+/// in `sd-models/src/lib.rs`.
+const LEGACY_ATTENTION_KEYS: [(&str, &str); 4] = [
+    (".to_q.", ".query."),
+    (".to_k.", ".key."),
+    (".to_v.", ".value."),
+    (".to_out.0.", ".proj_attn."),
+];
+
+/// Only appears in the legacy layout, so its presence identifies one.
+const LEGACY_SENTINEL: &str = "proj_attn";
+
+/// Rewrite a modern attention key to its legacy equivalent.
+///
+/// Returns `None` when the name needs no rewriting, which is every key in a
+/// modern checkpoint and most keys in a legacy one.
+pub fn legacy_attention_key(name: &str) -> Option<String> {
+    LEGACY_ATTENTION_KEYS
+        .iter()
+        .find(|(modern, _)| name.contains(modern))
+        .map(|(modern, legacy)| name.replace(modern, legacy))
+}
+
+/// Whether any file names a tensor using the legacy attention layout.
+///
+/// Reads only the safetensors headers — no tensor data is touched, so this is
+/// cheap even against a multi-gigabyte UNet.
+fn uses_legacy_attention_names(paths: &[PathBuf]) -> Result<bool> {
+    for path in paths {
+        // SAFETY: same contract as the caller's — the file must not be mutated
+        // while mapped. Dropped before returning.
+        let mapped = unsafe { sd_tensor::safetensors::MmapedSafetensors::new(path)? };
+        if mapped
+            .tensors()
+            .iter()
+            .any(|(name, _)| name.contains(LEGACY_SENTINEL))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Open one or more `.safetensors` files as a [`VarBuilder`].
+///
+/// Checkpoints using the legacy diffusers attention names are adapted
+/// transparently, so model code only ever asks for the modern names. Detection
+/// is per-load and header-only; a modern checkpoint pays one header parse and
+/// is otherwise untouched.
 ///
 /// # Safety
 ///
@@ -74,6 +129,15 @@ pub fn safetensors_var_builder<'a, P: AsRef<Path>>(
     // SAFETY: documented in this function's contract — files must not be
     // mutated for the lifetime of the returned VarBuilder.
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&owned, dtype, device)? };
+
+    if uses_legacy_attention_names(&owned)? {
+        tracing::debug!("legacy attention names detected; adapting");
+        // `rename_f` maps the name the model *asks for* onto the name that is
+        // *stored*, which is the direction needed here.
+        return Ok(vb.rename_f(|name: &str| {
+            legacy_attention_key(name).unwrap_or_else(|| name.to_string())
+        }));
+    }
     Ok(vb)
 }
 
