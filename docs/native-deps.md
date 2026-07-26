@@ -1,7 +1,44 @@
-# The one C dependency, and how to remove it
+# The native-code budget
 
-Our code is entirely Rust. One transitive dependency is not, and it is
-avoidable with a **one-line upstream change** that we have tested end to end.
+Our code is entirely Rust. Exactly **one** transitive dependency compiles C,
+and it is avoidable with a **one-line upstream change** we have tested end to
+end.
+
+This is enforced, not aspirational: [`scripts/check-native-deps.sh`](../scripts/check-native-deps.sh)
+runs in CI and fails if any crate outside the allowlist compiles native code.
+A C dependency arrives transitively, in someone else's `Cargo.toml`, and
+nothing about your build looks different when it does — so it gets checked.
+
+```
+$ ./scripts/check-native-deps.sh
+native deps ok [default]: 1 allowlisted, 0 unexpected
+    onig_sys (known)
+```
+
+## Full audit
+
+Measured across every backend:
+
+| Build | Compiles native code | Removable? |
+|---|---|---|
+| default (CPU) | `onig_sys` only | **yes** — one line upstream |
+| `--features accelerate` | `onig_sys` only | same; Accelerate links a system framework, compiles nothing |
+| `--features metal` | `onig_sys` + `candle-metal-kernels` | no — Metal Shading Language |
+| `--features cuda` | `onig_sys` + `candle-kernels`, `cudaforge` | no — CUDA C++ |
+
+Nothing else in the tree pulls `cc`. There are no other `-sys` crates.
+`ring`/`rustls` are **not** reachable from our binaries — they appear only
+under `cargo deny --all-features`, which enables backends we do not ship by
+default.
+
+**GPU kernels cannot be Rust here.** CUDA kernels are CUDA C++ and Metal
+shaders are MSL; candle has no Rust-authored kernel path. The only way to an
+all-Rust GPU stack is a backend with a Rust kernel DSL — `cubecl` (burn) or
+`rust-gpu`. That is a seam-level decision, not a dependency tweak. See
+[seam.md](seam.md).
+
+So: **after the `onig` fix, CPU builds are 100% Rust.** GPU builds contain
+kernel code that is inherently not Rust, and no dependency choice changes that.
 
 ## What is actually native
 

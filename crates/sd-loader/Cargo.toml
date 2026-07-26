@@ -17,3 +17,4 @@ tracing.workspace = true
 default = []
 cuda = ["sd-tensor/cuda"]
 metal = ["sd-tensor/metal"]
+accelerate = ["sd-tensor/accelerate"]

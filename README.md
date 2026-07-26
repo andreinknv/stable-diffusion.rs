@@ -51,7 +51,11 @@ which builds `onig_sys` — the oniguruma C regex library — so a C compiler is
 required. You never invoke it yourself, and there is still no cmake or
 submodule ceremony.
 
-This is **fixable in one line upstream**, and we have verified the fix. See
+This is **fixable in one line upstream**, and we have verified the fix. It is
+also the *only* native code in a CPU build — audited and enforced in CI by
+[`scripts/check-native-deps.sh`](scripts/check-native-deps.sh), which fails if
+anything else starts compiling C. GPU builds additionally contain CUDA C++ /
+Metal shader kernels, which no dependency choice can make Rust. Full audit in
 [docs/native-deps.md](docs/native-deps.md).
 
 That keeps one option open: candle is pre-1.0, maintained largely by one
@@ -62,9 +66,10 @@ instead of rewriting every model. Cheap to keep, impossible to add later.
 ## Build
 
 ```bash
-cargo build --release                      # CPU
-cargo build --release --features metal     # Apple GPU
-cargo build --release --features cuda      # NVIDIA
+cargo build --release                        # CPU
+cargo build --release --features accelerate  # CPU + Apple BLAS (no native code added)
+cargo build --release --features metal       # Apple GPU
+cargo build --release --features cuda        # NVIDIA
 ```
 
 ```bash

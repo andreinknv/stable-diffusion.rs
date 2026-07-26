@@ -19,3 +19,4 @@ tokenizers.workspace = true
 default = []
 cuda = ["sd-tensor/cuda", "sd-loader/cuda"]
 metal = ["sd-tensor/metal", "sd-loader/metal"]
+accelerate = ["sd-tensor/accelerate", "sd-loader/accelerate"]

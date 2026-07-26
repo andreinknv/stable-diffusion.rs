@@ -26,3 +26,4 @@ tracing-subscriber.workspace = true
 default = []
 cuda = ["stable-diffusion-rs/cuda", "sd-tensor/cuda"]
 metal = ["stable-diffusion-rs/metal", "sd-tensor/metal"]
+accelerate = ["stable-diffusion-rs/accelerate", "sd-tensor/accelerate"]

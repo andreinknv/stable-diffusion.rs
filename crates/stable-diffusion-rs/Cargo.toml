@@ -23,3 +23,5 @@ image.workspace = true
 default = []
 cuda = ["sd-tensor/cuda", "sd-loader/cuda", "sd-models/cuda", "sd-sample/cuda"]
 metal = ["sd-tensor/metal", "sd-loader/metal", "sd-models/metal", "sd-sample/metal"]
+# Apple BLAS. Links a system framework — adds no native compilation.
+accelerate = ["sd-tensor/accelerate", "sd-loader/accelerate", "sd-models/accelerate", "sd-sample/accelerate"]

@@ -18,6 +18,19 @@ jobs:
       - uses: actions/checkout@v4
       - run: ./scripts/check-seam.sh
 
+  native-deps:
+    name: native deps (C/C++ budget)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Fails if any crate outside the documented allowlist compiles C or C++.
+      # A native dependency arrives transitively, in someone else's manifest,
+      # and nothing about the build looks different when it does.
+      - run: ./scripts/check-native-deps.sh
+      - run: ./scripts/check-native-deps.sh cuda
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
