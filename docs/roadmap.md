@@ -68,7 +68,7 @@ leave the order-1 range; `testing::assert_close` is absolute-only.
 | ✅ | SDXL — text encoder 2 | verified vs `transformers` |
 | ✅ | SDXL — UNet | verified vs `diffusers`, max_abs 1.4e-5 |
 | ✅ | SDXL — end to end | 1024 on Metal in 89 s, f16 weights + tiled decode |
-| ✅ | GGUF | `--gguf` generates images; Q4_0 quality is poor, see below |
+| ✅ | GGUF | `--gguf` generates images; use Q4_K over Q4_0, see below |
 | ⬜ | Metal and CUDA paths through the seam | Metal verified end to end |
 
 The VAE encoder's downsampler pads **asymmetrically** (bottom and right only).
@@ -79,28 +79,59 @@ any other downsampling path.
 Remaining milestone 2 work:
 
 - SDXL (same geometry, second text encoder, different latent scaling)
-- **Better quantisations than Q4_0.** `sdrs txt2img --gguf` works end to end,
-  but the image from a Q4_0 checkpoint is markedly worse than the f32 one —
-  soft, low-contrast, short on detail. The mapping is not the cause; all three
-  towers are verified against the same golden references as the safetensors
-  path:
+- ~~**Better quantisations than Q4_0.**~~ **Done — use Q4_K, not Q4_0.**
+  Measured by `sd-models --test gguf_quant_sweep`, every row against the same
+  golden references the safetensors path is held to:
 
-  | tower | vs. f32 reference |
-  |---|---|
-  | VAE decode | `mean_abs` 8.9e-3 |
-  | UNet | correlation 0.9848 |
-  | text encoder | correlation 0.9746 |
+  | quant | size | VAE `mean_abs` | UNet corr | CLIP corr |
+  |---|---|---|---|---|
+  | f16 | 2133 MB | 6.3e-5 | 1.0000 | 1.0000 |
+  | Q8_0 | 1764 MB | 6.3e-4 | 0.9999 | 0.9999 |
+  | Q6_K | 1711 MB | 2.3e-3 | 0.9998 | 0.9986 |
+  | Q5_K | 1664 MB | 2.4e-3 | 0.9992 | 0.9949 |
+  | Q4_K | 1619 MB | 5.5e-3 | 0.9976 | 0.9852 |
+  | Q4_0 | 1567 MB | 8.9e-3 | 0.9848 | 0.9746 |
 
-  The text encoder is the weakest, which is consistent with what is already
-  known about it: CLIP carries activations of magnitude 851, and 4-bit blocks
-  represent those badly. Conditioning error at the start of the loop compounds
-  through every step.
+  **The f16 row is the point of the table.** It is the control: f16 through
+  the GGUF name map reproduces the f32 reference exactly, so the mapping is
+  correct and every other row is quantisation error alone. Without it, a poor
+  Q4_0 image cannot be distinguished from a subtly wrong translation — which
+  is what we spent time suspecting.
 
-  So the useful next step is Q8_0 and the k-quants (`Q4_K`/`Q5_K`), which keep
-  outliers at higher precision — candle already dequantises all of them, so
-  this is fixture work and measurement, not new code. Worth checking whether
-  keeping the text encoder at F16 while the UNet stays quantised recovers most
-  of the quality for little memory.
+  Q4_K costs 3% more file than Q4_0 and recovers nearly all the lost detail;
+  Q4_0's characteristic soft, low-contrast output is gone. Q8_0 is
+  indistinguishable from f16. The text encoder is the weakest tower at every
+  quantisation, consistent with CLIP's magnitude-851 activations.
+
+  Two things worth knowing before doing this on another model:
+
+  **No published SD 1.5 carries k-quants, for a structural reason.** k-quants
+  use blocks of 256 along the fastest axis; SD 1.5's UNet is built from 320-
+  and 640-channel blocks, and 320 % 256 = 64. 497 of 1131 tensors cannot take
+  one and fall back to F16 — which is why Q4_K is *larger* than Q4_0 here
+  rather than comparable. Generate them locally:
+
+  ```bash
+  cargo run --release -p sd-cli --example requantise -- \
+    sd15-f16.gguf sd15-q4_k.gguf Q4_K
+  ```
+
+  **Only 37% of SD 1.5's parameters are quantisable at all.** Convolution
+  weights have a 3-wide fastest axis, so no block quantisation applies and
+  they stay F16 in every published file. Quantisation reaches the attention
+  and linear layers — and the entire text encoder, which is why CLIP absorbs
+  the damage.
+
+  Still open: keeping the text encoder at F16 while the UNet stays quantised.
+  Q4_K makes this much less urgent, and unlike the above it is plumbing (two
+  weight sources for one pipeline), not measurement.
+- **Keep quantised weights quantised.** Today every GGUF weight is
+  dequantised to f32 at load, so quantisation buys disk and nothing else —
+  SD 1.5 occupies 4.26 GB of RAM whether the file is Q4_0 or f32. candle's
+  `QMatMul` holds weights in their quantised form and dequantises per
+  operation. This is the blocker for the larger architectures below: Flux is
+  12B parameters, which is 48 GB of f32 and will not load on a 36 GB machine
+  at any quantisation. Doing this before attempting them is the right order.
 - CUDA through the seam. Metal is verified end to end at 512; CUDA is untested.
 - **SD 1.5 in f16 too**, if it is ever worth it. SDXL needed it to fit; SD 1.5
   does not, and switching would mean re-verifying every golden test against f16
@@ -115,6 +146,15 @@ TAESD · ESRGAN upscaling · inpainting
 
 This is the phase that took upstream years, and it parallelizes well: each
 architecture is independent and verifiable against its own golden data.
+
+**SD 3 and Flux are blocked on quantised residency**, not on the architecture
+work. They are MMDiT transformers rather than UNets and need a T5 encoder
+alongside CLIP — a large job, but a tractable one. The hard stop is memory:
+Flux is 12B parameters, and this codebase dequantises every weight to f32 at
+load, so it would ask for 48 GB before the first step. Do `QMatMul` first.
+Conveniently, k-quants suit those models far better than they suit SD 1.5 —
+their hidden sizes are multiples of 256, so nothing falls back to F16, which
+is why city96 can publish `Q4_K` for SD 3.5 and nobody can for SD 1.5.
 
 ## Deliberately not doing
 

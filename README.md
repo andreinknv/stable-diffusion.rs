@@ -10,9 +10,9 @@ have a binary.
 > **Status: it renders.** Text-to-image and image-to-image work for
 > Stable Diffusion 1.5 and SDXL, on CPU and Apple GPU. Every model component is
 > verified tensor-by-tensor against `diffusers`/`transformers` — not eyeballed.
-> GGUF works end to end (`sdrs txt2img --gguf`), though Q4_0 output is
-> noticeably softer than f32 — see the roadmap for why and what to try next. CUDA compiles but
-> is untested. See the [roadmap](docs/roadmap.md).
+> GGUF works end to end (`sdrs txt2img --gguf`); prefer Q4_K over Q4_0, which
+> is visibly soft. CUDA compiles but is untested. See the
+> [roadmap](docs/roadmap.md).
 
 <p align="center">
   <img src="assets/sdxl-crab-1024-metal-f16.png" width="420"
@@ -114,8 +114,12 @@ sdrs img2img --model ./models/sd15 --init-image out.png \
 
 # A single quantised checkpoint, as stable-diffusion.cpp writes them. These
 # carry no tokenizer, so one has to be supplied.
-sdrs txt2img --gguf sd15-q4_0.gguf --tokenizer tokenizer.json \
+sdrs txt2img --gguf sd15-q4_k.gguf --tokenizer tokenizer.json \
   --prompt "a rusty crab on a beach" -o out.png
+
+# No published SD 1.5 ships k-quants — its 320-channel blocks do not divide
+# into their 256-value blocks. Make one from any other GGUF:
+cargo run --release -p sd-cli --example requantise -- in.gguf out.gguf Q4_K
 ```
 
 The same seed on the same device and build reproduces a file byte for byte.
