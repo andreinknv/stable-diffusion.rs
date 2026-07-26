@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import shutil
 import sys
@@ -742,6 +743,33 @@ def dump_sdxl_unet(output: pathlib.Path, model_id: str) -> None:
     print(f"linked {link}")
 
 
+# Small GGUF files produced by llama.cpp, for testing the header reader
+# against something we did not write ourselves. Chosen for size — the largest
+# is 67 MB — and for covering cases a synthetic file cannot: a real metadata
+# block, a genuinely mixed quantisation spread, and a big-endian build.
+GGUF_FIXTURES = [
+    ("ggml-org/stories15M_MOE", "moe_shakespeare15M.gguf"),
+    ("ggml-org/stories15M_MOE", "stories15M_MOE-Q8_0.gguf"),
+    ("ggml-org/models", "bert-bge-small/ggml-model-f16-big-endian.gguf"),
+]
+
+
+def dump_gguf(output: pathlib.Path, _model_id: str) -> None:
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    out = output / "gguf"
+    out.mkdir(parents=True, exist_ok=True)
+    for repo, name in GGUF_FIXTURES:
+        src = hf_hub_download(repo_id=repo, filename=name)
+        link = out / pathlib.Path(name).name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(src)
+        print(f"  {os.path.getsize(src) / 1e6:8.2f} MB  {link.name}")
+    print(f"\nlinked into {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="component", required=True)
@@ -810,8 +838,14 @@ def main() -> None:
     )
     sdxlu.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    gg = sub.add_parser("gguf", help="link small real GGUF files for the header tests")
+    gg.add_argument("--model-id", default="", help="unused")
+    gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     args = ap.parse_args()
-    if args.component == "sdxl_unet":
+    if args.component == "gguf":
+        dump_gguf(args.output, args.model_id)
+    elif args.component == "sdxl_unet":
         dump_sdxl_unet(args.output, args.model_id)
     elif args.component == "sdxl_text_encoder_2":
         dump_sdxl_text_encoder_2(args.output, args.model_id)

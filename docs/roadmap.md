@@ -85,11 +85,13 @@ Remaining milestone 2 work:
   load. candle already dequantises `Q4_K`/`Q5_K`/`Q8_0`, so this is wiring
   plus a name mapping, not new numerics.
 
-  **Point it at a real checkpoint first.** The header tests round-trip through
-  candle's own writer, which does not exercise what makes GGUF hard in
-  practice: non-UTF8 strings, null-terminated strings the spec says are not,
-  and v2 layouts beside v3. candle's reader has a lossy-UTF8 path that exists
-  because real files violate the spec, and none of it is covered yet.
+  The header reader is now tested against real llama.cpp files as well as
+  synthetic ones — `dump_reference.py gguf` links three small fixtures (16 MB
+  to 67 MB). That found one thing immediately: big-endian builds exist, candle
+  rejects them as `unsupported magic/version Gguf/50331648`, and we now say
+  what that actually means. Still uncovered: non-UTF8 and null-terminated
+  strings, and v2 layouts — candle has code paths for all three, so real files
+  clearly produce them.
 - CUDA through the seam. Metal is verified end to end at 512; CUDA is untested.
 - **SD 1.5 in f16 too**, if it is ever worth it. SDXL needed it to fit; SD 1.5
   does not, and switching would mean re-verifying every golden test against f16

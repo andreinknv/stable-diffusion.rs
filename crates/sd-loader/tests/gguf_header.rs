@@ -155,3 +155,89 @@ fn absent_metadata_is_absent_rather_than_defaulted() {
     assert_eq!(info.get_str("general.name"), Some("anonymous"));
     assert_eq!(info.get_str("nothing.here"), None);
 }
+
+// -- real files ------------------------------------------------------------
+//
+// Everything above round-trips through candle's own writer. These read files
+// produced by llama.cpp, which is the coverage that round trip cannot give.
+// They skip when the fixtures are absent, like every other golden test here:
+//
+//   python3 xtask/golden/dump_reference.py gguf --output tests/golden
+
+fn fixture(name: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/gguf")
+        .join(name);
+    if !p.exists() {
+        eprintln!("SKIP: no {name}; see xtask/golden/README.md");
+        return None;
+    }
+    Some(p)
+}
+
+#[test]
+fn a_real_llama_cpp_checkpoint_reads() {
+    let Some(p) = fixture("moe_shakespeare15M.gguf") else {
+        return;
+    };
+    let info = GgufInfo::open(&p).expect("reading a real GGUF");
+    assert_eq!(info.architecture(), Some("llama"));
+    assert_eq!(info.tensors.len(), 86);
+    // ~7.8 M parameters. Pinned loosely: the assertion is that we counted
+    // something sane, not that this file never changes.
+    let params = info.parameter_count();
+    assert!(
+        (7_000_000..9_000_000).contains(&params),
+        "parameter count looks wrong: {params}"
+    );
+    // Real files carry far more metadata than anything synthetic here.
+    assert!(
+        info.metadata.len() > 10,
+        "expected real metadata, got {} keys",
+        info.metadata.len()
+    );
+}
+
+#[test]
+fn a_real_quantised_checkpoint_reports_a_mixed_spread() {
+    // The design case for `quantisations()`, confirmed against a real file
+    // rather than assumed: a Q8_0 checkpoint is not uniformly Q8_0. It keeps
+    // 19 tensors at F32, which is why a single label would be a lie.
+    let Some(p) = fixture("stories15M_MOE-Q8_0.gguf") else {
+        return;
+    };
+    let info = GgufInfo::open(&p).expect("reading a real quantised GGUF");
+    let spread = info.quantisations();
+    assert!(
+        spread.len() >= 2,
+        "a real k-quant file mixes precisions; got {spread:?}"
+    );
+    assert_eq!(spread[0].0, GgmlDType::Q8_0, "commonest type first");
+    let f32_count = spread
+        .iter()
+        .find(|(d, _)| *d == GgmlDType::F32)
+        .map(|(_, n)| *n)
+        .unwrap_or(0);
+    assert!(
+        f32_count > 0,
+        "expected some tensors kept at full precision: {spread:?}"
+    );
+}
+
+#[test]
+fn a_big_endian_file_is_named_rather_than_reported_as_corrupt() {
+    // HuggingFace hosts big-endian builds for s390x. candle rejects them with
+    // "unsupported magic/version Gguf/50331648" — accurate, and useless: that
+    // number is version 3 with its bytes reversed. A reader who sees it has
+    // no way to know the file is fine and the byte order is not.
+    let Some(p) = fixture("ggml-model-f16-big-endian.gguf") else {
+        return;
+    };
+    let err = GgufInfo::open(&p).expect_err("big-endian must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("big-endian"), "should name the cause: {msg}");
+    assert!(
+        msg.contains("little-endian"),
+        "should say what to use instead: {msg}"
+    );
+}

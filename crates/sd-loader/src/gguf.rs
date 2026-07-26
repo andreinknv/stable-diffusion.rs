@@ -15,6 +15,54 @@ use sd_tensor::gguf::{Content, GgmlDType, Value};
 
 use crate::{LoadError, Result};
 
+/// Reject files we can identify but cannot read, before candle tries.
+///
+/// candle reports a big-endian GGUF as `unsupported magic/version
+/// Gguf/50331648`, which is accurate and tells the reader nothing: 50331648
+/// is `0x03000000`, version 3 with its bytes reversed. Files like this are
+/// real — HuggingFace hosts big-endian builds for s390x — so the difference
+/// between "corrupt" and "wrong byte order" is worth saying out loud.
+fn preflight(file: &mut std::fs::File, path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut head = [0u8; 8];
+    if file.read_exact(&mut head).is_err() {
+        return Err(LoadError::Unsupported {
+            path: path.to_path_buf(),
+            reason: "file is shorter than a GGUF header".to_string(),
+        });
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| LoadError::Unsupported {
+            path: path.to_path_buf(),
+            reason: format!("cannot seek: {e}"),
+        })?;
+
+    let magic = &head[..4];
+    if magic != b"GGUF" {
+        return Err(LoadError::Unsupported {
+            path: path.to_path_buf(),
+            reason: format!("not a GGUF file: expected magic \"GGUF\", found {magic:?}"),
+        });
+    }
+
+    let version = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+    // A plausible version read one way and implausible the other is the
+    // signature of reversed bytes. Versions in the wild are 1 to 3.
+    if !(1..=3).contains(&version) && (1..=3).contains(&version.swap_bytes()) {
+        return Err(LoadError::Unsupported {
+            path: path.to_path_buf(),
+            reason: format!(
+                "this is a big-endian GGUF (version {} stored byte-reversed). Only \
+                 little-endian files are supported — most builds are, but s390x \
+                 releases are not. Use the little-endian build of this model.",
+                version.swap_bytes()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// A GGUF checkpoint's header: what it is, and what is in it.
 #[derive(Debug)]
 pub struct GgufInfo {
@@ -44,6 +92,7 @@ impl GgufInfo {
             path: path.clone(),
             reason: format!("cannot open: {e}"),
         })?;
+        preflight(&mut file, &path)?;
         let content = Content::read(&mut file)?;
 
         let tensors = content
