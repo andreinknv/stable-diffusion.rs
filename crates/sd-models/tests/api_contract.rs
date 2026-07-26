@@ -238,3 +238,92 @@ fn module_forward_is_in_scope_via_the_seam() -> Result<()> {
     assert_eq!(y.dims(), &[2, 8]);
     Ok(())
 }
+
+/// (batch, heads, seq_q, seq_kv, head_dim) for every attention shape this
+/// workspace runs.
+const ATTENTION_SHAPES: [(usize, usize, usize, usize, usize); 4] = [
+    (1, 1, 16, 16, 8),   // VAE self-attention, small
+    (2, 8, 64, 64, 40),  // UNet self-attention
+    (2, 8, 64, 77, 40),  // UNet cross-attention: seq_q != seq_kv
+    (1, 12, 77, 77, 64), // CLIP
+];
+
+#[test]
+fn attention_dispatch_reports_which_implementation_ran() -> Result<()> {
+    // These tests run on CPU, and candle 0.11's fused SDPA is Metal-only, so
+    // every shape here must report Naive. That assertion is the point: without
+    // it, `attention_dispatch_agrees_with_the_naive_reference` below would be
+    // comparing the naive path against itself and passing regardless.
+    //
+    // If a future candle gains a CPU kernel this test fails, which is the
+    // correct outcome — it means the agreement test has become meaningful and
+    // this expectation needs revisiting, not that anything is broken.
+    let dev = Device::Cpu;
+    for (b, h, sq, sk, d) in ATTENTION_SHAPES {
+        let q = Tensor::zeros((b, h, sq, d), DType::F32, &dev)?;
+        let k = Tensor::zeros((b, h, sk, d), DType::F32, &dev)?;
+        let (_, path) = ops::attention_with_path(&q, &k, &k, None)?;
+        assert_eq!(
+            path,
+            ops::AttentionPath::Naive,
+            "shape {b}x{h}x{sq}x{sk}x{d} on CPU"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn attention_dispatch_agrees_with_the_naive_reference() -> Result<()> {
+    // ops::scaled_dot_product_attention dispatches to candle's fused kernel
+    // where available. That is only a safe swap if it computes the same thing,
+    // so pin it against the reference on every shape we use.
+    //
+    // On a CPU runner both sides are the same code and this only checks
+    // shapes. It earns its keep on a `--features metal` build, where the two
+    // sides can genuinely differ.
+    let dev = Device::Cpu;
+    for (b, h, sq, sk, d) in ATTENTION_SHAPES {
+        let q = Tensor::randn(0f32, 1f32, (b, h, sq, d), &dev)?;
+        let k = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev)?;
+        let v = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev)?;
+
+        let got = ops::scaled_dot_product_attention(&q, &k, &v)?;
+        let want = ops::naive_attention(&q, &k, &v, None)?;
+        assert_eq!(got.dims(), &[b, h, sq, d]);
+        testing::assert_close(
+            &got,
+            &want,
+            1e-4,
+            &format!("unmasked {b}x{h}x{sq}x{sk}x{d}"),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn masked_attention_dispatch_agrees_with_the_naive_reference() -> Result<()> {
+    let dev = Device::Cpu;
+    for (b, h, s, d) in [(1usize, 1usize, 16usize, 8usize), (1, 12, 77, 64)] {
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let mask = ops::causal_mask(s, &dev)?;
+
+        let got = ops::scaled_dot_product_attention_masked(&q, &k, &v, &mask)?;
+        let want = ops::naive_attention(&q, &k, &v, Some(&mask))?;
+        testing::assert_close(&got, &want, 1e-4, &format!("masked {b}x{h}x{s}x{d}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn attention_refuses_a_shape_that_would_exhaust_memory() -> Result<()> {
+    // The seam, not just the benchmark, is what refuses an oversized decode —
+    // so a model or CLI call gets the same protection. See
+    // sd_tensor::ops::check_attention_budget.
+    let seq = 384 * 384;
+    let err = ops::check_attention_budget(1, 1, seq, seq, DType::F32)
+        .expect_err("a 384 latent projects 81 GiB and must be refused");
+    assert!(err.to_string().contains("81.0 GiB"), "{err}");
+    Ok(())
+}

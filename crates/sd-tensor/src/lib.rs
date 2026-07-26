@@ -38,7 +38,7 @@ pub mod nn {
 /// Most forward to candle. The ones that do not are marked, and are the first
 /// candidates for a native implementation if we ever move off candle.
 pub mod ops {
-    use super::{Result, Tensor, D};
+    use super::{DType, Error, Result, Tensor, D};
 
     pub use candle_nn::ops::{silu, softmax, softmax_last_dim};
 
@@ -67,51 +67,234 @@ pub mod ops {
         xs * candle_nn::ops::sigmoid(&(xs * 1.702f64)?)?
     }
 
-    /// Scaled dot-product attention without a mask.
+    /// Which implementation served an attention call.
     ///
-    /// `q`, `k`, `v` are `[batch, heads, seq, head_dim]`.
+    /// Returned by [`attention_with_path`] so callers — tests especially — can
+    /// assert *which* path ran. Without it, a test that compares the
+    /// dispatcher against [`naive_attention`] silently degrades into comparing
+    /// the naive path with itself: it passes, and proves nothing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AttentionPath {
+        /// candle's fused kernel. The score matrix is never materialised.
+        Fused,
+        /// [`naive_attention`], bounded by [`check_attention_budget`].
+        Naive,
+    }
+
+    /// Environment override for the naive-attention memory budget, in bytes.
+    pub const ATTENTION_BUDGET_ENV: &str = "SD_ATTENTION_BUDGET_BYTES";
+
+    /// Ceiling on a single naive-attention score matrix.
     ///
-    /// Naive: it materialises the full `seq x seq` score matrix. This is
-    /// **measured to be the dominant cost at production resolution**, not a
-    /// theoretical concern.
+    /// 2 GiB admits every geometry this project actually runs — an SD 1.5 VAE
+    /// decode at 512x512 needs 64 MiB and SDXL at 1024x1024 needs 1 GiB — and
+    /// refuses the sizes that cannot finish. See [`check_attention_budget`].
+    pub const DEFAULT_ATTENTION_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+    /// Bytes one attention score matrix needs.
     ///
-    /// A 64x64 latent gives `seq = 4096`, so the score matrix is 4096x4096 f32
-    /// — 67 MB allocated per call, before softmax. On an M4 Max that is enough
-    /// to make Metal *slower than CPU* for a 512x512 VAE decode, despite Metal
-    /// being 4-5x faster at smaller sizes. See docs/backends.md for the table.
+    /// `None` means the count overflowed 64 bits, which is itself a refusal —
+    /// no machine runs that shape.
     ///
-    /// Replacing this with chunked or flash attention is the single
-    /// highest-value optimisation available, and — being behind the seam — it
-    /// needs no model code changes at all.
-    pub fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
-        let dim = q.dim(D::Minus1)?;
+    /// Note the `batch` and `heads` factors: the score matrix is
+    /// `[batch, heads, seq_q, seq_k]`, so a per-head figure understates a
+    /// multi-head call by `batch * heads`.
+    pub fn attention_score_bytes(
+        batch: usize,
+        heads: usize,
+        seq_q: usize,
+        seq_k: usize,
+        dtype: DType,
+    ) -> Option<u64> {
+        (batch as u64)
+            .checked_mul(heads as u64)?
+            .checked_mul(seq_q as u64)?
+            .checked_mul(seq_k as u64)?
+            .checked_mul(dtype.size_in_bytes() as u64)
+    }
+
+    /// Parse a budget override. `None` (unset) keeps the default.
+    pub fn parse_attention_budget(raw: Option<&str>) -> Result<u64> {
+        let Some(raw) = raw else {
+            return Ok(DEFAULT_ATTENTION_BUDGET_BYTES);
+        };
+        raw.trim().parse().map_err(|_| {
+            Error::Msg(format!(
+                "{ATTENTION_BUDGET_ENV} must be a byte count, got {raw:?}"
+            ))
+        })
+    }
+
+    /// The active budget, honouring [`ATTENTION_BUDGET_ENV`].
+    pub fn attention_budget_bytes() -> Result<u64> {
+        match std::env::var(ATTENTION_BUDGET_ENV) {
+            Ok(raw) => parse_attention_budget(Some(&raw)),
+            Err(std::env::VarError::NotPresent) => Ok(DEFAULT_ATTENTION_BUDGET_BYTES),
+            Err(std::env::VarError::NotUnicode(_)) => Err(Error::Msg(format!(
+                "{ATTENTION_BUDGET_ENV} is not valid UTF-8"
+            ))),
+        }
+    }
+
+    /// Refuse a naive-attention call whose score matrix exceeds the budget.
+    ///
+    /// This is a hard error rather than a warning because of how the failure
+    /// actually presents. On a Metal build the score matrix is wired GPU
+    /// memory: the GPU cannot take page faults, so those pages are pinned,
+    /// unswappable, and invisible to jetsam. Exceeding physical RAM therefore
+    /// does not kill the process — the kernel runs out of reclaimable pages
+    /// and the machine panics.
+    ///
+    /// On 2026-07-25 a VAE decode at a 384x384 latent projected 81 GiB on a
+    /// 36 GiB Mac and took the whole machine down with a watchdog timeout. The
+    /// process never got an allocation failure to report. That is why the
+    /// check happens here, before anything is allocated, instead of being left
+    /// to the allocator — and why it lives in the seam rather than in one
+    /// benchmark, since every caller allocates through this path.
+    ///
+    /// The returned figure is one score matrix. Peak usage is **at least
+    /// twice** that: scaling and softmax each produce a separate allocation of
+    /// the same size, and a mask adds another.
+    ///
+    /// Cost here is `O(n^4)` in the latent edge `n`, because `seq = n*n` and
+    /// the matrix is `seq x seq`. One step up a doubling sweep costs 16x.
+    pub fn check_attention_budget(
+        batch: usize,
+        heads: usize,
+        seq_q: usize,
+        seq_k: usize,
+        dtype: DType,
+    ) -> Result<u64> {
+        let budget = attention_budget_bytes()?;
+        let Some(bytes) = attention_score_bytes(batch, heads, seq_q, seq_k, dtype) else {
+            return Err(Error::Msg(format!(
+                "attention score matrix [{batch}, {heads}, {seq_q}, {seq_k}] ({dtype:?}) overflows \
+                 a 64-bit byte count; there is no machine that runs it"
+            )));
+        };
+        if bytes > budget {
+            return Err(Error::Msg(format!(
+                "refusing to allocate: attention score matrix [{batch}, {heads}, {seq_q}, \
+                 {seq_k}] ({dtype:?}) = {} for a single call, over the {} budget, and peak use is \
+                 at least double that.\n\n\
+                 For a VAE decode this is O(n^4) in the latent edge, so the next size up costs \
+                 16x. On a Metal build the allocation is wired GPU memory the OS cannot reclaim \
+                 or swap, so overshooting physical RAM panics the machine instead of failing this \
+                 process. See docs/backends.md.\n\n\
+                 Use a smaller size, or raise the budget deliberately with \
+                 {ATTENTION_BUDGET_ENV}=<bytes>.",
+                human_bytes(bytes),
+                human_bytes(budget),
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// Format a byte count in units a human can act on.
+    pub fn human_bytes(bytes: u64) -> String {
+        const UNITS: [(&str, u64); 4] = [
+            ("GiB", 1 << 30),
+            ("MiB", 1 << 20),
+            ("KiB", 1 << 10),
+            ("B", 1),
+        ];
+        for (suffix, scale) in UNITS {
+            if bytes >= scale {
+                return format!("{:.1} {suffix}", bytes as f64 / scale as f64);
+            }
+        }
+        format!("{bytes} B")
+    }
+
+    /// Reference attention: materialises the full `seq_q x seq_k` score matrix.
+    ///
+    /// `q`, `k`, `v` are `[batch, heads, seq, head_dim]`. `k`/`v` may have a
+    /// different sequence length than `q` (cross-attention).
+    ///
+    /// Kept as the correctness oracle for [`scaled_dot_product_attention`] and
+    /// as the fallback wherever candle's fused kernel declines the shape.
+    ///
+    /// Refuses oversized calls via [`check_attention_budget`] before
+    /// allocating anything. At a 64x64 latent (`seq = 4096`) the score matrix
+    /// is 4096x4096 f32 — 64 MiB per call — and it is measurably the dominant
+    /// cost at production resolution. See docs/backends.md.
+    pub fn naive_attention(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (batch, heads, seq_q, dim) = q.dims4()?;
+        let seq_k = k.dim(D::Minus2)?;
+        check_attention_budget(batch, heads, seq_q, seq_k, q.dtype())?;
+
         let scale = 1f64 / (dim as f64).sqrt();
         let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
+        let scores = match mask {
+            Some(m) => scores.broadcast_add(m)?,
+            None => scores,
+        };
         let weights = softmax_last_dim(&scores)?;
         weights.matmul(&v.contiguous()?)
     }
 
+    /// Attention, plus which implementation served it.
+    ///
+    /// candle 0.11 implements SDPA for Metal only — its `cpu_fwd` bails
+    /// outright — so on any other device we go straight to
+    /// [`naive_attention`] rather than paying for a guaranteed failure.
+    ///
+    /// Even on Metal the fused kernel declines shapes, and as of candle 0.11
+    /// it declines every shape in this workspace: f32 at `head_dim = 512` (the
+    /// VAE attention block) is explicitly excluded, and a mask must be
+    /// `[batch, heads, seq_q, seq_k]` while [`causal_mask`] is `[1, 1, s, s]`.
+    /// So this currently reports [`AttentionPath::Naive`] everywhere. Treat a
+    /// fused path as an optimisation that may arrive, not one already banked —
+    /// the memory characteristics you get today are the naive ones.
+    ///
+    /// A declined shape falls back rather than failing. That is safe because
+    /// the naive path is budget-checked; it cannot quietly turn into the
+    /// allocation that wedges the machine.
+    pub fn attention_with_path(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, AttentionPath)> {
+        if q.device().is_metal() {
+            let dim = q.dim(D::Minus1)?;
+            let scale = (1f64 / (dim as f64).sqrt()) as f32;
+            let qc = q.contiguous()?;
+            let kc = k.contiguous()?;
+            let vc = v.contiguous()?;
+            // `softcapping = 1.0` disables the tanh softcap path.
+            if let Ok(t) = candle_nn::ops::sdpa(&qc, &kc, &vc, mask, false, scale, 1.0) {
+                return Ok((t, AttentionPath::Fused));
+            }
+        }
+        Ok((naive_attention(q, k, v, mask)?, AttentionPath::Naive))
+    }
+
+    /// Scaled dot-product attention, unmasked.
+    ///
+    /// `q`, `k`, `v` are `[batch, heads, seq, head_dim]`. `k`/`v` may have a
+    /// different sequence length than `q` (cross-attention).
+    pub fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        attention_with_path(q, k, v, None).map(|(t, _)| t)
+    }
+
     /// Scaled dot-product attention with an additive mask.
     ///
-    /// `q`, `k`, `v` are `[batch, heads, seq, head_dim]`. `mask` is
-    /// broadcast-added to the scores before softmax, so masked positions
-    /// should hold a large negative value (`f32::NEG_INFINITY`) and visible
-    /// positions `0.0`.
-    ///
-    /// Needed by CLIP, which is causal. Same naive full-score-matrix caveat as
-    /// [`scaled_dot_product_attention`].
+    /// `mask` is added to the scores before softmax, so masked positions hold
+    /// a large negative value (`f32::NEG_INFINITY`) and visible positions
+    /// `0.0`. Build one with [`causal_mask`].
     pub fn scaled_dot_product_attention_masked(
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
         mask: &Tensor,
     ) -> Result<Tensor> {
-        let dim = q.dim(D::Minus1)?;
-        let scale = 1f64 / (dim as f64).sqrt();
-        let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
-        let scores = scores.broadcast_add(mask)?;
-        let weights = softmax_last_dim(&scores)?;
-        weights.matmul(&v.contiguous()?)
+        attention_with_path(q, k, v, Some(mask)).map(|(t, _)| t)
     }
 
     /// Additive causal mask of shape `[1, 1, seq, seq]`.
@@ -119,6 +302,11 @@ pub mod ops {
     /// Position `(i, j)` is `0.0` when `j <= i` and `f32::NEG_INFINITY`
     /// otherwise, ready to pass to
     /// [`scaled_dot_product_attention_masked`].
+    ///
+    /// The leading `1, 1` broadcasts over batch and heads, which the naive
+    /// path handles. candle's fused kernel instead requires a mask materialised
+    /// to `[batch, heads, seq_q, seq_k]`, so passing this one keeps us on the
+    /// naive path — see [`attention_with_path`].
     pub fn causal_mask(seq: usize, device: &super::Device) -> Result<Tensor> {
         let mut data = Vec::with_capacity(seq * seq);
         for i in 0..seq {
@@ -303,6 +491,162 @@ pub mod testing {
             "{what}: tensors diverge beyond atol={atol:.3e}\n  {c}\n\
              Hint: check axis order and parameter naming before suspecting the kernel."
         );
+        Ok(())
+    }
+}
+
+/// The attention memory budget that keeps an oversized decode from wedging the
+/// machine.
+///
+/// These live in the library, not in the benchmark that first triggered the
+/// crash, for two reasons: every caller allocates through
+/// [`ops::naive_attention`], and unit tests in an `examples/` target are not
+/// run by `cargo test` — a guard tested only there is a guard with no
+/// regression cover at all.
+#[cfg(test)]
+mod attention_budget_tests {
+    use super::ops::*;
+    use super::{DType, Device, Tensor};
+
+    /// One square f32 score matrix for a VAE decode at latent edge `n`.
+    fn latent_bytes(n: usize) -> Option<u64> {
+        let seq = n.checked_mul(n)?;
+        attention_score_bytes(1, 1, seq, seq, DType::F32)
+    }
+
+    #[test]
+    fn score_matrix_grows_as_the_fourth_power_of_the_latent_edge() {
+        // Quadrupling the latent edge is a 256x memory cost, which is exactly
+        // why eyeballing "one size up" is not safe here.
+        assert_eq!(latent_bytes(16), Some(256 * 1024));
+        assert_eq!(latent_bytes(64), Some(64 * 1024 * 1024));
+        assert_eq!(latent_bytes(128), Some(1024 * 1024 * 1024));
+        assert_eq!(latent_bytes(256), Some(16 * 1024 * 1024 * 1024));
+        assert_eq!(latent_bytes(384), Some(86_973_087_744));
+    }
+
+    #[test]
+    fn batch_and_heads_multiply_the_cost() {
+        // The score matrix is [batch, heads, seq_q, seq_k]. Costing a single
+        // head and calling it the total understates a real UNet call by an
+        // order of magnitude.
+        let one = attention_score_bytes(1, 1, 4096, 4096, DType::F32).unwrap();
+        assert_eq!(
+            attention_score_bytes(2, 8, 4096, 4096, DType::F32),
+            Some(one * 16)
+        );
+        // Dtype counts too: f16 halves it.
+        assert_eq!(
+            attention_score_bytes(1, 1, 4096, 4096, DType::F16),
+            Some(one / 2)
+        );
+    }
+
+    #[test]
+    fn the_documented_bench_sweep_still_runs() {
+        for n in [16usize, 32, 64] {
+            let seq = n * n;
+            assert!(
+                check_attention_budget(1, 1, seq, seq, DType::F32).is_ok(),
+                "docs/backends.md benchmarks latent {n}; the budget must not block it"
+            );
+        }
+    }
+
+    #[test]
+    fn sdxl_at_1024_is_not_collateral_damage() {
+        // A 128 latent is 1 GiB — real, supported work. A budget that refuses
+        // it would be protecting the machine by breaking the product.
+        assert!(check_attention_budget(1, 1, 128 * 128, 128 * 128, DType::F32).is_ok());
+    }
+
+    #[test]
+    fn the_run_that_panicked_the_machine_is_refused() {
+        // 2026-07-25: a decode at a 384 latent on a 36 GiB Mac projected
+        // 81 GiB of wired Metal memory and took the kernel down with a
+        // watchdog timeout.
+        let seq = 384 * 384;
+        let err = check_attention_budget(1, 1, seq, seq, DType::F32)
+            .expect_err("384 must not be runnable under the default budget");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("81.0 GiB"),
+            "should state the real cost: {msg}"
+        );
+        assert!(
+            msg.contains(ATTENTION_BUDGET_ENV),
+            "should name the override: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_first_size_over_budget_is_refused() {
+        // 128 is 1 GiB and allowed; 192 is 5 GiB and is not. The boundary
+        // matters more than the extremes — it is the step someone actually
+        // takes next after a successful run.
+        assert!(check_attention_budget(1, 1, 128 * 128, 128 * 128, DType::F32).is_ok());
+        assert!(check_attention_budget(1, 1, 192 * 192, 192 * 192, DType::F32).is_err());
+    }
+
+    #[test]
+    fn overflow_is_refused_rather_than_wrapped() {
+        // Wrapping would turn an impossible shape into a small byte count and
+        // wave it straight through the budget check.
+        assert_eq!(
+            attention_score_bytes(1, 1, usize::MAX, usize::MAX, DType::F32),
+            None
+        );
+        let seq = (1usize << 20) * (1usize << 20);
+        assert!(check_attention_budget(1, 1, seq, seq, DType::F32).is_err());
+    }
+
+    #[test]
+    fn the_budget_override_is_explicit_and_validated() {
+        assert_eq!(
+            parse_attention_budget(None).unwrap(),
+            DEFAULT_ATTENTION_BUDGET_BYTES
+        );
+        assert_eq!(parse_attention_budget(Some(" 4096 ")).unwrap(), 4096);
+        assert!(parse_attention_budget(Some("2GiB")).is_err());
+        assert!(parse_attention_budget(Some("-1")).is_err());
+    }
+
+    #[test]
+    fn sizes_are_reported_in_units_a_human_can_act_on() {
+        assert_eq!(human_bytes(86_973_087_744), "81.0 GiB");
+        assert_eq!(human_bytes(64 * 1024 * 1024), "64.0 MiB");
+        // Zero is below every scale and falls through to the plain form.
+        assert_eq!(human_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn attention_refuses_an_oversized_call_instead_of_allocating_it() -> super::Result<()> {
+        // The inputs here are ~740 KB each; the score matrix they imply is
+        // 2.0 GiB, just over budget. If the guard were missing or ran too
+        // late, this test would allocate that matrix — so it verifies the
+        // guard fires *before* the matmul, not merely that the numbers are
+        // right in isolation.
+        let dev = Device::Cpu;
+        let seq = 23_200;
+        let q = Tensor::zeros((1, 1, seq, 8), DType::F32, &dev)?;
+        let err = scaled_dot_product_attention(&q, &q, &q)
+            .expect_err("a 2.0 GiB score matrix is over the default budget");
+        assert!(
+            err.to_string().contains("refusing to allocate"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attention_reports_the_naive_path_off_metal() -> super::Result<()> {
+        // candle 0.11's SDPA is Metal-only, so on a CPU test runner the fused
+        // path is unreachable. Asserting this is what stops a "fused agrees
+        // with naive" test from quietly becoming naive-agrees-with-itself.
+        let dev = Device::Cpu;
+        let q = Tensor::zeros((1, 2, 8, 32), DType::F32, &dev)?;
+        let (_, path) = attention_with_path(&q, &q, &q, None)?;
+        assert_eq!(path, AttentionPath::Naive);
         Ok(())
     }
 }

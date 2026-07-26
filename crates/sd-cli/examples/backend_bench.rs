@@ -9,14 +9,54 @@
 //! sequence length is `n*n`, and our attention is O(seq^2) in memory, which is
 //! the whole point of this benchmark — see docs/backends.md.
 //!
+//! Because that makes memory grow as `n^4`, an oversized run is refused rather
+//! than left to the operating system. The refusal itself lives in the seam
+//! (`sd_tensor::ops::check_attention_budget`) so that it covers every caller,
+//! not just this file; what this file adds is doing the check *up front*, so a
+//! bad size costs nothing instead of failing partway through a decode.
+//!
 //! Always discard the first call: candle compiles Metal pipelines lazily, so
 //! it includes shader compilation and is not representative.
 
+use anyhow::{bail, Result};
 use sd_tensor::nn::{VarBuilder, VarMap};
+use sd_tensor::ops::{check_attention_budget, human_bytes};
 use sd_tensor::{device, DType, Tensor};
 use stable_diffusion_rs::models::vae::{Decoder, DecoderConfig};
 
-fn main() -> anyhow::Result<()> {
+/// Latent edge used when the argument is absent.
+const DEFAULT_LATENT_EDGE: u64 = 64;
+
+/// Parse the latent edge, rejecting a malformed argument rather than silently
+/// benchmarking a different size than the one that was asked for.
+fn latent_edge(arg: Option<&str>) -> Result<usize> {
+    let Some(arg) = arg else {
+        return Ok(DEFAULT_LATENT_EDGE as usize);
+    };
+    let n: u64 = arg
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("latent edge must be a positive integer, got {arg:?}"))?;
+    if n == 0 {
+        bail!("latent edge must be greater than zero");
+    }
+    // The budget check is what refuses oversized runs; this only keeps the
+    // `seq = n * n` arithmetic from overflowing before it gets there.
+    usize::try_from(n)
+        .ok()
+        .filter(|n| n.checked_mul(*n).is_some())
+        .ok_or_else(|| anyhow::anyhow!("latent {n}x{n} overflows an attention sequence length"))
+}
+
+fn main() -> Result<()> {
+    // Vet the size before allocating anything at all — including before
+    // building the decoder, so a refusal costs nothing.
+    let arg = std::env::args().nth(1);
+    let n = latent_edge(arg.as_deref())?;
+    let seq = n * n;
+    // The VAE attention block is single-head over a batch of one.
+    let score_bytes = check_attention_budget(1, 1, seq, seq, DType::F32)?;
+
     let dev = device::best()?;
     println!("device: {dev:?}");
 
@@ -32,15 +72,11 @@ fn main() -> anyhow::Result<()> {
         norm_eps: 1e-6,
     };
     let d = Decoder::new(&cfg, vb)?;
-    let n: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
     println!(
-        "latent {n}x{n} -> image {}x{}  (attention seq = {})",
+        "latent {n}x{n} -> image {}x{}  (attention seq = {seq}, score matrix = {})",
         n * 8,
         n * 8,
-        n * n
+        human_bytes(score_bytes),
     );
     let z = Tensor::zeros((1, 4, n, n), DType::F32, &dev)?;
 
@@ -60,4 +96,25 @@ fn main() -> anyhow::Result<()> {
     println!("best of 3 (steady state):         {best:?}");
     println!("output: {:?}", out.dims());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_malformed_argument_is_rejected_not_silently_defaulted() {
+        // Falling back to 64 would benchmark a different size than the one
+        // asked for and report it as if it were the requested run.
+        assert!(latent_edge(Some("64x")).is_err());
+        assert!(latent_edge(Some("-1")).is_err());
+        assert!(latent_edge(Some("0")).is_err());
+        assert_eq!(latent_edge(None).unwrap(), DEFAULT_LATENT_EDGE as usize);
+        assert_eq!(latent_edge(Some(" 32 ")).unwrap(), 32);
+    }
+
+    #[test]
+    fn an_edge_whose_square_overflows_is_rejected() {
+        assert!(latent_edge(Some(&u64::MAX.to_string())).is_err());
+    }
 }

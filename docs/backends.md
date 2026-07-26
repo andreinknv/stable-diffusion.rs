@@ -118,6 +118,15 @@ cargo run --release -p sd-cli --example backend_bench -- 32
 cargo run --release -p sd-cli --features metal --example backend_bench -- 32
 ```
 
+Mind the argument. Memory is `n^4`, so the next size up costs 16x, and on Metal
+the score matrix is wired GPU memory the OS cannot reclaim — overshooting RAM
+panics the machine rather than failing the process (this has happened, at
+`-- 384`). `sd_tensor::ops::check_attention_budget` refuses past a 2 GiB
+projection before allocating, and it sits in the seam, so the CLI and the models
+are covered too — not just this benchmark. Override with
+`SD_ATTENTION_BUDGET_BYTES` only deliberately; see rule 8 in
+[AGENTS.md](../AGENTS.md).
+
 Metal works — conv2d, group norm, attention and upsampling all execute on the
 GPU, and it is 4-5x faster than CPU. Then at production resolution it falls off
 a cliff and loses to the CPU.
@@ -132,6 +141,24 @@ slower, because the GPU is the one starved for memory bandwidth.
 Two caveats on the numbers: the first Metal call took 36 s including lazy
 shader compilation, so always warm up; and an M4 Max has unusually fast CPU
 matmul, so the CPU column flatters itself relative to a typical x86 machine.
+
+### What not to do about it: candle's fused SDPA
+
+`candle_nn::ops::sdpa` looks like the free fix. It is not, for us. In 0.11 it is
+Metal-only (`cpu_fwd` bails outright), and on Metal it declines every shape this
+workspace runs:
+
+- f32 at `head_dim = 512` is explicitly excluded — that is exactly the VAE
+  attention block, single-head over 512 channels, i.e. the call that produced
+  the cliff below.
+- the UNet's `head_dim = 40` is not in its supported set at all.
+- a mask must be materialised to `[batch, heads, seq_q, seq_k]`, while
+  `ops::causal_mask` is `[1, 1, s, s]`, so CLIP's causal path declines too.
+
+`ops::attention_with_path` is wired up to use it where it applies and reports
+which path actually ran, so this can be re-checked on a candle bump rather than
+re-litigated from memory. Today it reports `Naive` everywhere. Do not record
+"fused attention landed" as a memory win without checking that value.
 
 ### What to do about it
 

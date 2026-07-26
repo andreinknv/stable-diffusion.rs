@@ -8,7 +8,7 @@ translate a precise specification into Rust that makes a specific test pass.
 
 ---
 
-## The seven hard rules
+## The eight hard rules
 
 ### 1. Never modify a test file to make it pass
 
@@ -73,6 +73,46 @@ Copy names character by character from your task's reference layout section.
 
 Every task ends with exact commands. Run them. Paste the real output. Do not
 claim a test passes without having run it.
+
+### 8. Never run a size you have not costed
+
+Attention memory here is **O(n^4)** in the latent edge, not O(n^2). `seq = n*n`,
+and the score matrix is `seq x seq`. One step up a doubling sweep costs 16x:
+
+| latent n | image | one score matrix |
+|---:|---:|---:|
+| 64 | 512x512 | 64 MiB |
+| 128 | 1024x1024 | 1 GiB |
+| 256 | 2048x2048 | 16 GiB |
+| 384 | 3072x3072 | **81 GiB** |
+
+Those figures are for *one* matrix. Peak use is at least double: scaling and
+softmax each allocate another of the same size, and a mask adds a third. A
+multi-head call multiplies again by `batch * heads`.
+
+On a Metal build that matrix is **wired GPU memory**. The GPU cannot take page
+faults, so the pages are pinned, unswappable, and invisible to jetsam.
+Overshooting physical RAM does not fail your process — it takes the machine
+down. On 2026-07-25 `backend_bench 384` on a 36 GiB Mac ended in a kernel
+watchdog panic and a power-button reset. There was no error to catch and
+nothing in the logs from the benchmark itself.
+
+`sd_tensor::ops::check_attention_budget` now refuses past a 2 GiB projection,
+before anything is allocated, and *every* attention call goes through it — the
+CLI and the models, not just `backend_bench`. **Do not raise
+`SD_ATTENTION_BUDGET_BYTES` to get past a refusal.** It exists for a deliberate
+experiment on a machine you know can take it, not for clearing an obstacle. If
+your task needs a larger latent, stop and say so.
+
+Do not assume a fused attention kernel rescues you either. candle 0.11 ships one
+for Metal, but it declines every shape in this workspace (f32 at `head_dim=512`
+is excluded, and it wants a mask materialised to `[batch, heads, seq_q, seq_k]`),
+so what actually runs today is the naive path with the memory profile above.
+`sd_tensor::ops::attention_with_path` reports which path served a call; check it
+rather than assuming.
+
+The general form of this rule: before running anything parameterised by a size,
+work out what that size allocates. Refusing is free; a wedged machine is not.
 
 ---
 

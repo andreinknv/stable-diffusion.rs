@@ -14,6 +14,15 @@ authors.workspace = true
 name = "sdrs"
 path = "src/main.rs"
 
+# Cargo defaults example targets to `test = false`, so a `#[cfg(test)]` block
+# in an example compiles under `cargo test` and then never runs. Declaring the
+# target explicitly is what makes these tests real; without it the benchmark's
+# guard-rail tests would be silently dead in CI.
+[[example]]
+name = "backend_bench"
+path = "examples/backend_bench.rs"
+test = true
+
 [dependencies]
 stable-diffusion-rs.workspace = true
 sd-tensor.workspace = true
