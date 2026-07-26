@@ -305,13 +305,54 @@ still earns its place: it bounds the allocation, and it is what SD 1.5's
 40- and 160-wide heads use, along with any masked shape, since the kernel
 wants a `[batch, heads, seq_q, seq_k]` mask and `causal_mask` is `[1, 1, s, s]`.
 
-What is genuinely left is narrower than "write a kernel":
+### Metal end to end: fast, and currently **wrong**
 
-- **Run the diffusion models end to end on Metal.** Every Flux and SD 3.5
-  timing in this document is CPU-only. The attention is now fast; whether the
-  rest of the graph is has not been measured.
-- Broadening the fused path to SD 1.5 by materialising the causal mask to the
-  shape the kernel wants, which is a reshape rather than a kernel.
+Flux schnell at 512x512, 4 steps: **22.7 s on Metal against 166.1 s on CPU**,
+a 7.3x speedup, with memory never dropping below 82% free. The image it
+produces is garbage — a flat orange field with a corrupted strip along the
+top. Speed is worthless without that, so **Metal is not usable for the
+diffusion models yet** and the CPU timings elsewhere in this document remain
+the honest ones.
+
+Not yet localised. `--example metal_check` compares CPU against Metal per
+operation and everything it covers agrees:
+
+| op | agreement |
+|---|---|
+| fused attention (Flux-shaped) | 1.9e-7 |
+| QLinear Q4_K / Q5_K / Q8_0 | within quantisation noise |
+| QLinear F16, plain matmul | exact |
+
+So the fault is in composition, or in an op that check does not cover — the
+VAE's convolutions, the norms, or RoPE. Worth remembering that Metal has
+produced exactly this shape of failure here before: a 1024 decode returned
+noise because candle never checks the Metal command buffer unless something
+synchronises, and the real error (`kIOGPUCommandBufferCallbackErrorOutOfMemory`)
+was invisible until a synchronize was forced. Extending `metal_check` op by
+op is the way in.
+
+### Candle capabilities we are not using
+
+A survey after the fused-attention surprise, since the same mistake was
+clearly available twice:
+
+- **`candle_nn::ops::rms_norm`** — a fused RMSNorm. We hand-wrote one in
+  `t5`, one in `flux` and one in `sd3`. Three copies of an op candle already
+  has, each doing its own f32 upcast.
+- **`candle_nn::cpu_flash_attention::run_flash_attn_cpu`** — flash attention
+  for the *CPU* path, which is what every model here actually runs on.
+  Potentially the largest single win available, and entirely unexplored.
+- **`candle_nn::rotary_emb::{rope, rope_i, rope_thd}`** — fused RoPE. Flux's
+  axis-wise 2x2 formulation may not map onto it directly, but that is worth
+  establishing rather than assuming.
+- **`candle_nn::ops::{layer_norm, pixel_shuffle, pixel_unshuffle}`** — a
+  fused LayerNorm, and shuffles that are exactly patchify/unpatchify.
+- `candle-transformers` ships its own flux, t5, clip and stable_diffusion
+  models. We do not want those — implementing the models is the point of this
+  project — but they are a reference to check ambiguous conventions against.
+
+- Broadening the fused attention path to SD 1.5 by materialising the causal
+  mask to the shape the kernel wants, which is a reshape rather than a kernel.
 
 ## Upstream contributions worth making
 
