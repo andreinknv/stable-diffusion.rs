@@ -670,6 +670,78 @@ def dump_sdxl_text_encoder_2(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out / 'text_encoder_2.safetensors'}")
 
 
+def dump_sdxl_unet(output: pathlib.Path, model_id: str) -> None:
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import UNet2DConditionModel
+    from safetensors.torch import save_file
+
+    out = output / "sdxl_unet"
+    out.mkdir(parents=True, exist_ok=True)
+
+    # fp16 variant: half the download, and both sides load the same file, so
+    # the comparison stays apples-to-apples. Upcast to fp32 for the reference
+    # because that is what the Rust side runs.
+    print(f"loading {model_id} (subfolder=unet, variant=fp16)")
+    unet = UNet2DConditionModel.from_pretrained(
+        model_id, subfolder="unet", variant="fp16", torch_dtype=torch.float32
+    )
+    unet.eval()
+
+    gen = torch.Generator().manual_seed(SEED)
+    sample = torch.randn(1, 4, 32, 32, generator=gen)
+    timestep = torch.tensor([500.0])
+    # SDXL's cross-attention dim is 2048: the two encoders concatenated.
+    context = torch.randn(1, 77, 2048, generator=gen)
+    pooled = torch.randn(1, 1280, generator=gen)
+    # original h/w, crop top/left, target h/w.
+    time_ids = torch.tensor([[1024.0, 1024.0, 0.0, 0.0, 1024.0, 1024.0]])
+
+    mid_out = {}
+
+    def capture_mid(_m, _i, o):
+        t = o[0] if isinstance(o, tuple) else o
+        mid_out["mid_output"] = t.detach().contiguous().float().clone()
+
+    handle = unet.mid_block.register_forward_hook(capture_mid)
+    with torch.no_grad():
+        result = unet(
+            sample,
+            timestep,
+            encoder_hidden_states=context,
+            added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids},
+        ).sample
+    handle.remove()
+
+    tensors = {
+        "sample": sample.contiguous(),
+        "timestep": timestep.contiguous(),
+        "context": context.contiguous(),
+        "pooled": pooled.contiguous(),
+        "time_ids": time_ids.contiguous(),
+        "output": result.detach().contiguous().clone(),
+        **mid_out,
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    link = out / "unet.safetensors"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(
+        hf_hub_download(
+            repo_id=model_id, filename="unet/diffusion_pytorch_model.fp16.safetensors"
+        )
+    )
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<14} {tuple(v.shape)}")
+    print(f"linked {link}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="component", required=True)
@@ -732,8 +804,16 @@ def main() -> None:
     )
     sdxl2.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    sdxlu = sub.add_parser("sdxl_unet", help="dump SDXL UNet references")
+    sdxlu.add_argument(
+        "--model-id", default="stabilityai/stable-diffusion-xl-base-1.0", help="HuggingFace model id"
+    )
+    sdxlu.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     args = ap.parse_args()
-    if args.component == "sdxl_text_encoder_2":
+    if args.component == "sdxl_unet":
+        dump_sdxl_unet(args.output, args.model_id)
+    elif args.component == "sdxl_text_encoder_2":
         dump_sdxl_text_encoder_2(args.output, args.model_id)
     elif args.component == "samplers":
         dump_samplers(args.output, args.model_id)

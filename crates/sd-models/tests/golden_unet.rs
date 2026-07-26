@@ -52,9 +52,14 @@ fn config_sd15_has_four_blocks_and_768_cross_dim() {
     assert_eq!(cfg.layers_per_block, 2);
     assert_eq!(cfg.in_channels, 4);
     assert_eq!(cfg.out_channels, 4);
-    // Head *count*, despite the name. 320 / 8 = 40 wide at the first block.
-    assert_eq!(cfg.attention_head_dim, 8);
-    assert_eq!(cfg.block_out_channels[0] / cfg.attention_head_dim, 40);
+    // Head *counts*, despite the name. 320 / 8 = 40 wide at the first block.
+    assert_eq!(cfg.attention_head_dim, vec![8; 4]);
+    assert_eq!(cfg.block_out_channels[0] / cfg.attention_head_dim[0], 40);
+    // SD 1.5 attends on every block but the deepest, one transformer each.
+    assert_eq!(cfg.down_block_has_attention, vec![true, true, true, false]);
+    assert_eq!(cfg.transformer_layers_per_block, vec![1; 4]);
+    // No micro-conditioning: that is SDXL's.
+    assert!(cfg.addition.is_none());
     // 1e-5 in the UNet, unlike the VAE's 1e-6.
     assert!((cfg.norm_eps - 1e-5).abs() < f64::EPSILON);
 }
@@ -79,10 +84,13 @@ fn tiny_config() -> UNetConfig {
         out_channels: 4,
         block_out_channels: vec![32, 64],
         layers_per_block: 1,
-        attention_head_dim: 2,
+        attention_head_dim: vec![2, 2],
+        transformer_layers_per_block: vec![1, 1],
+        down_block_has_attention: vec![true, false],
         cross_attention_dim: 16,
         norm_num_groups: 8,
         norm_eps: 1e-5,
+        addition: None,
     }
 }
 
@@ -118,7 +126,7 @@ fn the_skip_stack_is_fully_consumed() {
     let context = Tensor::zeros((1, 77, cfg.cross_attention_dim), DType::F32, &dev).unwrap();
 
     let (_, skips, _) = unet
-        .forward_with_skips(&sample, &timestep, &context)
+        .forward_with_skips(&sample, &timestep, &context, None)
         .expect("forward");
     assert_eq!(skips.len(), cfg.skip_channels().len());
 }
@@ -136,6 +144,7 @@ fn down_pass_skips_match_diffusers() {
             refs.get("sample").expect("sample"),
             refs.get("timestep").expect("timestep"),
             refs.get("context").expect("context"),
+            None,
         )
         .expect("forward");
     assert_eq!(skips.len(), 12, "skip stack must have 12 entries");
@@ -172,6 +181,7 @@ fn mid_block_matches_diffusers() {
             refs.get("sample").expect("sample"),
             refs.get("timestep").expect("timestep"),
             refs.get("context").expect("context"),
+            None,
         )
         .expect("forward");
     let want = refs.get("mid_output").expect("mid_output");

@@ -8,7 +8,7 @@
 use sd_tensor::nn::{conv2d, group_norm, Conv2d, Conv2dConfig, GroupNorm};
 use sd_tensor::{ops, Module, Result, Tensor, VarBuilder};
 
-use super::blocks::{BlockConfig, DownBlock2D, MidBlock2DCrossAttn, UpBlock2D};
+use super::blocks::{AttentionSpec, BlockConfig, DownBlock2D, MidBlock2DCrossAttn, UpBlock2D};
 use super::embeddings::{timestep_embedding, TimestepEmbedding};
 
 /// Geometry of the denoiser.
@@ -18,13 +18,33 @@ pub struct UNetConfig {
     pub out_channels: usize,
     pub block_out_channels: Vec<usize>,
     pub layers_per_block: usize,
-    /// **The number of attention heads, despite the name.** SD 1.5's config
-    /// calls this `attention_head_dim` and diffusers reads it as a head count,
-    /// so at 320 channels this is 8 heads of 40 — not heads of width 8.
-    pub attention_head_dim: usize,
+    /// **Head counts, despite the name.** Both configs call this
+    /// `attention_head_dim` and diffusers reads it as a head count, so SD 1.5's
+    /// 8 at 320 channels means 8 heads of 40 — not heads of width 8. One entry
+    /// per block.
+    pub attention_head_dim: Vec<usize>,
+    /// Transformer blocks per attention module, one entry per block. All 1 in
+    /// SD 1.5; SDXL uses [1, 2, 10].
+    pub transformer_layers_per_block: Vec<usize>,
+    /// Which down blocks carry cross-attention. Up blocks mirror this in
+    /// reverse. SD 1.5 attends on all but the deepest; SDXL on all but the
+    /// *shallowest*, which is the opposite end.
+    pub down_block_has_attention: Vec<bool>,
     pub cross_attention_dim: usize,
     pub norm_num_groups: usize,
     pub norm_eps: f64,
+    /// SDXL's micro-conditioning. `None` for SD 1.5, which has none.
+    pub addition: Option<AdditionEmbedding>,
+}
+
+/// SDXL's extra conditioning: image size and crop offsets, sinusoidally
+/// embedded and concatenated with the pooled text embedding.
+#[derive(Debug, Clone, Copy)]
+pub struct AdditionEmbedding {
+    /// Width of the sinusoid applied to each of the six time ids.
+    pub time_embed_dim: usize,
+    /// Input width of `add_embedding`: `6 * time_embed_dim + pooled_dim`.
+    pub projection_input_dim: usize,
 }
 
 impl UNetConfig {
@@ -34,11 +54,52 @@ impl UNetConfig {
             out_channels: 4,
             block_out_channels: vec![320, 640, 1280, 1280],
             layers_per_block: 2,
-            attention_head_dim: 8,
+            attention_head_dim: vec![8; 4],
+            transformer_layers_per_block: vec![1; 4],
+            down_block_has_attention: vec![true, true, true, false],
             cross_attention_dim: 768,
             norm_num_groups: 32,
             norm_eps: 1e-5,
+            addition: None,
         }
+    }
+
+    /// SDXL base.
+    ///
+    /// Three blocks rather than four, attention on the *last two* rather than
+    /// the first three, a much deeper transformer at the bottom, and the
+    /// text_time micro-conditioning.
+    pub fn sdxl() -> Self {
+        Self {
+            in_channels: 4,
+            out_channels: 4,
+            block_out_channels: vec![320, 640, 1280],
+            layers_per_block: 2,
+            // 320/5 = 640/10 = 1280/20 = 64 wide throughout.
+            attention_head_dim: vec![5, 10, 20],
+            transformer_layers_per_block: vec![1, 2, 10],
+            down_block_has_attention: vec![false, true, true],
+            cross_attention_dim: 2048,
+            norm_num_groups: 32,
+            norm_eps: 1e-5,
+            addition: Some(AdditionEmbedding {
+                time_embed_dim: 256,
+                // 6 ids * 256 = 1536, plus the 1280-wide pooled embedding.
+                projection_input_dim: 2816,
+            }),
+        }
+    }
+
+    /// Attention spec for block `i`, or `None` when that block has none.
+    fn attention_spec(&self, i: usize) -> Option<AttentionSpec> {
+        if !*self.down_block_has_attention.get(i)? {
+            return None;
+        }
+        Some(AttentionSpec {
+            heads: *self.attention_head_dim.get(i)?,
+            cross_dim: self.cross_attention_dim,
+            depth: *self.transformer_layers_per_block.get(i)?,
+        })
     }
 
     /// Channel width of every skip the down pass pushes, in push order.
@@ -76,6 +137,8 @@ pub struct UNet2DConditionModel {
     conv_out: Conv2d,
     /// `block_out_channels[0]`, the width of the raw sinusoid.
     freq_dim: usize,
+    /// SDXL only. Projects the micro-conditioning into the time embedding.
+    add_embedding: Option<(TimestepEmbedding, AdditionEmbedding)>,
 }
 
 fn conv3x3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
@@ -99,7 +162,6 @@ impl UNet2DConditionModel {
             sd_tensor::Error::Msg("block_out_channels must not be empty".to_string())
         })?;
         let temb_channels = first * 4;
-        let heads = cfg.attention_head_dim;
 
         let conv_in = conv3x3(cfg.in_channels, first, vb.pp("conv_in"))?;
         let time_embedding = TimestepEmbedding::new(first, temb_channels, vb.pp("time_embedding"))?;
@@ -118,9 +180,9 @@ impl UNet2DConditionModel {
                     num_layers: cfg.layers_per_block,
                     groups: cfg.norm_num_groups,
                     eps: cfg.norm_eps,
-                    // The deepest down block has neither attention nor a
-                    // downsampler.
-                    attention: (!is_final).then_some((heads, cfg.cross_attention_dim)),
+                    attention: cfg.attention_spec(i),
+                    // The deepest block never downsamples, whichever
+                    // architecture this is.
                     resample: !is_final,
                 },
                 vb_down.pp(i.to_string()),
@@ -128,15 +190,27 @@ impl UNet2DConditionModel {
             prev = out_c;
         }
 
+        // The mid block always attends, at the deepest block's width and depth.
+        let deepest = channels.len() - 1;
         let mid_block = MidBlock2DCrossAttn::new(
             last,
             temb_channels,
-            heads,
-            cfg.cross_attention_dim,
+            AttentionSpec {
+                heads: *cfg.attention_head_dim.last().ok_or_else(|| {
+                    sd_tensor::Error::Msg("attention_head_dim must not be empty".to_string())
+                })?,
+                cross_dim: cfg.cross_attention_dim,
+                depth: *cfg.transformer_layers_per_block.last().ok_or_else(|| {
+                    sd_tensor::Error::Msg(
+                        "transformer_layers_per_block must not be empty".to_string(),
+                    )
+                })?,
+            },
             cfg.norm_num_groups,
             cfg.norm_eps,
             vb.pp("mid_block"),
         )?;
+        let _ = deepest;
 
         // -- up ----------------------------------------------------------
         //
@@ -163,9 +237,10 @@ impl UNet2DConditionModel {
                     num_layers: up_layers,
                     groups: cfg.norm_num_groups,
                     eps: cfg.norm_eps,
-                    // The first up block has no attention; the last has no
-                    // upsampler.
-                    attention: (i != 0).then_some((heads, cfg.cross_attention_dim)),
+                    // Up blocks mirror the down pass, so block `i` here
+                    // corresponds to down block `len - 1 - i`.
+                    attention: cfg.attention_spec(reversed.len() - 1 - i),
+                    // The last up block never upsamples.
                     resample: i != reversed.len() - 1,
                 },
                 &chunk,
@@ -188,12 +263,41 @@ impl UNet2DConditionModel {
             )?,
             conv_out: conv3x3(first, cfg.out_channels, vb.pp("conv_out"))?,
             freq_dim: first,
+            add_embedding: match cfg.addition {
+                Some(add) => Some((
+                    TimestepEmbedding::new(
+                        add.projection_input_dim,
+                        temb_channels,
+                        vb.pp("add_embedding"),
+                    )?,
+                    add,
+                )),
+                None => None,
+            },
         })
     }
 
-    /// `sample`: `[b, 4, h, w]`, `timestep`: `[b]`, `context`: `[b, 77, 768]`.
+    /// `sample`: `[b, 4, h, w]`, `timestep`: `[b]`, `context`: `[b, 77, dim]`.
     pub fn forward(&self, sample: &Tensor, timestep: &Tensor, context: &Tensor) -> Result<Tensor> {
-        self.forward_with_skips(sample, timestep, context)
+        self.forward_with_skips(sample, timestep, context, None)
+            .map(|(out, _, _)| out)
+    }
+
+    /// SDXL's forward: the same, plus micro-conditioning.
+    ///
+    /// `pooled` is the second text encoder's projected embedding `[b, 1280]`,
+    /// and `time_ids` is `[b, 6]` — original height and width, crop top and
+    /// left, then target height and width. Both are required by an SDXL UNet
+    /// and rejected by an SD 1.5 one, which has nowhere to put them.
+    pub fn forward_sdxl(
+        &self,
+        sample: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        pooled: &Tensor,
+        time_ids: &Tensor,
+    ) -> Result<Tensor> {
+        self.forward_with_skips(sample, timestep, context, Some((pooled, time_ids)))
             .map(|(out, _, _)| out)
     }
 
@@ -208,11 +312,37 @@ impl UNet2DConditionModel {
         sample: &Tensor,
         timestep: &Tensor,
         context: &Tensor,
+        added: Option<(&Tensor, &Tensor)>,
     ) -> Result<(Tensor, Vec<Tensor>, Tensor)> {
         // `timestep` is [b], not a scalar: a scalar yields [1, 1280] where
         // [b, 1280] is needed, and that only surfaces deep inside a resnet.
         let temb = timestep_embedding(timestep, self.freq_dim)?;
         let temb = self.time_embedding.forward(&temb)?;
+
+        let temb = match (&self.add_embedding, added) {
+            (Some((embed, cfg)), Some((pooled, time_ids))) => {
+                // Each of the six ids gets its own sinusoid, then they are
+                // flattened and concatenated with the pooled text embedding.
+                let (b, n) = time_ids.dims2()?;
+                let flat = time_ids.flatten_all()?;
+                let sinusoid = timestep_embedding(&flat, cfg.time_embed_dim)?;
+                let sinusoid = sinusoid.reshape((b, n * cfg.time_embed_dim))?;
+                let combined = Tensor::cat(&[&sinusoid, pooled], 1)?;
+                // Added to the timestep embedding, not concatenated with it.
+                (temb + embed.forward(&combined)?)?
+            }
+            (Some(_), None) => {
+                return Err(sd_tensor::Error::Msg(
+                    "this UNet expects SDXL micro-conditioning; use forward_sdxl".to_string(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(sd_tensor::Error::Msg(
+                    "micro-conditioning supplied to a UNet that has no add_embedding".to_string(),
+                ))
+            }
+            (None, None) => temb,
+        };
 
         let mut h = self.conv_in.forward(sample)?;
         // conv_in's output is the first skip. Omitting it shifts the entire

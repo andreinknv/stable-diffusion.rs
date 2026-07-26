@@ -22,6 +22,7 @@ pub struct ClipTokenizer {
     inner: tokenizers::Tokenizer,
     bos_token_id: u32,
     eos_token_id: u32,
+    pad_token_id: u32,
     max_length: usize,
 }
 
@@ -53,8 +54,30 @@ impl ClipTokenizer {
             inner,
             bos_token_id,
             eos_token_id,
+            // CLIP pads with EOS. SDXL's *second* tokenizer does not — see
+            // `with_pad_token`.
+            pad_token_id: eos_token_id,
             max_length: MAX_LENGTH,
         })
+    }
+
+    /// Override the padding token by name.
+    ///
+    /// SD 1.5's tokenizer, and SDXL's first, pad with `<|endoftext|>`. SDXL's
+    /// **second** pads with `!` — token id 0. Applying the first rule to the
+    /// second fills every unused slot with 49407 instead of 0, which changes
+    /// the conditioning for every prompt shorter than 77 tokens, meaning all
+    /// of them. Nothing about the shapes reveals it.
+    pub fn with_pad_token(mut self, token: &str) -> Result<Self, TokenizeError> {
+        self.pad_token_id = self
+            .inner
+            .token_to_id(token)
+            .ok_or_else(|| TokenizeError::Load(format!("vocabulary has no {token}")))?;
+        Ok(self)
+    }
+
+    pub fn pad_token_id(&self) -> u32 {
+        self.pad_token_id
     }
 
     /// Encode a prompt to exactly `max_length` (77) token IDs.
@@ -81,7 +104,7 @@ impl ClipTokenizer {
     }
 
     fn fit(&self, ids: &[u32]) -> Vec<u32> {
-        fit_to_context(ids, self.max_length, self.eos_token_id)
+        fit_to_context(ids, self.max_length, self.eos_token_id, self.pad_token_id)
     }
 
     pub fn bos_token_id(&self) -> u32 {
@@ -97,25 +120,36 @@ impl ClipTokenizer {
     }
 }
 
-/// Force `ids` to exactly `max_length`, padding or truncating with EOS.
+/// Force `ids` to exactly `max_length`.
 ///
-/// Both directions end in EOS. Truncation overwrites the last slot rather than
-/// just slicing, because a naive `ids[..77]` cuts mid-prompt and leaves an
-/// ordinary word token where the encoder expects the sequence to terminate.
+/// Two different rules, and conflating them is the bug this signature exists
+/// to prevent:
+///
+/// * **Truncating** always ends in EOS. A naive `ids[..77]` cuts mid-prompt
+///   and leaves an ordinary word token where the encoder expects the sequence
+///   to terminate.
+/// * **Padding** fills with `pad`, and does *not* move EOS — the sequence
+///   already ended, and the padding sits after it. When `pad == eos` (CLIP's
+///   usual case) the two are indistinguishable, which is exactly why SDXL's
+///   second tokenizer, which pads with 0, breaks code that assumes otherwise.
 ///
 /// A free function rather than a method so the padding contract — the part of
 /// this file that is ours rather than the `tokenizers` crate's, and where the
 /// mistakes actually happen — is testable without a 2 MB vocabulary. The
 /// integration tests need the real `tokenizer.json` and therefore skip when it
 /// is absent; these do not, so they run in CI.
-fn fit_to_context(ids: &[u32], max_length: usize, eos: u32) -> Vec<u32> {
+fn fit_to_context(ids: &[u32], max_length: usize, eos: u32, pad: u32) -> Vec<u32> {
     if max_length == 0 {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(max_length);
-    out.extend_from_slice(&ids[..ids.len().min(max_length)]);
-    out.resize(max_length, eos);
-    out[max_length - 1] = eos;
+    if ids.len() >= max_length {
+        out.extend_from_slice(&ids[..max_length]);
+        out[max_length - 1] = eos;
+    } else {
+        out.extend_from_slice(ids);
+        out.resize(max_length, pad);
+    }
     out
 }
 
@@ -140,7 +174,7 @@ mod tests {
     fn a_short_prompt_is_padded_with_eos_not_zero() {
         // Padding with 0 is the classic mistake: 0 is a real token id, so the
         // result looks plausible and produces subtly wrong embeddings.
-        let got = fit_to_context(&[BOS, 320, 1125, EOS], 8, EOS);
+        let got = fit_to_context(&[BOS, 320, 1125, EOS], 8, EOS, EOS);
         assert_eq!(got, vec![BOS, 320, 1125, EOS, EOS, EOS, EOS, EOS]);
     }
 
@@ -149,19 +183,19 @@ mod tests {
         // A naive `ids[..max]` would end on 5 here, leaving the encoder with
         // no terminator.
         let ids: Vec<u32> = (1..=10).collect();
-        let got = fit_to_context(&ids, 5, EOS);
+        let got = fit_to_context(&ids, 5, EOS, EOS);
         assert_eq!(got, vec![1, 2, 3, 4, EOS]);
     }
 
     #[test]
     fn an_exact_fit_still_ends_in_eos() {
-        let got = fit_to_context(&[BOS, 320, EOS], 3, EOS);
+        let got = fit_to_context(&[BOS, 320, EOS], 3, EOS, EOS);
         assert_eq!(got, vec![BOS, 320, EOS]);
     }
 
     #[test]
     fn empty_input_is_all_padding() {
-        assert_eq!(fit_to_context(&[], 4, EOS), vec![EOS, EOS, EOS, EOS]);
+        assert_eq!(fit_to_context(&[], 4, EOS, EOS), vec![EOS, EOS, EOS, EOS]);
     }
 
     #[test]
@@ -169,8 +203,51 @@ mod tests {
         for len in [0usize, 1, 2, 77] {
             for input in [0usize, 1, 5, 200] {
                 let ids: Vec<u32> = (0..input as u32).collect();
-                assert_eq!(fit_to_context(&ids, len, EOS).len(), len);
+                assert_eq!(fit_to_context(&ids, len, EOS, EOS).len(), len);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pad_token_tests {
+    use super::*;
+
+    const BOS: u32 = 49406;
+    const EOS: u32 = 49407;
+    /// SDXL's second tokenizer pads with `!`, which is id 0.
+    const PAD_BANG: u32 = 0;
+
+    #[test]
+    fn padding_uses_the_pad_token_not_eos() {
+        // The SDXL tokenizer_2 case. EOS still terminates the sequence where
+        // the prompt ends; everything after it is the pad token.
+        let got = fit_to_context(&[BOS, 320, EOS], 6, EOS, PAD_BANG);
+        assert_eq!(got, vec![BOS, 320, EOS, PAD_BANG, PAD_BANG, PAD_BANG]);
+    }
+
+    #[test]
+    fn padding_does_not_move_eos_to_the_last_slot() {
+        // The bug this split exists to prevent. Forcing the final slot to EOS
+        // is correct when truncating and wrong when padding — and invisible
+        // whenever pad == eos, which is every SD 1.5 case.
+        let got = fit_to_context(&[BOS, 320, EOS], 6, EOS, PAD_BANG);
+        assert_ne!(
+            *got.last().unwrap(),
+            EOS,
+            "EOS belongs where the prompt ended, not at the end of the padding"
+        );
+    }
+
+    #[test]
+    fn truncation_still_ends_in_eos_whatever_the_pad_token() {
+        // Truncation has no padding, so the pad token is irrelevant and the
+        // EOS rule still applies.
+        let ids: Vec<u32> = (1..=10).collect();
+        assert_eq!(
+            fit_to_context(&ids, 4, EOS, PAD_BANG),
+            vec![1, 2, 3, EOS],
+            "a truncated prompt must terminate"
+        );
     }
 }

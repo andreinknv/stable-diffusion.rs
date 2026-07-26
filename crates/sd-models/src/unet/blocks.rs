@@ -80,6 +80,17 @@ pub struct DownBlock2D {
     downsampler: Option<Downsample2D>,
 }
 
+/// Cross-attention settings for a block that has it.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionSpec {
+    /// Head *count*. `dim_head` is derived as `channels / heads`.
+    pub heads: usize,
+    pub cross_dim: usize,
+    /// Transformer blocks per attention module. 1 throughout SD 1.5; SDXL
+    /// uses [1, 2, 10], so the deepest block carries ten.
+    pub depth: usize,
+}
+
 /// How a block is configured. Grouped into a struct because passing eight
 /// positional numbers to two constructors is how the head count and the head
 /// dim get swapped.
@@ -90,8 +101,8 @@ pub struct BlockConfig {
     pub num_layers: usize,
     pub groups: usize,
     pub eps: f64,
-    /// `Some((heads, cross_dim))` adds a transformer after every resnet.
-    pub attention: Option<(usize, usize)>,
+    /// `Some(spec)` adds a transformer after every resnet.
+    pub attention: Option<AttentionSpec>,
     pub resample: bool,
 }
 
@@ -116,13 +127,13 @@ impl DownBlock2D {
                 cfg.eps,
                 vb_resnets.pp(i.to_string()),
             )?);
-            if let Some((heads, cross_dim)) = cfg.attention {
+            if let Some(a) = cfg.attention {
                 attentions.push(Transformer2DModel::new(
                     cfg.out_channels,
-                    heads,
-                    cfg.out_channels / heads,
-                    1,
-                    cross_dim,
+                    a.heads,
+                    cfg.out_channels / a.heads,
+                    a.depth,
+                    a.cross_dim,
                     vb_attn.pp(i.to_string()),
                 )?);
             }
@@ -206,13 +217,13 @@ impl UpBlock2D {
                 cfg.eps,
                 vb_resnets.pp(i.to_string()),
             )?);
-            if let Some((heads, cross_dim)) = cfg.attention {
+            if let Some(a) = cfg.attention {
                 attentions.push(Transformer2DModel::new(
                     cfg.out_channels,
-                    heads,
-                    cfg.out_channels / heads,
-                    1,
-                    cross_dim,
+                    a.heads,
+                    cfg.out_channels / a.heads,
+                    a.depth,
+                    a.cross_dim,
                     vb_attn.pp(i.to_string()),
                 )?);
             }
@@ -273,8 +284,7 @@ impl MidBlock2DCrossAttn {
     pub fn new(
         channels: usize,
         temb_channels: usize,
-        heads: usize,
-        cross_dim: usize,
+        attention: AttentionSpec,
         groups: usize,
         eps: f64,
         vb: VarBuilder,
@@ -291,10 +301,10 @@ impl MidBlock2DCrossAttn {
             )?,
             attention: Transformer2DModel::new(
                 channels,
-                heads,
-                channels / heads,
-                1,
-                cross_dim,
+                attention.heads,
+                channels / attention.heads,
+                attention.depth,
+                attention.cross_dim,
                 vb.pp("attentions").pp("0"),
             )?,
             resnet_1: ResnetBlock2D::new(
