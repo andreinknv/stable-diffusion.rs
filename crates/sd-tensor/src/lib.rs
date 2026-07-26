@@ -499,6 +499,8 @@ pub mod gguf {
     pub use candle_core::quantized::{GgmlDType, QTensor};
 }
 
+pub mod quantized;
+
 pub mod sysmem;
 
 /// Device selection.
