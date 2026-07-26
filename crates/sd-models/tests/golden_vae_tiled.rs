@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use sd_models::vae::{AutoencoderKlDecoder, VaeConfig, TILE_LATENT_EDGE};
+use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, VaeConfig, TILE_LATENT_EDGE};
 use sd_tensor::{testing, DType, Device, Tensor};
 
 fn decoder(dev: &Device) -> Option<AutoencoderKlDecoder> {
@@ -119,5 +119,116 @@ fn tile_seams_are_not_visible_as_discontinuities() {
     assert!(
         worst < mean * 6.0,
         "a column step of {worst:.4} against a mean of {mean:.4} looks like a visible seam"
+    );
+}
+
+// -- the encode half -------------------------------------------------------
+//
+// img2img runs both, so an untiled encode pays the same `cin * 9` im2col
+// blowup the decode does — twice in one run. These mirror the decode tests
+// and are kept deliberately small: the point is the tiling logic, not scale.
+
+fn encoder(dev: &Device) -> Option<AutoencoderKlEncoder> {
+    let w = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/vae_decoder/vae.safetensors");
+    if !w.exists() {
+        eprintln!("SKIP: no VAE weights; run xtask/golden/dump_reference.py vae");
+        return None;
+    }
+    let vb = sd_loader::safetensors_var_builder(&[&w], DType::F32, dev).expect("weights");
+    Some(AutoencoderKlEncoder::new(&VaeConfig::sd15(), vb).expect("encoder"))
+}
+
+#[test]
+fn an_image_that_already_fits_is_not_tiled() {
+    let dev = Device::Cpu;
+    let Some(enc) = encoder(&dev) else { return };
+    // Exactly one tile: 64 latent x 8.
+    let px = TILE_LATENT_EDGE * 8;
+    let img = sd_tensor::rng::SeededRng::new(3)
+        .randn((1, 3, px, px), &dev)
+        .unwrap();
+
+    let whole = enc.encode(&img).expect("encode");
+    let tiled = enc.encode_tiled(&img).expect("encode_tiled");
+    let c = testing::closeness(&whole, &tiled).expect("comparing");
+    assert_eq!(
+        c.max_abs, 0.0,
+        "an image within one tile must not be tiled: {c}"
+    );
+}
+
+#[test]
+fn tiled_encode_agrees_closely_with_a_whole_image_encode() {
+    let dev = Device::Cpu;
+    let Some(enc) = encoder(&dev) else { return };
+    // 576px: past one tile so tiling engages, small enough to stay cheap.
+    let img = sd_tensor::rng::SeededRng::new(4)
+        .randn((1, 3, 576, 576), &dev)
+        .unwrap();
+
+    let whole = enc.encode(&img).expect("whole encode");
+    let tiled = enc.encode_tiled(&img).expect("tiled encode");
+    assert_eq!(
+        whole.dims(),
+        tiled.dims(),
+        "tiling must not change the latent shape"
+    );
+    assert_eq!(tiled.dims(), &[1, 4, 72, 72], "576px -> 72 latent");
+
+    let c = testing::closeness(&whole, &tiled).expect("comparing");
+    eprintln!("tiled encode vs whole: {c}");
+    // Same reasoning as the decode: convolutions at a tile edge see padding
+    // where they would otherwise see neighbours, so this is close, not equal.
+    // Latents are order-1, so a mean of a few hundredths is small.
+    assert!(
+        c.mean_abs < 0.05,
+        "tiled encode drifts too far from the whole-image encode: {c}"
+    );
+}
+
+#[test]
+fn a_tiled_encode_round_trips_through_a_tiled_decode() {
+    // The img2img path end to end, at a size where both halves tile. If the
+    // two tilings disagreed about geometry — a stride, a trim, an edge — the
+    // round trip would not come back the right shape, let alone the right
+    // image.
+    let dev = Device::Cpu;
+    let (Some(enc), Some(dec)) = (encoder(&dev), decoder(&dev)) else {
+        return;
+    };
+    // A smooth gradient, not noise. A VAE cannot reproduce noise — that is
+    // what the latent bottleneck is for — so a round-trip assertion against
+    // noise would fail for a correct encoder and prove nothing.
+    let (h, w) = (576usize, 576usize);
+    let mut data = Vec::with_capacity(3 * h * w);
+    for c in 0..3 {
+        for y in 0..h {
+            for x in 0..w {
+                let fy = y as f32 / h as f32;
+                let fx = x as f32 / w as f32;
+                // Distinct per channel so a channel swap would show up.
+                data.push(match c {
+                    0 => fx * 2.0 - 1.0,
+                    1 => fy * 2.0 - 1.0,
+                    _ => (fx * fy) * 2.0 - 1.0,
+                });
+            }
+        }
+    }
+    let img = Tensor::from_vec(data, (1, 3, h, w), &dev).expect("gradient");
+
+    let latent = enc.encode_tiled(&img).expect("tiled encode");
+    assert_eq!(latent.dims(), &[1, 4, 72, 72]);
+    let out = dec.decode_tiled(&latent).expect("tiled decode");
+    assert_eq!(out.dims(), img.dims(), "round trip must preserve the shape");
+
+    let c = testing::closeness(&out, &img).expect("comparing");
+    eprintln!("tiled round trip vs source: {c}");
+    // A VAE round trip is lossy by design; this only asserts the image
+    // survives recognisably rather than becoming noise.
+    assert!(
+        c.mean_abs < 0.25,
+        "a tiled round trip should still resemble its input: {c}"
     );
 }
