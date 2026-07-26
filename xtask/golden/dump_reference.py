@@ -45,6 +45,67 @@ def _require(module: str):
         )
 
 
+def dump_flux_vae(output: pathlib.Path, model_id: str) -> None:
+    """Flux's VAE: the same convolutional geometry as SD, 16 latent channels.
+
+    Two things here that the SD dump does not exercise. The latent is 16
+    channels wide rather than 4, which is what lets Flux hold detail SD's
+    latent cannot represent. And the latent parameterisation has a *shift*
+    as well as a scale — `(x - shift) * scale` — so this dumps the scaled
+    tensors too. Getting the shift backwards leaves a recognisable image with
+    wrong contrast, which survives eyeballing and only a reference catches.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import AutoencoderKL
+    from safetensors.torch import save_file
+
+    out = output / "flux_vae"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id} (subfolder=vae)")
+    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
+    vae.eval()
+
+    latent_channels = vae.config.latent_channels
+    scaling = vae.config.scaling_factor
+    shift = getattr(vae.config, "shift_factor", 0.0) or 0.0
+    print(f"  latent_channels={latent_channels} scaling={scaling} shift={shift}")
+
+    gen = torch.Generator().manual_seed(SEED)
+    latent = torch.randn(1, latent_channels, 32, 32, generator=gen, dtype=torch.float32)
+    image_in = torch.randn(1, 3, 256, 256, generator=torch.Generator().manual_seed(1))
+
+    with torch.no_grad():
+        # Flux sets use_quant_conv/use_post_quant_conv false, so diffusers
+        # leaves both as None and the latent goes straight into the decoder.
+        z = vae.post_quant_conv(latent) if vae.post_quant_conv is not None else latent
+        image = vae.decoder(z)
+        raw_moments = vae.encoder(image_in)
+        moments = vae.quant_conv(raw_moments) if vae.quant_conv is not None else raw_moments
+        mean = moments[:, :latent_channels]
+        # What the pipeline actually feeds the transformer, and what it feeds
+        # back to the decoder: the round trip through the parameterisation.
+        scaled = (mean - shift) * scaling
+        unscaled = latent / scaling + shift
+        pq = vae.post_quant_conv(unscaled) if vae.post_quant_conv is not None else unscaled
+        decoded_from_scaled = vae.decoder(pq)
+
+    tensors = {
+        "latent": latent.contiguous(),
+        "image": image.detach().contiguous().clone(),
+        "encoder_input": image_in.contiguous(),
+        "encoder_moments": moments.detach().contiguous().clone(),
+        "encoder_scaled_mean": scaled.detach().contiguous().clone(),
+        "decoded_from_scaled": decoded_from_scaled.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    weights = {k: v.detach().contiguous().clone() for k, v in vae.state_dict().items()}
+    save_file(weights, str(out / "vae.safetensors"))
+    print(f"wrote {out}/reference.safetensors and vae.safetensors")
+
+
 def dump_vae(output: pathlib.Path, model_id: str) -> None:
     torch = _require("torch")
     _require("diffusers")
@@ -789,6 +850,14 @@ def main() -> None:
     )
     vae.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    fluxvae = sub.add_parser("flux_vae", help="dump Flux VAE (16-channel) references")
+    fluxvae.add_argument(
+        "--model-id",
+        default="Freepik/flux.1-lite-8B",
+        help="ungated repo carrying the Flux VAE; black-forest-labs is gated",
+    )
+    fluxvae.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     clip = sub.add_parser("clip_tokenizer", help="dump CLIP tokenizer references")
     clip.add_argument(
         "--model-id",
@@ -864,6 +933,8 @@ def main() -> None:
         dump_unet_attention(args.output, args.model_id)
     elif args.component == "unet_blocks":
         dump_unet_blocks(args.output, args.model_id)
+    elif args.component == "flux_vae":
+        dump_flux_vae(args.output, args.model_id)
     elif args.component == "vae":
         dump_vae(args.output, args.model_id)
     elif args.component == "clip_tokenizer":

@@ -27,6 +27,19 @@ pub struct VaeConfig {
     pub norm_eps: f64,
     /// Latents are stored scaled; decoding divides by this first.
     pub scaling_factor: f64,
+    /// Latents are stored shifted as well as scaled: `(x - shift) * scale`.
+    ///
+    /// Zero for every Stable Diffusion VAE, non-zero for Flux. Kept separate
+    /// from `scaling_factor` rather than folded into it because the two are
+    /// applied in a fixed order and folding them would silently transpose it.
+    pub shift_factor: f64,
+    /// Whether `quant_conv` / `post_quant_conv` exist.
+    ///
+    /// Every SD VAE has them; Flux sets `use_quant_conv: false` and feeds the
+    /// latent straight to the decoder. They are 1x1 convolutions, so a wrong
+    /// answer here is not a shape error — it is a missing weight, or a silent
+    /// extra transform.
+    pub use_quant_conv: bool,
 }
 
 impl Default for VaeConfig {
@@ -46,6 +59,8 @@ impl VaeConfig {
             norm_num_groups: 32,
             norm_eps: 1e-6,
             scaling_factor: 0.18215,
+            shift_factor: 0.0,
+            use_quant_conv: true,
         }
     }
 
@@ -56,45 +71,81 @@ impl VaeConfig {
             ..Self::sd15()
         }
     }
+
+    /// Flux. The same convolutional geometry as SD — `[128, 256, 512, 512]`,
+    /// two layers per block, 32 groups — with a 16-channel latent instead of
+    /// 4, and a shifted latent distribution.
+    ///
+    /// The wider latent is the whole reason Flux images hold fine detail that
+    /// SD's 4-channel latent cannot represent, and it costs nothing here
+    /// because the encoder and decoder are already parameterised by it.
+    pub fn flux() -> Self {
+        Self {
+            latent_channels: 16,
+            scaling_factor: 0.3611,
+            shift_factor: 0.1159,
+            use_quant_conv: false,
+            ..Self::sd15()
+        }
+    }
 }
 
 /// The decode half of `AutoencoderKL`: `post_quant_conv` followed by [`Decoder`].
 #[derive(Debug)]
 pub struct AutoencoderKlDecoder {
-    post_quant_conv: Conv2d,
+    post_quant_conv: Option<Conv2d>,
     decoder: Decoder,
     scaling_factor: f64,
+    shift_factor: f64,
 }
 
 impl AutoencoderKlDecoder {
     /// Build from weights. `vb` should be rooted at the VAE itself, so that
     /// `post_quant_conv` and `decoder.*` resolve directly beneath it.
     pub fn new(cfg: &VaeConfig, vb: VarBuilder) -> Result<Self> {
-        let post_quant_conv = conv2d(
-            cfg.latent_channels,
-            cfg.latent_channels,
-            1,
-            Conv2dConfig::default(),
-            vb.pp("post_quant_conv"),
-        )?;
+        let post_quant_conv = if cfg.use_quant_conv {
+            Some(conv2d(
+                cfg.latent_channels,
+                cfg.latent_channels,
+                1,
+                Conv2dConfig::default(),
+                vb.pp("post_quant_conv"),
+            )?)
+        } else {
+            None
+        };
         let decoder = Decoder::new(&DecoderConfig::from(cfg), vb.pp("decoder"))?;
         Ok(Self {
             post_quant_conv,
             decoder,
             scaling_factor: cfg.scaling_factor,
+            shift_factor: cfg.shift_factor,
         })
     }
 
     /// Decode *already unscaled* latents `[b, 4, h, w]` to `[b, 3, h*8, w*8]`
     /// in roughly `[-1, 1]`.
     pub fn decode_raw(&self, latents: &Tensor) -> Result<Tensor> {
-        let xs = self.post_quant_conv.forward_t(latents)?;
+        let xs = match &self.post_quant_conv {
+            Some(c) => c.forward_t(latents)?,
+            None => latents.clone(),
+        };
         self.decoder.forward(&xs)
     }
 
-    /// Decode latents as produced by the sampler, applying `scaling_factor`.
+    /// Undo the stored latent parameterisation: `x / scale + shift`.
+    ///
+    /// The inverse of [`AutoencoderKlEncoder::scale`], and the order matters —
+    /// dividing after shifting gives a plausible image with wrong contrast
+    /// rather than an error.
+    fn unscale(&self, latents: &Tensor) -> Result<Tensor> {
+        (latents / self.scaling_factor)? + self.shift_factor
+    }
+
+    /// Decode latents as produced by the sampler, applying the scaling and
+    /// shift the checkpoint stores them under.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
-        self.decode_raw(&(latents / self.scaling_factor)?)
+        self.decode_raw(&self.unscale(latents)?)
     }
 
     /// [`Self::decode`], in overlapping tiles.
@@ -110,7 +161,7 @@ impl AutoencoderKlDecoder {
     /// eliminates. Small latents that already fit are decoded whole, so this
     /// is safe to call unconditionally.
     pub fn decode_tiled(&self, latents: &Tensor) -> Result<Tensor> {
-        self.decode_raw_tiled(&(latents / self.scaling_factor)?)
+        self.decode_raw_tiled(&self.unscale(latents)?)
     }
 
     /// [`Self::decode_raw`], in overlapping tiles.
@@ -187,9 +238,10 @@ impl AutoencoderKlDecoder {
 #[derive(Debug)]
 pub struct AutoencoderKlEncoder {
     encoder: Encoder,
-    quant_conv: Conv2d,
+    quant_conv: Option<Conv2d>,
     latent_channels: usize,
     scaling_factor: f64,
+    shift_factor: f64,
 }
 
 impl AutoencoderKlEncoder {
@@ -198,18 +250,23 @@ impl AutoencoderKlEncoder {
     pub fn new(cfg: &VaeConfig, vb: VarBuilder) -> Result<Self> {
         let encoder = Encoder::new(&EncoderConfig::from(cfg), vb.pp("encoder"))?;
         // Operates on the concatenated (mean, logvar), hence 2x on both sides.
-        let quant_conv = conv2d(
-            2 * cfg.latent_channels,
-            2 * cfg.latent_channels,
-            1,
-            Conv2dConfig::default(),
-            vb.pp("quant_conv"),
-        )?;
+        let quant_conv = if cfg.use_quant_conv {
+            Some(conv2d(
+                2 * cfg.latent_channels,
+                2 * cfg.latent_channels,
+                1,
+                Conv2dConfig::default(),
+                vb.pp("quant_conv"),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             encoder,
             quant_conv,
             latent_channels: cfg.latent_channels,
             scaling_factor: cfg.scaling_factor,
+            shift_factor: cfg.shift_factor,
         })
     }
 
@@ -218,13 +275,27 @@ impl AutoencoderKlEncoder {
     ///
     /// Unscaled — this is the distribution as the model expresses it.
     pub fn encode_dist(&self, image: &Tensor) -> Result<(Tensor, Tensor)> {
-        let moments = self.quant_conv.forward_t(&self.encoder.forward(image)?)?;
+        let encoded = self.encoder.forward(image)?;
+        let moments = match &self.quant_conv {
+            Some(c) => c.forward_t(&encoded)?,
+            None => encoded,
+        };
         let mean = moments.narrow(1, 0, self.latent_channels)?;
         let logvar = moments.narrow(1, self.latent_channels, self.latent_channels)?;
         Ok((mean.contiguous()?, logvar.contiguous()?))
     }
 
-    /// Encode to a latent ready for the sampler, applying `scaling_factor`.
+    /// Apply the stored latent parameterisation: `(x - shift) * scale`.
+    ///
+    /// Shift first, then scale. [`AutoencoderKlDecoder::decode`] inverts this
+    /// in the opposite order; getting either backwards leaves the image
+    /// recognisable but with wrong contrast, which is the kind of error that
+    /// survives eyeballing.
+    fn scale(&self, latents: &Tensor) -> Result<Tensor> {
+        (latents - self.shift_factor)? * self.scaling_factor
+    }
+
+    /// Encode to a latent ready for the sampler, applying scaling and shift.
     ///
     /// Uses the distribution's **mean** rather than sampling from it. For
     /// img2img that is what you want: the sampler adds its own noise, so
@@ -232,7 +303,7 @@ impl AutoencoderKlEncoder {
     /// the result irreproducible.
     pub fn encode(&self, image: &Tensor) -> Result<Tensor> {
         let (mean, _) = self.encode_dist(image)?;
-        mean * self.scaling_factor
+        self.scale(&mean)
     }
 
     /// Sample from the latent distribution using externally supplied noise.
@@ -246,7 +317,7 @@ impl AutoencoderKlEncoder {
         // it a degenerate checkpoint can produce an infinite std.
         let std = (logvar.clamp(-30.0, 20.0)? * 0.5)?.exp()?;
         let sample = (mean + (std * noise)?)?;
-        sample * self.scaling_factor
+        self.scale(&sample)
     }
 
     /// Latent channel count, for sizing the noise [`Self::encode_sampled`]
