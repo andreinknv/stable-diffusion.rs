@@ -233,41 +233,54 @@ Metal took 14.3 s against CPU's 27.5 s for that run. **That is one run on a
 machine with other work on it, not a benchmark** — see the spread warning
 above before quoting it.
 
-## Known Metal defect: the VAE decode at 1024
+## The VAE decode at 1024 does not fit in GPU memory
 
-**candle 0.11's Metal backend miscomputes a VAE decode at a 128x128 latent**
-(1024px output). Smaller latents are fine. Measured, same weights and same
-input latent, CPU against Metal:
+A 1024px decode needs more GPU memory than a 36 GiB Mac has, and until
+recently it did not say so — it returned an image of horizontal noise bands.
 
-| latent | output | max abs difference |
-|---:|---:|---:|
-| 32x32 | 256px | 0.0001 |
-| 64x64 | 512px | 0.0001 |
-| **128x128** | **1024px** | **7.99** |
+**The memory is conv im2col, not activations.**
+`DecoderConfig::peak_activation_bytes` counts activation tensors, and at 1024
+the largest is 1.07 GB, comfortably inside the 2 GiB budget. But candle's
+conv2d materialises an im2col intermediate holding `cin * 9` values per output
+position:
 
-On a [-1, 1] image that is total corruption — the decode comes out as
-horizontal noise bands. `metal_decoder_parity.rs` pins the boundary and will
-fail informatively if a candle upgrade fixes it.
+| convolution | activation counted | im2col actually allocated | ratio |
+|---|---:|---:|---:|
+| 256 -> 256 @ 512px | 0.27 GB | 2.42 GB | 9x |
+| 256 -> 128 @ 1024px | 0.54 GB | **9.66 GB** | **18x** |
 
-What it is not, each checked directly:
+So the budget guard is measuring the wrong thing by an order of magnitude at
+these sizes. It is still worth having — it catches the `n^4` attention blowup
+it was written for — but **do not read `peak_activation_bytes` as a true peak.**
 
-- **not any single op.** `conv2d`, `silu`, `softmax_last_dim` and `matmul`
-  were each compared CPU against Metal at these shapes and at tensor sizes up
-  to 2.15 GB. All agree to 3e-6.
-- **not chunked attention.** The divergence is identical with chunking
-  disabled and with chunks 64x smaller.
-- **not SDXL.** SD 1.5 shares this decoder architecture; it is size-triggered.
-  SD 1.5 at 512 stays inside the good range, which is why this went unnoticed
-  until SDXL made 1024 the default.
+**Why it was silent.** candle queues Metal work and only inspects the command
+buffer's status when something synchronizes. Nothing did, so a decode whose
+command buffer failed with `kIOGPUCommandBufferCallbackErrorOutOfMemory`
+returned a tensor of whatever the buffer held, and the error was discovered
+never. `Decoder::forward` now synchronizes once at the end, which costs
+nothing next to a decode and turns the corruption into an error you can read.
 
-**Consequence: SDXL at its native 1024 is correct on CPU and wrong on Metal.**
-Use `--cpu` for 1024 until this is fixed. SD 1.5 at 512 is unaffected on
-either backend.
+Ruled out along the way, each measured rather than assumed:
 
-The obvious mitigation is to run the VAE decode on CPU when the latent is
-large, leaving the UNet on GPU — the decode is a single pass and a small part
-of the total. That is a deliberate perf/correctness trade, so it is written
-down here rather than applied silently.
+- **individual ops** — `conv2d` (including the 9.66 GB im2col case), `silu`,
+  `group_norm`, `softmax_last_dim`, `matmul` and `upsample_nearest2d` all
+  agree CPU against Metal at these shapes, to 3e-5 or better;
+- **chunked attention** — the corruption was identical with chunking disabled
+  and with chunks 64x smaller;
+- **the UNet and sampler** — a single denoise step decodes to a clean blurry
+  image, and the latent statistics stay sane through every step.
+
+The corruption was also *deterministic* across runs, which is what pointed
+back at memory rather than away from it: an allocation that fails the same way
+every time still fails.
+
+**Consequence: SDXL at its native 1024 works on CPU and runs out of memory on
+Metal here.** Use `--cpu` for 1024. SD 1.5 at 512 is unaffected on either.
+
+Two ways out, neither taken yet: run the decode on CPU above the known-good
+latent size, or decode in tiles so no single conv needs a 9.66 GB im2col.
+Tiling is what other implementations do, and it fixes the cause rather than
+routing around it.
 
 ## When to revisit
 

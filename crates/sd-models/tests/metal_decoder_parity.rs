@@ -1,34 +1,35 @@
-//! CPU/Metal parity for the VAE decoder.
+//! CPU/Metal parity for the VAE decoder, and the GPU out-of-memory boundary.
 //!
-//! candle 0.11's Metal backend miscomputes a VAE decode at a 128x128 latent
-//! (1024px output). Smaller latents agree with CPU to 1e-4; at 128 the two
-//! differ by ~1.0 on a [-1, 1] image, which is total corruption — the decode
-//! comes out as horizontal noise bands.
+//! A 1024px decode does not fit in GPU memory on a 36 GiB Mac, and until the
+//! synchronize in `Decoder::forward` it did not say so. candle queues Metal
+//! work and only inspects the command buffer's status when something
+//! synchronizes, so the decode *returned a tensor* — of whatever the buffer
+//! happened to hold — and the failure was never discovered. The symptom was
+//! an image of horizontal noise bands.
 //!
-//! Isolated as far as it goes: `conv2d`, `silu`, `softmax_last_dim` and
-//! `matmul` were each compared CPU against Metal at these shapes and at
-//! tensor sizes up to 2.15 GB, and all agree. Chunked attention is not
-//! involved either — the divergence is identical with chunking disabled, and
-//! with chunks 64x smaller. So it is the composition, not any one op, and it
-//! is size-triggered rather than model-specific: SD 1.5 and SDXL share this
-//! decoder architecture.
+//! Root cause of the memory itself: **conv im2col, not the activations.**
+//! `DecoderConfig::peak_activation_bytes` counts activation tensors, and at
+//! 1024 the largest is 1.07 GB — comfortably inside budget. But candle's
+//! conv2d materialises an im2col intermediate of `cin * 9` values per output
+//! position, which for the decoder's 256->128 convolution at 1024x1024 is
+//! **9.66 GB, eighteen times the activation it is counted against.**
 //!
-//! Practical effect: **SDXL at its native 1024 is correct on CPU and wrong on
-//! Metal.** SD 1.5 at 512 is unaffected, which is why this went unnoticed
-//! until SDXL.
-//!
-//! This test documents the boundary rather than asserting the bug is absent,
-//! so it will start failing — informatively — if a candle upgrade fixes it.
+//! Ruled out along the way, each measured rather than assumed: individual ops
+//! (`conv2d` including a 9.66 GB im2col, `silu`, `group_norm`,
+//! `softmax_last_dim`, `matmul`, `upsample_nearest2d`) all agree CPU against
+//! Metal; chunked attention is irrelevant (identical with it disabled and
+//! with chunks 64x smaller); and the corruption was deterministic across
+//! runs, which is what ruled memory pressure back *in* rather than out.
 
 use std::path::PathBuf;
 
 use sd_models::vae::{AutoencoderKlDecoder, VaeConfig};
 use sd_tensor::{DType, Device, Tensor};
 
-/// Largest latent edge the Metal decoder is known to get right.
-const KNOWN_GOOD_LATENT_EDGE: usize = 64;
-/// Smallest known-bad edge.
-const KNOWN_BAD_LATENT_EDGE: usize = 128;
+/// Largest latent edge that fits in GPU memory here.
+const FITS: usize = 64;
+/// Smallest edge known not to.
+const DOES_NOT_FIT: usize = 128;
 
 fn weights() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -37,7 +38,7 @@ fn weights() -> Option<PathBuf> {
 }
 
 #[test]
-fn metal_decoder_agrees_with_cpu_up_to_the_known_boundary() {
+fn metal_decode_matches_cpu_and_fails_loudly_when_it_cannot() {
     let Ok(metal) = Device::new_metal(0) else {
         eprintln!("SKIP: no Metal device");
         return;
@@ -54,42 +55,61 @@ fn metal_decoder_agrees_with_cpu_up_to_the_known_boundary() {
     let vb = sd_loader::safetensors_var_builder(&[&w], DType::F32, &metal).expect("metal weights");
     let dec_metal = AutoencoderKlDecoder::new(&cfg, vb).expect("metal decoder");
 
-    let mut rng = sd_tensor::rng::SeededRng::new(0);
-    let decode_both = |edge: usize, rng: &mut sd_tensor::rng::SeededRng| -> f32 {
-        let latent: Tensor = rng.randn((1, 4, edge, edge), &cpu).unwrap();
-        let a = dec_cpu.decode(&latent).unwrap();
-        let b = dec_metal
-            .decode(&latent.to_device(&metal).unwrap())
+    let latent = |edge: usize| -> Tensor {
+        sd_tensor::rng::SeededRng::new(0)
+            .randn((1, 4, edge, edge), &cpu)
             .unwrap()
-            .to_device(&cpu)
-            .unwrap();
-        let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        av.iter()
-            .zip(&bv)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0f32, f32::max)
     };
 
-    let good = decode_both(KNOWN_GOOD_LATENT_EDGE, &mut rng);
-    eprintln!("latent {KNOWN_GOOD_LATENT_EDGE}: max|cpu - metal| = {good:.5}");
-    assert!(
-        good < 1e-2,
-        "Metal used to agree with CPU at a {KNOWN_GOOD_LATENT_EDGE} latent and no longer does \
-         ({good}). That is a new regression, not the known 1024 one."
-    );
+    // Within budget: Metal must agree with CPU.
+    let z = latent(FITS);
+    let a = dec_cpu.decode(&z).expect("cpu decode");
+    let b = dec_metal
+        .decode(&z.to_device(&metal).unwrap())
+        .expect("metal decode should fit at this size")
+        .to_device(&cpu)
+        .unwrap();
+    let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let d = av
+        .iter()
+        .zip(&bv)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    eprintln!("latent {FITS}: max|cpu - metal| = {d:.5}");
+    assert!(d < 1e-2, "Metal diverged from CPU at a {FITS} latent ({d})");
 
-    let bad = decode_both(KNOWN_BAD_LATENT_EDGE, &mut rng);
-    eprintln!("latent {KNOWN_BAD_LATENT_EDGE}: max|cpu - metal| = {bad:.5}");
-    if bad < 1e-2 {
-        panic!(
-            "Metal now agrees with CPU at a {KNOWN_BAD_LATENT_EDGE} latent ({bad}). The known \
-             candle Metal bug appears to be fixed — delete this assertion, drop the CPU-decode \
-             caveat from docs/backends.md, and re-enable SDXL at 1024 on Metal."
-        );
+    // Beyond it: an error, never a wrong tensor. That distinction is the
+    // whole point — the failure mode this replaced returned noise.
+    let z = latent(DOES_NOT_FIT);
+    match dec_metal.decode(&z.to_device(&metal).unwrap()) {
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!("latent {DOES_NOT_FIT}: refused as expected — {msg}");
+            assert!(
+                msg.contains("Insufficient Memory") || msg.to_lowercase().contains("memory"),
+                "expected an out-of-memory error, got: {msg}"
+            );
+        }
+        Ok(out) => {
+            // Not a failure in itself — a bigger GPU, or a candle that stops
+            // materialising im2col, would land here. But it must be *correct*,
+            // not merely returned.
+            let got = out.to_device(&cpu).unwrap();
+            let want = dec_cpu.decode(&z).expect("cpu decode");
+            let gv = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let wv = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let d = gv
+                .iter()
+                .zip(&wv)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                d < 1e-2,
+                "a {DOES_NOT_FIT} latent decoded on Metal without erroring, but the result is \
+                 wrong (max|diff| {d}). That is the silent-corruption bug returning."
+            );
+            eprintln!("latent {DOES_NOT_FIT}: now fits and matches CPU — update docs/backends.md");
+        }
     }
-    eprintln!(
-        "known-bad boundary reproduced: Metal decode diverges by {bad:.3} at a \
-         {KNOWN_BAD_LATENT_EDGE} latent. See this file's header."
-    );
 }

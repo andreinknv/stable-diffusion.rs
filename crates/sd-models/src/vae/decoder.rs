@@ -50,6 +50,12 @@ impl DecoderConfig {
     /// This is on the config rather than the built decoder so a caller can
     /// cost a decode *before* constructing one. `None` means the count
     /// overflowed, which is itself a refusal.
+    ///
+    /// **This is not the true peak.** It counts activation tensors only.
+    /// candle's conv2d also materialises an im2col intermediate of `cin * 9`
+    /// values per output position, which at a 1024px decode is 9.66 GB
+    /// against the 0.54 GB activation it accompanies — eighteen times larger.
+    /// Treat this as a floor, and see docs/backends.md.
     pub fn peak_activation_bytes(
         &self,
         batch: usize,
@@ -385,6 +391,22 @@ impl Decoder {
         }
         let h = self.conv_norm_out.forward(&h)?;
         let h = ops::silu(&h)?;
-        self.conv_out.forward(&h)
+        let out = self.conv_out.forward(&h)?;
+
+        // Force any deferred GPU error to surface here.
+        //
+        // candle queues Metal work and only inspects the command buffer's
+        // status when something synchronizes. A decode that exhausts GPU
+        // memory therefore *returns a tensor* — full of whatever was in the
+        // buffer — and the failure is discovered never. A 1024px decode does
+        // exactly that on a 36 GiB Mac, and the symptom is an image of
+        // horizontal noise bands rather than an error.
+        //
+        // One sync per decode is negligible next to the decode itself, and it
+        // converts silent corruption into
+        // `Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory)`.
+        // On CPU this is a no-op.
+        out.device().synchronize()?;
+        Ok(out)
     }
 }
