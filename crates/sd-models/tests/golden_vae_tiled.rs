@@ -50,10 +50,12 @@ fn a_latent_that_already_fits_is_not_tiled() {
 fn tiling_agrees_closely_with_a_whole_image_decode() {
     let dev = Device::Cpu;
     let Some(dec) = decoder(&dev) else { return };
-    // 96 latent = 768px: bigger than one tile, small enough that the
-    // whole-image reference is still affordable on CPU.
+    // 80 latent = 640px. Two constraints meet here: it must exceed one tile
+    // so tiling actually engages, and the whole-image *reference* must itself
+    // be permitted — at 88 latent the untiled decode allocates 4.57 GB and the
+    // budget refuses it, which is the guard working, not a test failure.
     let z = sd_tensor::rng::SeededRng::new(1)
-        .randn((1, 4, 96, 96), &dev)
+        .randn((1, 4, 80, 80), &dev)
         .unwrap();
 
     let whole = dec.decode(&z).expect("whole decode");
@@ -83,6 +85,8 @@ fn tile_seams_are_not_visible_as_discontinuities() {
     // blending works, the seam is unremarkable.
     let dev = Device::Cpu;
     let Some(dec) = decoder(&dev) else { return };
+    // No whole-image reference here, so this is free to exceed the untiled
+    // budget — each tile is decoded separately and every one fits.
     let z = sd_tensor::rng::SeededRng::new(2)
         .randn((1, 4, 96, 96), &dev)
         .unwrap();

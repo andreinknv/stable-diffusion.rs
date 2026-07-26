@@ -8,11 +8,12 @@
 //! an image of horizontal noise bands.
 //!
 //! Root cause of the memory itself: **conv im2col, not the activations.**
-//! `DecoderConfig::peak_activation_bytes` counts activation tensors, and at
-//! 1024 the largest is 1.07 GB — comfortably inside budget. But candle's
-//! conv2d materialises an im2col intermediate of `cin * 9` values per output
+//! `DecoderConfig::peak_alloc_bytes` now counts this: candle's conv2d
+//! materialises an im2col intermediate of `cin * 9` values per output
 //! position, which for the decoder's 256->128 convolution at 1024x1024 is
-//! **9.66 GB, eighteen times the activation it is counted against.**
+//! **9.66 GB, eighteen times the activation it accompanies.** An earlier
+//! version counted activations alone and reported 1.07 GB, which is worse
+//! than no estimate because it reads as reassurance.
 //!
 //! Ruled out along the way, each measured rather than assumed: individual ops
 //! (`conv2d` including a 9.66 GB im2col, `silu`, `group_norm`,

@@ -254,6 +254,79 @@ impl AutoencoderKlEncoder {
     pub fn latent_channels(&self) -> usize {
         self.latent_channels
     }
+
+    /// [`Self::encode`], in overlapping tiles.
+    ///
+    /// The mirror of [`AutoencoderKlDecoder::decode_tiled`], and needed for
+    /// the same reason: an encode allocates a conv im2col of `cin * 9` values
+    /// per position, so a 1024x1024 input costs as much as the decode it
+    /// feeds. img2img does both, so leaving this untiled means paying the
+    /// blowup twice in one run.
+    ///
+    /// Tiles are taken in image space and blended in latent space, where the
+    /// overlap is 8x smaller. Inputs that already fit are encoded whole, so
+    /// this is safe to call unconditionally.
+    pub fn encode_tiled(&self, image: &Tensor) -> Result<Tensor> {
+        let (_, _, ih, iw) = image.dims4()?;
+        let tile_px = TILE_LATENT_EDGE * 8;
+        if ih <= tile_px && iw <= tile_px {
+            return self.encode(image);
+        }
+
+        let stride_latent = ((TILE_LATENT_EDGE as f64) * (1.0 - TILE_OVERLAP)) as usize;
+        let stride_latent = stride_latent.max(1);
+        let stride_px = stride_latent * 8;
+        // Blending happens on the latent, so the extent is in latent units.
+        let blend_extent = TILE_LATENT_EDGE - stride_latent;
+
+        let mut rows: Vec<Vec<Tensor>> = Vec::new();
+        let mut y = 0;
+        while y < ih {
+            let h = tile_px.min(ih - y);
+            let mut row = Vec::new();
+            let mut x = 0;
+            while x < iw {
+                let w = tile_px.min(iw - x);
+                let patch = image.narrow(2, y, h)?.narrow(3, x, w)?.contiguous()?;
+                row.push(self.encode(&patch)?);
+                if x + w >= iw {
+                    break;
+                }
+                x += stride_px;
+            }
+            rows.push(row);
+            if y + h >= ih {
+                break;
+            }
+            y += stride_px;
+        }
+
+        let mut out_rows = Vec::with_capacity(rows.len());
+        for i in 0..rows.len() {
+            let mut out_row: Vec<Tensor> = Vec::with_capacity(rows[i].len());
+            for j in 0..rows[i].len() {
+                let mut t = rows[i][j].clone();
+                if i > 0 {
+                    t = blend(&rows[i - 1][j], &t, blend_extent, 2)?;
+                }
+                if j > 0 {
+                    // The untrimmed left neighbour, for the same reason as in
+                    // `decode_tiled`: trimmed tiles differ in height on any
+                    // row that was cut short.
+                    t = blend(&rows[i][j - 1], &t, blend_extent, 3)?;
+                }
+                let last_col = j + 1 == rows[i].len();
+                let last_row = i + 1 == rows.len();
+                let th = t.dims()[2];
+                let tw = t.dims()[3];
+                let h = if last_row { th } else { stride_latent.min(th) };
+                let w = if last_col { tw } else { stride_latent.min(tw) };
+                out_row.push(t.narrow(2, 0, h)?.narrow(3, 0, w)?.contiguous()?);
+            }
+            out_rows.push(Tensor::cat(&out_row, 3)?);
+        }
+        Tensor::cat(&out_rows, 2)
+    }
 }
 
 /// Latent edge of one decode tile. 64 latent = 512px, the size SD 1.5 was

@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 
 use sd_models::clip::{ClipTextConfig, ClipTextEncoder, ClipTokenizer};
 use sd_models::unet::{UNet2DConditionModel, UNetConfig};
-use sd_models::vae::{AutoencoderKlDecoder, VaeConfig};
+use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, VaeConfig};
 use sd_sample::{euler_ancestral_step, sigmas_for_steps, DpmSolverPlusPlus2M, Schedule};
 use sd_tensor::rng::SeededRng;
 use sd_tensor::{DType, Device, Tensor};
 
-use super::{PipelineError, ProgressFn, SamplerKind, Txt2ImgConfig};
+use super::{Img2ImgConfig, PipelineError, ProgressFn, SamplerKind, Txt2ImgConfig};
 
 /// SDXL's second tokenizer pads with `!`, not `<|endoftext|>`.
 const TOKENIZER_2_PAD: &str = "!";
@@ -48,6 +48,7 @@ pub struct SdxlPipeline {
     text_encoder_2: ClipTextEncoder,
     unet: UNet2DConditionModel,
     vae: AutoencoderKlDecoder,
+    vae_encoder: AutoencoderKlEncoder,
     schedule: Schedule,
     device: Device,
 }
@@ -105,6 +106,15 @@ impl SdxlPipeline {
             }
         })?;
 
+        // Same file, both halves; mmap means the weights are not read twice.
+        let vb = sd_loader::safetensors_var_builder(&[&vae_path], VAE_DTYPE, device)?;
+        let vae_encoder = AutoencoderKlEncoder::new(&VaeConfig::sdxl(), vb).map_err(|source| {
+            PipelineError::VaeWeights {
+                path: vae_path.clone(),
+                source,
+            }
+        })?;
+
         Ok(Self {
             tokenizer,
             tokenizer_2,
@@ -112,6 +122,7 @@ impl SdxlPipeline {
             text_encoder_2,
             unet,
             vae,
+            vae_encoder,
             schedule: Schedule::sd15(),
             device: device.clone(),
         })
@@ -162,31 +173,47 @@ impl SdxlPipeline {
             return Err(PipelineError::NoSteps);
         }
 
-        let (cond, cond_pooled) = self.encode(&cfg.prompt)?;
-        let (uncond, uncond_pooled) = self.encode(&cfg.negative_prompt)?;
-        // Uncond first, matching the split in the loop.
-        let context = Tensor::cat(&[&uncond, &cond], 0)?;
-        let pooled = Tensor::cat(&[&uncond_pooled, &cond_pooled], 0)?;
-
         // original h/w, crop top/left, target h/w. Telling SDXL the image was
         // cropped from a larger original, or produced at a lower resolution
         // than it was, measurably degrades output — these are conditioning
         // inputs the model was trained on, not metadata.
-        let (h, w) = (cfg.height as f32, cfg.width as f32);
-        // The sinusoid inside the UNet is computed in f32 and cast there, so
-        // these stay f32.
-        let time_ids = Tensor::new(&[h, w, 0.0, 0.0, h, w], &self.device)?
-            .reshape((1, 6))?
-            .repeat((2, 1))?;
+        let (context, pooled, time_ids) = self.conditioning(cfg)?;
 
         let sigmas = sigmas_for_steps(&self.schedule, cfg.steps);
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
 
         let mut rng = SeededRng::new(cfg.seed);
-        let mut latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+        let latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+
+        let latent = self.denoise(
+            cfg, latent, &sigmas, &context, &pooled, &time_ids, &mut rng, progress,
+        )?;
+        // Tiled: SDXL's native 1024 needs a 9.66 GB conv intermediate as a
+        // single decode, which does not fit in GPU memory. See
+        // docs/backends.md.
+        Ok(self.vae.decode_tiled(&latent)?)
+    }
+
+    /// The sampling loop, shared by txt2img and img2img.
+    ///
+    /// `sigmas` is a full ladder; img2img passes a suffix of one.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise(
+        &self,
+        cfg: &Txt2ImgConfig,
+        mut latent: Tensor,
+        sigmas: &[f64],
+        context: &Tensor,
+        pooled: &Tensor,
+        time_ids: &Tensor,
+        rng: &mut SeededRng,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let (lh, lw) = (cfg.height / 8, cfg.width / 8);
+        let steps = sigmas.len().saturating_sub(1);
         let mut dpm = DpmSolverPlusPlus2M::new();
 
-        for i in 0..cfg.steps {
+        for i in 0..steps {
             let sigma = sigmas[i];
             let sigma_next = sigmas[i + 1];
 
@@ -205,9 +232,9 @@ impl SdxlPipeline {
                 .forward_sdxl(
                     &latent_in.to_dtype(self.unet.dtype())?,
                     &timestep,
-                    &context,
-                    &pooled,
-                    &time_ids,
+                    context,
+                    pooled,
+                    time_ids,
                 )?
                 .to_dtype(VAE_DTYPE)?;
             let out_uncond = out.narrow(0, 0, 1)?;
@@ -224,12 +251,89 @@ impl SdxlPipeline {
                 SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next)?,
             };
 
-            progress(i + 1, cfg.steps, sigma);
+            progress(i + 1, steps, sigma);
+        }
+        Ok(latent)
+    }
+
+    /// Conditioning for a prompt pair: context, pooled, time ids.
+    ///
+    /// Uncond first in both batched tensors, matching the split in the loop.
+    fn conditioning(&self, cfg: &Txt2ImgConfig) -> Result<(Tensor, Tensor, Tensor), PipelineError> {
+        let (cond, cond_pooled) = self.encode(&cfg.prompt)?;
+        let (uncond, uncond_pooled) = self.encode(&cfg.negative_prompt)?;
+        let context = Tensor::cat(&[&uncond, &cond], 0)?;
+        let pooled = Tensor::cat(&[&uncond_pooled, &cond_pooled], 0)?;
+
+        // original h/w, crop top/left, target h/w. These are conditioning
+        // inputs SDXL was trained on, not metadata: telling it the image was
+        // cropped from a larger original, or produced at a lower resolution
+        // than it was, measurably degrades the output.
+        //
+        // f32, because the sinusoid inside the UNet is computed in f32 and
+        // cast to the model dtype there.
+        let (h, w) = (cfg.height as f32, cfg.width as f32);
+        let time_ids = Tensor::new(&[h, w, 0.0, 0.0, h, w], &self.device)?
+            .reshape((1, 6))?
+            .repeat((2, 1))?;
+        Ok((context, pooled, time_ids))
+    }
+
+    /// Generate from an existing image. Returns `[1, 3, height, width]`.
+    pub fn run_img2img(&self, cfg: &Img2ImgConfig) -> Result<Tensor, PipelineError> {
+        self.run_img2img_with_progress(cfg, &mut |_, _, _| {})
+    }
+
+    /// [`Self::run_img2img`], reporting progress after each step.
+    pub fn run_img2img_with_progress(
+        &self,
+        cfg: &Img2ImgConfig,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let base = &cfg.base;
+        if base.width % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("width", base.width));
+        }
+        if base.height % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("height", base.height));
+        }
+        if base.steps == 0 {
+            return Err(PipelineError::NoSteps);
         }
 
-        // Tiled: SDXL's native 1024 needs a 9.66 GB conv intermediate as a
-        // single decode, which does not fit in GPU memory. See
-        // docs/backends.md.
+        let (context, pooled, time_ids) = self.conditioning(base)?;
+
+        let image = crate::image_io::load_image(
+            &cfg.init_image,
+            base.width as u32,
+            base.height as u32,
+            &self.device,
+        )?;
+        // The distribution mean, not a draw from it — the sampler owns all the
+        // randomness, so a run stays a function of the seed alone.
+        let latent = self.vae_encoder.encode(&image)?;
+
+        let sigmas = sigmas_for_steps(&self.schedule, base.steps);
+        let start = cfg.strength.start_index(base.steps);
+        if start >= base.steps {
+            return Ok(self.vae.decode_tiled(&latent)?);
+        }
+
+        let mut rng = SeededRng::new(base.seed);
+        let (lh, lw) = (base.height / 8, base.width / 8);
+        let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+        let latent = (latent + (noise * sigmas[start])?)?;
+
+        let latent = self.denoise(
+            base,
+            latent,
+            &sigmas[start..],
+            &context,
+            &pooled,
+            &time_ids,
+            &mut rng,
+            progress,
+        )?;
         Ok(self.vae.decode_tiled(&latent)?)
     }
 }

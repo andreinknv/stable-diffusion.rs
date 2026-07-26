@@ -72,8 +72,8 @@ fn main() -> Result<()> {
     // allocation. `Decoder::forward` checks this too — doing it here as well
     // only buys a cheaper refusal.
     check_alloc_budget(
-        cfg.peak_activation_bytes(1, n, n, DType::F32),
-        &format!("VAE decode activation for a {n}x{n} latent"),
+        cfg.peak_alloc_bytes(1, n, n, DType::F32),
+        &format!("VAE decode of a {n}x{n} latent (largest single allocation)"),
     )?;
 
     let dev = device::best()?;

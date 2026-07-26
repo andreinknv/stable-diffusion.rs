@@ -88,12 +88,18 @@ pub mod ops {
     /// Environment override for the naive-attention memory budget, in bytes.
     pub const ATTENTION_BUDGET_ENV: &str = "SD_ATTENTION_BUDGET_BYTES";
 
-    /// Ceiling on a single naive-attention score matrix.
+    /// Ceiling on any single allocation the models make.
     ///
-    /// 2 GiB admits every geometry this project actually runs — an SD 1.5 VAE
-    /// decode at 512x512 needs 64 MiB and SDXL at 1024x1024 needs 1 GiB — and
-    /// refuses the sizes that cannot finish. See [`check_attention_budget`].
-    pub const DEFAULT_ATTENTION_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    /// 4 GiB, and the figure is set by convolution rather than by attention.
+    /// A 512px decode — one tile, and SD 1.5's whole image — allocates a
+    /// 2.42 GB conv im2col, so anything below that refuses ordinary work. An
+    /// untiled 1024px decode needs 9.66 GB and is refused, which is correct:
+    /// tiling exists to bring it back under this line.
+    ///
+    /// It was 2 GiB while the estimate counted only activations. That
+    /// estimate under-reported by 18x, so the two numbers were wrong together
+    /// and looked consistent. See `DecoderConfig::peak_alloc_bytes`.
+    pub const DEFAULT_ATTENTION_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
     /// Bytes one attention score matrix needs.
     ///
@@ -800,17 +806,20 @@ mod attention_budget_tests {
 
     #[test]
     fn the_unchunked_path_still_refuses_an_oversized_call() -> super::Result<()> {
-        // The inputs here are ~740 KB each; the score matrix they imply is
-        // 2.0 GiB, just over budget. The dispatcher now *serves* this shape by
+        // The inputs here are ~1 MB each; the score matrix they imply is
+        // 4.4 GiB, just over budget. The dispatcher now *serves* this shape by
         // splitting it, which is the point of chunking — but `naive_attention`
         // is the one that would allocate the matrix whole, and it must still
         // refuse before the matmul rather than after. If the guard were
-        // missing or ran too late, this test would allocate 2.0 GiB.
+        // missing or ran too late, this test would allocate 4.4 GiB.
         let dev = Device::Cpu;
-        let seq = 23_200;
+        // sqrt(4 GiB / 4 bytes) is 32768, so this is the first round number
+        // past it. Tied to DEFAULT_ATTENTION_BUDGET_BYTES: if that changes,
+        // this has to move with it.
+        let seq = 33_000;
         let q = Tensor::zeros((1, 1, seq, 8), DType::F32, &dev)?;
         let err = naive_attention(&q, &q, &q, None)
-            .expect_err("a 2.0 GiB score matrix is over the default budget");
+            .expect_err("a 4.4 GiB score matrix is over the default budget");
         assert!(
             err.to_string().contains("refusing to allocate"),
             "unexpected error: {err}"

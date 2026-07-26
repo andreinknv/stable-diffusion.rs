@@ -135,6 +135,10 @@ enum Command {
 
         #[arg(short, long, default_value = "out.png")]
         output: String,
+
+        /// Treat the model directory as SDXL (two text encoders).
+        #[arg(long)]
+        sdxl: bool,
     },
 
     /// Report the active compute device and build configuration.
@@ -270,6 +274,7 @@ fn main() -> Result<()> {
             seed,
             sampler,
             output,
+            sdxl,
         } => {
             let cfg = Img2ImgConfig {
                 base: Txt2ImgConfig {
@@ -286,10 +291,7 @@ fn main() -> Result<()> {
                 strength: Strength::new(strength),
             };
 
-            tracing::info!(model = %model, "loading pipeline");
-            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                .with_context(|| format!("loading pipeline from {model}"))?;
-
+            tracing::info!(model = %model, sdxl, "loading pipeline");
             tracing::info!(
                 prompt = %cfg.base.prompt,
                 init = %init_image,
@@ -297,11 +299,22 @@ fn main() -> Result<()> {
                 "generating"
             );
             let started = std::time::Instant::now();
-            let img = pipeline
-                .run_img2img_with_progress(&cfg, &mut |step, total, sigma| {
-                    tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
-                })
-                .context("running img2img")?;
+            let mut report = |step, total, sigma: f64| {
+                tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
+            };
+            let img = if sdxl {
+                let pipeline = sd::pipeline::SdxlPipeline::load(Path::new(&model), &dev)
+                    .with_context(|| format!("loading SDXL pipeline from {model}"))?;
+                pipeline
+                    .run_img2img_with_progress(&cfg, &mut report)
+                    .context("running SDXL img2img")?
+            } else {
+                let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
+                    .with_context(|| format!("loading pipeline from {model}"))?;
+                pipeline
+                    .run_img2img_with_progress(&cfg, &mut report)
+                    .context("running img2img")?
+            };
 
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             println!("wrote {output} in {:.1?}", started.elapsed());

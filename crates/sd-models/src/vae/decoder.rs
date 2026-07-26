@@ -37,8 +37,8 @@ pub struct DecoderConfig {
 }
 
 impl DecoderConfig {
-    /// Bytes in the largest single activation tensor a decode of this latent
-    /// size will allocate.
+    /// Bytes in the largest single allocation a decode of this latent size
+    /// will make.
     ///
     /// Attention used to be the allocation that mattered, and refusing an
     /// oversized one is what kept a too-large decode from wedging the machine.
@@ -51,12 +51,14 @@ impl DecoderConfig {
     /// cost a decode *before* constructing one. `None` means the count
     /// overflowed, which is itself a refusal.
     ///
-    /// **This is not the true peak.** It counts activation tensors only.
-    /// candle's conv2d also materialises an im2col intermediate of `cin * 9`
-    /// values per output position, which at a 1024px decode is 9.66 GB
-    /// against the 0.54 GB activation it accompanies — eighteen times larger.
-    /// Treat this as a floor, and see docs/backends.md.
-    pub fn peak_activation_bytes(
+    /// **Counts the conv im2col, not just the activations.** candle's conv2d
+    /// materialises an intermediate of `cin * 9` values per output position,
+    /// and that — not the activation it produces — is the largest thing a
+    /// decode allocates: 9.66 GB against 0.54 GB at 1024px, eighteen times
+    /// larger. An earlier version of this function counted activations alone
+    /// and so reported 1.07 GB for a decode that needed nine times that,
+    /// which is worse than no estimate because it reads as reassurance.
+    pub fn peak_alloc_bytes(
         &self,
         batch: usize,
         latent_h: usize,
@@ -64,31 +66,52 @@ impl DecoderConfig {
         dtype: DType,
     ) -> Option<u64> {
         let (b, h, w) = (batch as u64, latent_h as u64, latent_w as u64);
-        // Up blocks run in reverse order, and every one but the last doubles
-        // the spatial scale.
-        let reversed = self.block_out_channels.iter().rev();
-        let last = self.block_out_channels.len().saturating_sub(1);
+        let reversed: Vec<usize> = self.block_out_channels.iter().rev().copied().collect();
+        let last = reversed.len().saturating_sub(1);
 
         // conv_in and mid_block run at latent resolution, on the widest layer.
-        let mut peak = b
-            .checked_mul(*self.block_out_channels.last()? as u64)?
-            .checked_mul(h)?
-            .checked_mul(w)?;
+        let widest = *self.block_out_channels.last()? as u64;
+        let mut peak = b.checked_mul(widest)?.checked_mul(h)?.checked_mul(w)?;
+        peak = peak.max(im2col_elems(b, widest, h, w)?);
 
+        // A block's resnets run at the *incoming* scale; its upsampler doubles
+        // the scale at the end. Costing the resnets at the doubled scale
+        // overstates the peak by 4x, which blocks work that would have fit.
         let mut scale = 1u64;
-        for (i, &channels) in reversed.enumerate() {
+        let mut prev = widest;
+        for (i, &channels) in reversed.iter().enumerate() {
+            let channels = channels as u64;
+            let (bh, bw) = (h.checked_mul(scale)?, w.checked_mul(scale)?);
+
+            // Resnets, pre-upsample. The first reads `prev` channels and the
+            // rest read `channels`; the wider one sets the cost.
+            peak = peak.max(b.checked_mul(channels)?.checked_mul(bh)?.checked_mul(bw)?);
+            peak = peak.max(im2col_elems(b, prev.max(channels), bh, bw)?);
+
             if i != last {
                 scale = scale.checked_mul(2)?;
+                let (uh, uw) = (h.checked_mul(scale)?, w.checked_mul(scale)?);
+                // The upsampler's own 3x3 conv, at the doubled scale.
+                peak = peak.max(b.checked_mul(channels)?.checked_mul(uh)?.checked_mul(uw)?);
+                peak = peak.max(im2col_elems(b, channels, uh, uw)?);
             }
-            // The post-upsample output is the largest tensor a block holds.
-            let elems = b
-                .checked_mul(channels as u64)?
-                .checked_mul(h.checked_mul(scale)?)?
-                .checked_mul(w.checked_mul(scale)?)?;
-            peak = peak.max(elems);
+            prev = channels;
         }
         peak.checked_mul(dtype.size_in_bytes() as u64)
     }
+}
+
+/// Elements in the im2col intermediate of a 3x3 convolution.
+///
+/// candle materialises `cin * kernel_area` values per output position. At the
+/// sizes a VAE decode reaches this is the largest allocation in the model, so
+/// any honest memory estimate has to include it.
+fn im2col_elems(batch: u64, in_channels: u64, h: u64, w: u64) -> Option<u64> {
+    batch
+        .checked_mul(in_channels)?
+        .checked_mul(9)?
+        .checked_mul(h)?
+        .checked_mul(w)
 }
 
 impl From<&VaeConfig> for DecoderConfig {
@@ -328,7 +351,7 @@ pub struct Decoder {
     up_blocks: Vec<UpDecoderBlock>,
     conv_norm_out: GroupNorm,
     conv_out: Conv2d,
-    /// Kept for `peak_activation_bytes`, which gates oversized decodes.
+    /// Kept for `peak_alloc_bytes`, which gates oversized decodes.
     cfg: DecoderConfig,
 }
 
@@ -380,8 +403,8 @@ impl Decoder {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b, _, lh, lw) = xs.dims4()?;
         ops::check_alloc_budget(
-            self.cfg.peak_activation_bytes(b, lh, lw, xs.dtype()),
-            &format!("VAE decode activation for a {lh}x{lw} latent"),
+            self.cfg.peak_alloc_bytes(b, lh, lw, xs.dtype()),
+            &format!("VAE decode of a {lh}x{lw} latent (largest single allocation)"),
         )?;
 
         let h = self.conv_in.forward(xs)?;

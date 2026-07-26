@@ -133,29 +133,37 @@ fn decoder_matches_diffusers_reference() {
     .unwrap();
 }
 
-/// The peak-activation estimate is what refuses an oversized decode now that
-/// chunked attention no longer does. An estimate that is wrong low would let
-/// the refusal through; wrong high would block legitimate work.
+/// The estimate that refuses an oversized decode now that chunked attention
+/// no longer does. Wrong low lets the refusal through; wrong high blocks
+/// legitimate work. It was wrong low by 18x until it counted the conv im2col.
 #[test]
-fn peak_activation_matches_the_diffusers_reference_shapes() {
+fn peak_alloc_counts_the_conv_im2col_not_just_activations() {
     let cfg = DecoderConfig::from(&VaeConfig::sd15());
 
-    // From xtask/golden/dump_reference.py at a 32x32 latent, the largest
-    // captured activation is up_block_2 at (1, 256, 256, 256) — 64 MiB of f32.
-    // That is ground truth from diffusers, not a guess at the graph.
-    assert_eq!(
-        cfg.peak_activation_bytes(1, 32, 32, DType::F32),
-        Some(256 * 256 * 256 * 4),
+    // Ground truth for the activation term, from
+    // xtask/golden/dump_reference.py at a 32x32 latent: the largest captured
+    // activation is up_block_2 at (1, 256, 256, 256) — 64 MiB of f32.
+    let activation_at_32 = 256u64 * 256 * 256 * 4;
+    let peak_at_32 = cfg.peak_alloc_bytes(1, 32, 32, DType::F32).unwrap();
+    assert!(
+        peak_at_32 > activation_at_32,
+        "the peak must exceed the largest activation, since a 3x3 conv over it          allocates nine values per input channel per position: got {peak_at_32}          against an activation of {activation_at_32}"
     );
 
-    // SDXL at 1024x1024 is real work and must stay under the 2 GiB budget.
-    let sdxl = cfg.peak_activation_bytes(1, 128, 128, DType::F32).unwrap();
-    assert!(sdxl < 2 * 1024 * 1024 * 1024, "SDXL 1024 peak was {sdxl}");
+    // The 1024px decode that exhausts GPU memory: 256 input channels, 3x3,
+    // at 1024x1024 is 9.66 GB. The old activation-only estimate said 1.07 GB.
+    let at_1024 = cfg.peak_alloc_bytes(1, 128, 128, DType::F32).unwrap();
+    assert_eq!(at_1024, 256 * 9 * 1024 * 1024 * 4, "im2col at 1024px");
+    assert!(
+        at_1024 > sd_tensor::ops::DEFAULT_ATTENTION_BUDGET_BYTES,
+        "an untiled 1024 decode must be refused; tiling is what brings it under"
+    );
 
-    // The latent that panicked the machine: 256 channels at 3072x3072.
-    assert_eq!(
-        cfg.peak_activation_bytes(1, 384, 384, DType::F32),
-        Some(9 * 1024 * 1024 * 1024),
+    // One tile — 64 latent, 512px — is ordinary work and must be admitted.
+    let one_tile = cfg.peak_alloc_bytes(1, 64, 64, DType::F32).unwrap();
+    assert!(
+        one_tile <= sd_tensor::ops::DEFAULT_ATTENTION_BUDGET_BYTES,
+        "a single tile must fit the budget, or tiled decoding cannot run: {one_tile}"
     );
 }
 
