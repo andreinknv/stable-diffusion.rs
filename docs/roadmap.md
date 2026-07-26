@@ -141,18 +141,46 @@ Remaining milestone 2 work:
 
 ## Milestone 3 — breadth
 
-SD 2.x · SD 3 · Flux (schnell, dev) · T5 text encoder · ControlNet · LoRA ·
-TAESD · ESRGAN upscaling · inpainting
+SD 2.x · SD 3 · Flux (schnell, dev) · ControlNet · LoRA · TAESD ·
+ESRGAN upscaling · inpainting  —  ✅ Flux (flux-mini), ✅ T5 text encoder
 
 This is the phase that took upstream years, and it parallelizes well: each
 architecture is independent and verifiable against its own golden data.
 
-**SD 3 and Flux are blocked on quantised residency**, not on the architecture
-work. They are MMDiT transformers rather than UNets and need a T5 encoder
-alongside CLIP — a large job, but a tractable one. The hard stop is memory:
-Flux is 12B parameters, and this codebase dequantises every weight to f32 at
-load, so it would ask for 48 GB before the first step. Do `QMatMul` first.
-Conveniently, k-quants suit those models far better than they suit SD 1.5 —
+**Flux runs.** `flux-mini` (3.2B) renders at 512x512 in 212 s on CPU —
+`assets/flux-mini-512-crab.png`. Every component is verified separately:
+
+| component | vs. reference | agreement |
+|---|---|---|
+| Flux VAE decode | `diffusers` | `max_abs` 1.4e-5 |
+| Flux VAE encode | `diffusers` | at its f32 noise floor, 9.6e-4 |
+| rectified flow sigmas | `diffusers` | 2.8e-8, at two resolutions |
+| flow Euler step | `diffusers` | 1.2e-7 |
+| T5 v1.1 encoder | `transformers` | output 1.9e-5 |
+| Flux MMDiT | `diffusers` | relative drift 2.1e-6 |
+
+Three things worth carrying to SD 3, which shares most of this:
+
+**F16 does not work for either large model.** T5's activations pass 190,000
+and the transformer NaNs; f16 stops at 65,504. T5's weights are therefore held
+quantised and expanded per matmul, which keeps activations in f32 and costs
+2.7 GB instead of 18.8. bf16 would suit both, but candle's CPU backend has no
+bf16 matmul — that is the single change that would most simplify this.
+
+**A striping artifact remains in the bottom ~15% of the image.** Not
+attributed. Everything upstream is independently verified, so it is none of
+those; flux-mini is a heavily distilled student and edge artifacts are a known
+failure mode, but that is a hypothesis. Worth resolving before trusting the
+pipeline on a full-size checkpoint.
+
+**Full Flux is still out of reach on 36 GB.** dev and schnell are 12B, which
+is 48 GB at f32. Reaching them means quantised residency for the *transformer*
+too — QLinear already exists and does this for T5, so the remaining work is
+wiring it through `sd-models/flux` and requantising the safetensors
+checkpoint, not new machinery.
+
+**SD 3 is blocked on much less than Flux was**, since the sampler, T5, and the
+MMDiT pattern are now all in place. Conveniently, k-quants suit these models far better than they suit SD 1.5 —
 their hidden sizes are multiples of 256, so nothing falls back to F16, which
 is why city96 can publish `Q4_K` for SD 3.5 and nobody can for SD 1.5.
 
