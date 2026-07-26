@@ -61,11 +61,25 @@ leave the order-1 range; `testing::assert_close` is absolute-only.
 
 ## Milestone 2 — usable
 
+| | Component | State |
+|---|---|---|
+| ✅ | VAE encoder | verified vs `diffusers`, max_abs 8.2e-5 |
+| ✅ | img2img | works; strength verified visually at 0.35 and 0.75 |
+| ⬜ | SDXL | same geometry, second text encoder, different latent scaling |
+| ⬜ | GGUF loading, then k-quants | |
+| ⬜ | Metal and CUDA paths through the seam | Metal verified end to end |
+
+The VAE encoder's downsampler pads **asymmetrically** (bottom and right only).
+A symmetric `padding: 1` gives the right shape and a half-pixel shift per
+level — 17.32 max_abs against a correct 8.2e-5. Worth knowing before writing
+any other downsampling path.
+
+Remaining milestone 2 work:
+
 - SDXL (same geometry, second text encoder, different latent scaling)
-- img2img
 - GGUF loading, then k-quant dequantization (`Q4_K`, `Q5_K`, `Q8_0` first —
   they cover most community models)
-- Metal and CUDA paths through the seam
+- CUDA through the seam. Metal is verified end to end; CUDA is untested.
 
 ## Milestone 3 — breadth
 
