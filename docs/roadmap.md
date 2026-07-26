@@ -78,7 +78,6 @@ any other downsampling path.
 
 Remaining milestone 2 work:
 
-- SDXL (same geometry, second text encoder, different latent scaling)
 - ~~**Better quantisations than Q4_0.**~~ **Done — use Q4_K, not Q4_0.**
   Measured by `sd-models --test gguf_quant_sweep`, every row against the same
   golden references the safetensors path is held to:
@@ -221,7 +220,7 @@ is a hand-written kernel, and it is the remaining work. See
   `xtask/golden`'s prompt set.
 - Additional samplers (DDIM, Heun, LMS) against reference trajectories
 - GGUF header parsing (metadata only, before dequantization)
-- A repeatable benchmark harness for `backend_bench`: run each configuration N
-  times and report a median and spread. Single runs on a busy machine vary by
-  ±40%, which is how the chunk-size question ended up unanswerable. Small,
-  self-contained, and it unblocks every performance claim after it.
+- ~~A repeatable benchmark harness for `backend_bench`~~ — **done**: five
+  repeats, reported as a median plus spread, with `SD_BENCH_REPEATS` to
+  override. A minimum would flatter a machine that was briefly idle; the
+  median plus the spread answers "what does this cost, and do I believe it".
