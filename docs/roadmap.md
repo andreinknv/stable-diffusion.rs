@@ -11,7 +11,7 @@ Ordered by **ops validated per unit of effort**, with visible output early.
 | ✅ | VAE decoder — structural tests | done |
 | ✅ | VAE decoder — numerical vs `diffusers` | verified, max_abs 3.7e-5 |
 | ✅ | CLIP tokenizer (BPE) | verified id-for-id vs HuggingFace |
-| ⬜ | CLIP text encoder | |
+| ✅ | CLIP text encoder | verified layer by layer vs `transformers` |
 | ⬜ | UNet | |
 | ⬜ | Euler ancestral, DPM++ 2M | |
 | ⬜ | `sdrs txt2img` | |
@@ -25,9 +25,17 @@ Reproduce with `python3 xtask/golden/dump_reference.py vae --output tests/golden
 followed by `cargo test --release -p sd-models --test golden_vae`. The
 references are ~460 MB and stay out of git, so this remains a local step.
 
-The CLIP tokenizer is done and matches HuggingFace id for id. Next concrete
-task: the CLIP **text encoder** (docs/agent-tasks/02), which turns those 77 ids
-into the embedding a UNet conditions on.
+The CLIP tokenizer matches HuggingFace id for id, and the text encoder matches
+`transformers` layer by layer. Both halves of the conditioning path are done.
+
+Next concrete task: the **UNet** (docs/agent-tasks/03 through 05), which is the
+large one — build it block by block and verify each against golden data rather
+than waiting for a whole-model comparison.
+
+A note for whoever verifies it. CLIP's activations peak at 851 and f32 cannot
+hold 1e-4 absolute at that magnitude, so `golden_clip_encoder.rs` compares with
+`|a-b| <= atol + rtol*|b|`. Expect to need the same for any tensor whose values
+leave the order-1 range; `testing::assert_close` is absolute-only.
 
 ## Milestone 2 — usable
 
