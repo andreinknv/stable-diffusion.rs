@@ -16,9 +16,12 @@ Cargo.lock.bak
 *.jpeg
 !assets/**/*.png
 
-# Golden reference tensors are large; generated locally by xtask/golden.
+# Golden reference data is large; generated locally by xtask/golden.
+# The CLIP vocabulary is 2 MB of JSON and belongs here for the same reason the
+# tensors do: golden tests skip when it is absent, so CI stays green without it.
 /tests/golden/**/*.safetensors
 /tests/golden/**/*.npz
+/tests/golden/**/*.json
 
 # Python reference environment
 __pycache__/

@@ -10,7 +10,8 @@
 //! 1. [`vae`] — decoder first. It produces a *visible* result from a known
 //!    latent, which validates conv2d, group norm, attention and upsampling
 //!    before anything depends on them.
-//! 2. `clip` — text encoder.
+//! 2. [`clip`] — text encoder.
 //! 3. `unet` — the large one. Verify block by block, never whole-model.
 
+pub mod clip;
 pub mod vae;

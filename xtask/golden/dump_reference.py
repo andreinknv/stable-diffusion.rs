@@ -25,7 +25,9 @@ Then, in the repo root:
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
+import shutil
 import sys
 
 SEED = 0
@@ -119,6 +121,78 @@ def dump_vae(output: pathlib.Path, model_id: str) -> None:
     )
 
 
+# Fixed prompt set for the tokenizer reference. Each one is here for a reason:
+# the empty string and the overlong string pin the padding and truncation
+# rules, the uppercase one pins casing, and the punctuation/digits one pins
+# that we are not doing our own preprocessing.
+PROMPTS = [
+    "",
+    "a photo of an astronaut riding a horse on mars",
+    "a rusty crab on a beach",
+    "A PHOTO OF A CAT",
+    "hello, world! 123",
+    "a " * 200,  # overlong, must truncate to 77
+]
+
+MAX_LENGTH = 77
+
+
+def dump_clip_tokenizer(output: pathlib.Path, model_id: str) -> None:
+    _require("transformers")
+    from transformers import CLIPTokenizer
+
+    out = output / "clip_tokenizer"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id}")
+    tok = CLIPTokenizer.from_pretrained(model_id)
+
+    ids = [
+        tok(
+            p,
+            padding="max_length",
+            max_length=MAX_LENGTH,
+            truncation=True,
+        )["input_ids"]
+        for p in PROMPTS
+    ]
+    for prompt, row in zip(PROMPTS, ids):
+        if len(row) != MAX_LENGTH:
+            sys.exit(f"error: {prompt!r} encoded to {len(row)} ids, expected {MAX_LENGTH}")
+
+    reference = {
+        "prompts": PROMPTS,
+        "ids": ids,
+        "bos_token_id": tok.bos_token_id,
+        "eos_token_id": tok.eos_token_id,
+        "max_length": MAX_LENGTH,
+    }
+    (out / "reference.json").write_text(json.dumps(reference, indent=2) + "\n")
+
+    # The Rust side loads a `tokenizer.json`, so put one next to the reference
+    # rather than making the test hunt through a HuggingFace cache. Pull the
+    # canonical file from the repo: `CLIPTokenizer` is the slow tokenizer and
+    # `save_pretrained` writes vocab.json/merges.txt instead.
+    #
+    # Deliberately a different artifact from the one that produced `ids` above.
+    # The Rust test then encodes with this file and compares against ids from
+    # the Python tokenizer, so agreement is a real cross-check rather than a
+    # restatement of the same code.
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    shutil.copyfile(
+        hf_hub_download(repo_id=model_id, filename="tokenizer.json"),
+        out / "tokenizer.json",
+    )
+
+    print(f"\nwrote {out / 'reference.json'}")
+    for prompt, row in zip(PROMPTS, ids):
+        shown = prompt if len(prompt) <= 40 else prompt[:37] + "..."
+        print(f"  {shown!r:<45} -> [{row[0]}, {row[1]}, ..., {row[-1]}]")
+    print(f"wrote {out / 'tokenizer.json'}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="component", required=True)
@@ -131,9 +205,19 @@ def main() -> None:
     )
     vae.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    clip = sub.add_parser("clip_tokenizer", help="dump CLIP tokenizer references")
+    clip.add_argument(
+        "--model-id",
+        default="openai/clip-vit-large-patch14",
+        help="HuggingFace model id",
+    )
+    clip.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     args = ap.parse_args()
     if args.component == "vae":
         dump_vae(args.output, args.model_id)
+    elif args.component == "clip_tokenizer":
+        dump_clip_tokenizer(args.output, args.model_id)
 
 
 if __name__ == "__main__":
