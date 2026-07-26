@@ -331,6 +331,74 @@ def dump_unet_blocks(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out / 'time_embedding.safetensors'}")
 
 
+def dump_unet_attention(output: pathlib.Path, model_id: str) -> None:
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import UNet2DConditionModel
+    from safetensors.torch import save_file
+
+    out = output / "unet_attention"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id} (subfolder=unet)")
+    unet = UNet2DConditionModel.from_pretrained(
+        model_id, subfolder="unet", torch_dtype=torch.float32
+    )
+    unet.eval()
+
+    attn = unet.down_blocks[0].attentions[0]
+    block = attn.transformer_blocks[0]
+
+    x = torch.randn(2, 320, 16, 16, generator=torch.Generator().manual_seed(0))
+    context = torch.randn(2, 77, 768, generator=torch.Generator().manual_seed(1))
+
+    captured: dict[str, "torch.Tensor"] = {}
+
+    def capture(name: str):
+        def hook(_module, inputs, output):
+            t = output[0] if isinstance(output, tuple) else output
+            captured[name] = t.detach().contiguous().float().clone()
+            if name == "block_output" and inputs:
+                captured["block_input"] = inputs[0].detach().contiguous().float().clone()
+
+        return hook
+
+    # Sub-block captures matter more here than anywhere else: with four
+    # independently checkable stages a failure localizes to one of them
+    # instead of "the transformer is wrong".
+    handles = [
+        block.register_forward_hook(capture("block_output")),
+        block.attn1.register_forward_hook(capture("attn1_output")),
+        block.attn2.register_forward_hook(capture("attn2_output")),
+        block.ff.register_forward_hook(capture("ff_output")),
+    ]
+
+    with torch.no_grad():
+        attn_output = attn(x, encoder_hidden_states=context)
+    if not isinstance(attn_output, torch.Tensor):
+        attn_output = attn_output.sample
+
+    for h in handles:
+        h.remove()
+
+    tensors = {
+        "attn_input": x.contiguous(),
+        "context": context.contiguous(),
+        "attn_output": attn_output.detach().contiguous().clone(),
+        **captured,
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    save_file(
+        {k: v.detach().contiguous().clone() for k, v in attn.state_dict().items()},
+        str(out / "attention.safetensors"),
+    )
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<16} {tuple(v.shape)}")
+    print(f"wrote {out / 'attention.safetensors'}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="component", required=True)
@@ -367,8 +435,18 @@ def main() -> None:
     )
     blocks.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    unet_attn = sub.add_parser("unet_attention", help="dump UNet transformer references")
+    unet_attn.add_argument(
+        "--model-id",
+        default="stable-diffusion-v1-5/stable-diffusion-v1-5",
+        help="HuggingFace model id",
+    )
+    unet_attn.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     args = ap.parse_args()
-    if args.component == "unet_blocks":
+    if args.component == "unet_attention":
+        dump_unet_attention(args.output, args.model_id)
+    elif args.component == "unet_blocks":
         dump_unet_blocks(args.output, args.model_id)
     elif args.component == "vae":
         dump_vae(args.output, args.model_id)
