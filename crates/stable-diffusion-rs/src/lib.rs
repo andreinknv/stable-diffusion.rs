@@ -18,6 +18,7 @@ pub use sd_sample as sample;
 pub use sd_tensor as tensor;
 
 pub mod image_io;
+pub mod pipeline;
 
 /// Crate version, for `--version` and bug reports.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

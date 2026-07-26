@@ -7,7 +7,10 @@ use clap::{Parser, Subcommand};
 // crates.io. Aliasing keeps call sites short — users can do the same.
 use stable_diffusion_rs as sd;
 
+use std::path::Path;
+
 use sd::models::vae::{AutoencoderKlDecoder, VaeConfig};
+use sd::pipeline::{SamplerKind, Txt2ImgConfig, Txt2ImgPipeline};
 use sd_tensor::{device, DType, Tensor};
 
 #[derive(Parser)]
@@ -49,8 +52,55 @@ enum Command {
         raw: bool,
     },
 
+    /// Generate an image from a text prompt.
+    ///
+    /// Named explicitly: clap would otherwise derive `txt2-img` from the
+    /// variant name, which is not what anyone will type.
+    #[command(name = "txt2img")]
+    Txt2Img {
+        /// Model directory in the standard diffusers layout.
+        #[arg(long)]
+        model: String,
+
+        #[arg(long)]
+        prompt: String,
+
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        #[arg(long, default_value_t = 7.5)]
+        cfg_scale: f64,
+
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        /// `euler-a` or `dpmpp2m`.
+        #[arg(long, default_value = "euler-a")]
+        sampler: String,
+
+        #[arg(short, long, default_value = "out.png")]
+        output: String,
+    },
+
     /// Report the active compute device and build configuration.
     Info,
+}
+
+fn parse_sampler(name: &str) -> Result<SamplerKind> {
+    match name {
+        "euler-a" | "euler_a" | "euler" => Ok(SamplerKind::EulerAncestral),
+        "dpmpp2m" | "dpm++2m" | "dpmpp-2m" => Ok(SamplerKind::DpmPlusPlus2M),
+        other => anyhow::bail!("unknown sampler {other:?}; expected 'euler-a' or 'dpmpp2m'"),
+    }
 }
 
 fn main() -> Result<()> {
@@ -110,6 +160,52 @@ fn main() -> Result<()> {
 
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             println!("wrote {output}");
+        }
+
+        Command::Txt2Img {
+            model,
+            prompt,
+            negative_prompt,
+            width,
+            height,
+            steps,
+            cfg_scale,
+            seed,
+            sampler,
+            output,
+        } => {
+            let cfg = Txt2ImgConfig {
+                prompt,
+                negative_prompt,
+                width,
+                height,
+                steps,
+                cfg_scale,
+                seed,
+                sampler: parse_sampler(&sampler)?,
+            };
+
+            tracing::info!(model = %model, "loading pipeline");
+            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
+                .with_context(|| format!("loading pipeline from {model}"))?;
+
+            tracing::info!(
+                prompt = %cfg.prompt,
+                steps = cfg.steps,
+                seed = cfg.seed,
+                "generating"
+            );
+            let started = std::time::Instant::now();
+            // A 20-step CPU run takes minutes; without per-step output it
+            // looks hung.
+            let img = pipeline
+                .run_with_progress(&cfg, &mut |step, total, sigma| {
+                    tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
+                })
+                .context("running txt2img")?;
+
+            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
+            println!("wrote {output} in {:.1?}", started.elapsed());
         }
     }
 
