@@ -23,7 +23,7 @@ use crate::{LoadError, Result};
 /// is `0x03000000`, version 3 with its bytes reversed. Files like this are
 /// real — HuggingFace hosts big-endian builds for s390x — so the difference
 /// between "corrupt" and "wrong byte order" is worth saying out loud.
-fn preflight(file: &mut std::fs::File, path: &Path) -> Result<()> {
+pub(crate) fn preflight(file: &mut std::fs::File, path: &Path) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut head = [0u8; 8];

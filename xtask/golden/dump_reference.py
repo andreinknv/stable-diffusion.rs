@@ -171,6 +171,65 @@ def calculate_shift_compat(config, image_seq_len):
     return image_seq_len * m + b
 
 
+
+def dump_t5(output: pathlib.Path, model_id: str) -> None:
+    """T5 v1.1 encoder against `transformers`.
+
+    Deliberately the *small* checkpoint. T5-XXL is 4.7B parameters and its
+    reference tensors would be unusable as a fixture, while the architecture
+    is identical — same RMSNorm, same unscaled attention, same relative
+    position buckets, same gated GELU. Verifying the code here and then
+    loading XXL weights into it separates "is the port right" from "is the
+    name mapping right", which is the split that made the GGUF work
+    tractable.
+
+    Per-block hidden states are captured, not just the output, so a
+    divergence localises to a block instead of being reported at the end.
+    """
+    torch = _require("torch")
+    _require("transformers")
+    from transformers import T5EncoderModel
+    from safetensors.torch import save_file
+
+    out = output / "t5"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id}")
+    model = T5EncoderModel.from_pretrained(model_id, torch_dtype=torch.float32).eval()
+    cfg = model.config
+    print(
+        f"  d_model={cfg.d_model} d_ff={cfg.d_ff} layers={cfg.num_layers} "
+        f"heads={cfg.num_heads} d_kv={cfg.d_kv}"
+    )
+
+    gen = torch.Generator().manual_seed(SEED)
+    # Ordinary ids well inside the vocabulary; the tokenizer is verified
+    # separately and mixing the two would confuse a failure here.
+    ids = torch.randint(0, 32000, (1, 24), generator=gen)
+
+    with torch.no_grad():
+        result = model(input_ids=ids, output_hidden_states=True)
+
+    tensors = {
+        "token_ids": ids.to(torch.int64).contiguous(),
+        "last_hidden_state": result.last_hidden_state.detach().contiguous().clone(),
+    }
+    for i, h in enumerate(result.hidden_states):
+        tensors[f"hidden_{i}"] = h.detach().contiguous().clone()
+
+    # The position bias itself, which is the piece most likely to be wrong and
+    # the hardest to infer from a whole-model mismatch.
+    attn = model.encoder.block[0].layer[0].SelfAttention
+    with torch.no_grad():
+        bias = attn.compute_bias(ids.shape[1], ids.shape[1])
+    tensors["position_bias"] = bias.detach().contiguous().clone()
+
+    save_file(tensors, str(out / "reference.safetensors"))
+    weights = {k: v.detach().contiguous().clone() for k, v in model.state_dict().items()}
+    save_file(weights, str(out / "t5.safetensors"))
+    print(f"wrote {out}/reference.safetensors ({len(tensors)} tensors) and t5.safetensors")
+
+
 def dump_vae(output: pathlib.Path, model_id: str) -> None:
     torch = _require("torch")
     _require("diffusers")
@@ -927,6 +986,10 @@ def main() -> None:
     flow.add_argument("--model-id", default="Freepik/flux.1-lite-8B")
     flow.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    t5 = sub.add_parser("t5", help="dump T5 v1.1 encoder references")
+    t5.add_argument("--model-id", default="google/t5-v1_1-small")
+    t5.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     clip = sub.add_parser("clip_tokenizer", help="dump CLIP tokenizer references")
     clip.add_argument(
         "--model-id",
@@ -1006,6 +1069,8 @@ def main() -> None:
         dump_flux_vae(args.output, args.model_id)
     elif args.component == "flow":
         dump_flow(args.output, args.model_id)
+    elif args.component == "t5":
+        dump_t5(args.output, args.model_id)
     elif args.component == "vae":
         dump_vae(args.output, args.model_id)
     elif args.component == "clip_tokenizer":

@@ -677,6 +677,25 @@ pub mod testing {
         })
     }
 
+    /// Worst violation of `|a - b| <= rtol * |b|`, i.e. `max(|a-b| - rtol*|b|)`.
+    ///
+    /// Compare the result against an `atol`. Use this instead of
+    /// [`closeness`] whenever the tensor carries values far from order 1,
+    /// which for text encoders is the normal case rather than the exception:
+    /// CLIP peaks at 851, and T5 at ~40,000. f32 cannot hold 1e-4 absolute at
+    /// that magnitude, so an absolute bound reports arithmetic noise as a
+    /// failure and tells you nothing about correctness.
+    ///
+    /// A negative result means every element was inside the relative
+    /// allowance with room to spare.
+    pub fn allclose_excess(a: &Tensor, b: &Tensor, rtol: f64) -> Result<f64> {
+        let af = a.to_dtype(DType::F32)?.flatten_all()?;
+        let bf = b.to_dtype(DType::F32)?.flatten_all()?;
+        let diff = (&af - &bf)?.abs()?;
+        let allowance = (bf.abs()? * rtol)?;
+        Ok((diff - allowance)?.max(0)?.to_scalar::<f32>()? as f64)
+    }
+
     /// Default tolerance for f16-origin weights run in f32.
     ///
     /// Tighter than this and you chase phantom failures from accumulation
