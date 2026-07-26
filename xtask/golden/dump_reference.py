@@ -106,6 +106,71 @@ def dump_flux_vae(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out}/reference.safetensors and vae.safetensors")
 
 
+
+def dump_flow(output: pathlib.Path, model_id: str) -> None:
+    """FlowMatchEulerDiscreteScheduler sigmas, timesteps, and a step.
+
+    The sigma schedule is where every rectified-flow implementation goes
+    wrong, because the warp is easy to write plausibly and slightly off. Two
+    resolutions are dumped so that a hardcoded shift cannot pass, and the
+    schedule is taken from the scheduler itself rather than reimplemented
+    here — a reference that shares our reasoning would verify nothing.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    from safetensors.torch import save_file
+
+    out = output / "flow"
+    out.mkdir(parents=True, exist_ok=True)
+
+    sched = FlowMatchEulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
+    print(f"loaded {type(sched).__name__} from {model_id}")
+
+    tensors = {}
+    for label, seq_len in [("1024tok", 1024), ("4096tok", 4096)]:
+        s = FlowMatchEulerDiscreteScheduler.from_config(sched.config)
+        mu = calculate_shift_compat(s.config, seq_len)
+        s.set_timesteps(num_inference_steps=20, mu=mu)
+        tensors[f"sigmas_{label}"] = s.sigmas.detach().float().contiguous().clone()
+        tensors[f"timesteps_{label}"] = s.timesteps.detach().float().contiguous().clone()
+        tensors[f"mu_{label}"] = torch.tensor([mu], dtype=torch.float32)
+
+    # One Euler step, so the update rule is checked and not just the schedule.
+    s = FlowMatchEulerDiscreteScheduler.from_config(sched.config)
+    s.set_timesteps(num_inference_steps=20, mu=calculate_shift_compat(s.config, 4096))
+    gen = torch.Generator().manual_seed(SEED)
+    x = torch.randn(1, 16, 8, 8, generator=gen)
+    v = torch.randn(1, 16, 8, 8, generator=gen)
+    stepped = s.step(v, s.timesteps[3], x, return_dict=False)[0]
+    tensors["step_x"] = x.contiguous()
+    tensors["step_velocity"] = v.contiguous()
+    tensors["step_index"] = torch.tensor([3], dtype=torch.float32)
+    tensors["step_out"] = stepped.detach().contiguous().clone()
+
+    # img2img: the forward noising the model was trained on.
+    noise = torch.randn(1, 16, 8, 8, generator=gen)
+    scaled = s.scale_noise(x, s.timesteps[5:6], noise)
+    # `.clone()`: this is the same tensor as `step_x`, and safetensors
+    # refuses to serialize two entries sharing one storage.
+    tensors["scale_noise_sample"] = x.contiguous().clone()
+    tensors["scale_noise_noise"] = noise.contiguous()
+    tensors["scale_noise_index"] = torch.tensor([5], dtype=torch.float32)
+    tensors["scale_noise_out"] = scaled.detach().contiguous().clone()
+
+    save_file(tensors, str(out / "reference.safetensors"))
+    print(f"wrote {out}/reference.safetensors")
+
+
+def calculate_shift_compat(config, image_seq_len):
+    """diffusers moved this helper around between versions."""
+    m = (config.max_shift - config.base_shift) / (
+        config.max_image_seq_len - config.base_image_seq_len
+    )
+    b = config.base_shift - m * config.base_image_seq_len
+    return image_seq_len * m + b
+
+
 def dump_vae(output: pathlib.Path, model_id: str) -> None:
     torch = _require("torch")
     _require("diffusers")
@@ -858,6 +923,10 @@ def main() -> None:
     )
     fluxvae.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    flow = sub.add_parser("flow", help="dump rectified-flow scheduler references")
+    flow.add_argument("--model-id", default="Freepik/flux.1-lite-8B")
+    flow.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     clip = sub.add_parser("clip_tokenizer", help="dump CLIP tokenizer references")
     clip.add_argument(
         "--model-id",
@@ -935,6 +1004,8 @@ def main() -> None:
         dump_unet_blocks(args.output, args.model_id)
     elif args.component == "flux_vae":
         dump_flux_vae(args.output, args.model_id)
+    elif args.component == "flow":
+        dump_flow(args.output, args.model_id)
     elif args.component == "vae":
         dump_vae(args.output, args.model_id)
     elif args.component == "clip_tokenizer":

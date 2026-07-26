@@ -5,10 +5,12 @@
 
 pub mod dpmpp;
 pub mod euler;
+pub mod flow;
 pub mod sigmas;
 
 pub use dpmpp::DpmSolverPlusPlus2M;
 pub use euler::euler_ancestral_step;
+pub use flow::{flow_euler_step, flow_sigmas, flow_timesteps, scale_noise, FlowMatchConfig};
 pub use sigmas::sigmas_for_steps;
 
 /// Beta schedule shapes used by Stable Diffusion.
