@@ -222,3 +222,46 @@ fn encoder_matches_diffusers_reference() {
     eprintln!("vae encoder vs diffusers: {c}");
     testing::assert_close(&got, expected, testing::DEFAULT_ATOL, "vae encoder moments").unwrap();
 }
+
+/// The GGUF path end to end: an LDM-named, Q4_0-quantised checkpoint decoded
+/// through the same decoder, and compared against the same reference.
+///
+/// This is what proves the name mapping. Unit tests show individual keys
+/// translate and that the translation is total over the file; only decoding
+/// shows they were translated to the *right* names — a plausible but wrong
+/// mapping loads without error and produces noise.
+#[test]
+fn a_quantised_ldm_checkpoint_decodes_through_the_name_map() {
+    let refs_path = golden_path();
+    let gguf =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/gguf/sd15-q4_0.gguf");
+    if !refs_path.exists() || !gguf.exists() {
+        eprintln!("SKIP: needs both the vae reference and sd15-q4_0.gguf");
+        return;
+    }
+
+    let dev = Device::Cpu;
+    let refs = sd_tensor::safetensors::load(&refs_path, &dev).expect("reference");
+    let latent = refs.get("latent").expect("latent");
+    let expected = refs.get("image").expect("image");
+
+    let vb = sd_loader::vae_var_builder_from_gguf(&gguf, DType::F32, &dev)
+        .expect("loading the VAE from a GGUF checkpoint");
+    let decoder = AutoencoderKlDecoder::new(&VaeConfig::sd15(), vb)
+        .expect("every mapped name must be one the decoder asks for");
+
+    let got = decoder.decode_raw(latent).expect("decode");
+    assert_eq!(got.dims(), expected.dims());
+
+    let c = testing::closeness(&got, expected).expect("comparing");
+    eprintln!("gguf Q4_0 vs f32 reference: {c}");
+
+    // Not 1e-4. These weights are 4-bit: the difference here is quantisation,
+    // and the assertion is that the image is recognisably the same one, not
+    // that it is the same numbers. A wrong mapping does not land near this —
+    // it decodes to noise, which on a [-1, 1] image means a mean well above 1.
+    assert!(
+        c.mean_abs < 0.15,
+        "decoded image is not recognisably the reference: {c}"
+    );
+}

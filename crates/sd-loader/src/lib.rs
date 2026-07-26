@@ -12,8 +12,9 @@
 //! mmap call below and justify any addition.
 
 pub mod gguf;
+pub mod ldm;
 
-pub use gguf::{gguf_var_builder, GgufInfo, Layout};
+pub use gguf::{gguf_var_builder, vae_var_builder_from_gguf, GgufInfo, Layout};
 
 use std::path::{Path, PathBuf};
 

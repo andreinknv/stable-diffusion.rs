@@ -68,7 +68,7 @@ leave the order-1 range; `testing::assert_close` is absolute-only.
 | ✅ | SDXL — text encoder 2 | verified vs `transformers` |
 | ✅ | SDXL — UNet | verified vs `diffusers`, max_abs 1.4e-5 |
 | ✅ | SDXL — end to end | 1024 on Metal in 89 s, f16 weights + tiled decode |
-| 🔴 | GGUF | reads and dequantises; needs a name map for SD checkpoints |
+| 🔴 | GGUF | VAE loads from a real Q4_0 checkpoint; UNet name map remains |
 | ⬜ | Metal and CUDA paths through the seam | Metal verified end to end |
 
 The VAE encoder's downsampler pads **asymmetrically** (bottom and right only).
@@ -79,9 +79,18 @@ any other downsampling path.
 Remaining milestone 2 work:
 
 - SDXL (same geometry, second text encoder, different latent scaling)
-- **LDM -> diffusers name translation for the VAE and UNet.** Everything else
-  in the GGUF path works: reading, dequantising, layout detection, and the
-  text encoder. What remains is index translation for the other two towers.
+- **LDM -> diffusers name translation for the UNet.** The VAE is done —
+  `vae_var_builder_from_gguf` loads a real Q4_0 checkpoint and decodes it
+  through the existing decoder at `mean_abs` 8.9e-3 against the f32
+  reference, which is quantisation error rather than mapping error. All 248
+  VAE tensors translate, injectively, checked against the real file.
+
+  Two things learned there that the UNet will hit as well: the decoder's
+  block order is **reversed** while the encoder's is not, and attention is
+  stored as 1x1 convolutions needing a reshape, not just a rename. Neither is
+  visible in a name.
+
+  What remains is the 686-tensor UNet:
 
   This is now specified rather than guessed at, from a real
   `stable-diffusion.cpp` SD 1.5 checkpoint (`dump_reference.py gguf` links it;
@@ -90,14 +99,14 @@ Remaining milestone 2 work:
   | tower | tensors | LDM name | ours |
   |---|---:|---|---|
   | CLIP | 196 | `cond_stage_model.transformer.text_model.encoder.layers.0.layer_norm1.weight` | strip the prefix — **done** |
-  | VAE | 248 | `first_stage_model.decoder.up.0.block.0.conv1.weight` | `decoder.up_blocks.N.resnets.0.conv1.weight` |
+  | VAE | 248 | `first_stage_model.decoder.up.0.block.0.conv1.weight` | `decoder.up_blocks.3.resnets.0.conv1.weight` — **done** |
   | UNet | 686 | `model.diffusion_model.input_blocks.1.0.in_layers.0.weight` | `down_blocks.0.resnets.0.norm1.weight` |
 
-  The VAE needs the `up` list reversed against `up_blocks`, `nin_shortcut` ->
-  `conv_shortcut`, `mid.attn_1.{q,k,v,proj_out}` -> `to_q/to_k/to_v/to_out.0`,
-  and `norm_out` -> `conv_norm_out`. The UNet is the bulk: LDM flattens
-  everything into `input_blocks.N.M` slots that map onto
-  `down_blocks`/`mid_block`/`up_blocks` by arithmetic, not by name.
+  LDM flattens the UNet into `input_blocks.N.M` slots that map onto
+  `down_blocks`/`mid_block`/`up_blocks` by arithmetic rather than by name.
+  Verify it the way the VAE was verified: make the translation **total** over
+  the real file and **injective**, then run the UNet golden test through it —
+  a plausible-but-wrong mapping loads without complaint.
 
   **The file declares nothing about itself** — no metadata at all, not even
   `general.architecture` — so `GgufInfo::layout()` infers the convention from

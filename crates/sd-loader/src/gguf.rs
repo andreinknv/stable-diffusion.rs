@@ -266,3 +266,85 @@ impl GgufInfo {
             .map(|rest| rest.to_string())
     }
 }
+
+/// Load just the VAE from an LDM-layout GGUF, translated to `diffusers` names.
+///
+/// The counterpart to [`gguf_var_builder`] for checkpoints that need
+/// translating rather than passing through. Tensors outside the VAE are
+/// skipped, so this works on a full SD checkpoint where UNet and CLIP share
+/// the file.
+///
+/// Weights arrive dequantised, so quantisation error is baked in — a Q4_0
+/// checkpoint decodes to a recognisably correct image, not a bit-identical
+/// one. That is the format's trade, not a defect here.
+pub fn vae_var_builder_from_gguf<'a>(
+    path: impl AsRef<Path>,
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'a>> {
+    let info = GgufInfo::open(&path)?;
+    if info.layout() != Layout::Ldm {
+        return Err(LoadError::Unsupported {
+            path: info.path.clone(),
+            reason: format!(
+                "expected an LDM-layout checkpoint (stable-diffusion.cpp writes these);                  tensor names look like {:?}",
+                info.layout()
+            ),
+        });
+    }
+
+    // Only the VAE is expanded, so size the guard on that rather than on the
+    // whole file — a full SD checkpoint is mostly UNet, which is skipped.
+    let vae_params: u64 = info
+        .tensors
+        .iter()
+        .filter(|(k, _)| k.starts_with("first_stage_model."))
+        .map(|(_, (shape, _))| shape.iter().map(|&d| d as u64).product::<u64>())
+        .sum();
+    sd_tensor::sysmem::check_headroom(
+        vae_params.saturating_mul(dtype.size_in_bytes() as u64),
+        &format!("dequantising the VAE from {}", info.path.display()),
+    )?;
+
+    let mut file = std::fs::File::open(&info.path).map_err(|e| LoadError::Unsupported {
+        path: info.path.clone(),
+        reason: format!("cannot open: {e}"),
+    })?;
+    preflight(&mut file, &info.path)?;
+    let content = Content::read(&mut file)?;
+
+    // Every SD VAE has four resolution levels; the decoder's block order is
+    // reversed against it.
+    const BLOCKS: usize = 4;
+
+    let mut tensors: HashMap<String, Tensor> = HashMap::new();
+    for name in content.tensor_infos.keys() {
+        let Some(mapped) = crate::ldm::vae_key(name, BLOCKS) else {
+            continue;
+        };
+        let t = content
+            .tensor(&mut file, name, device)?
+            .dequantize(device)?
+            .to_dtype(dtype)?;
+        // LDM stores the attention projections as 1x1 convolutions; our
+        // Linear wants them 2-D.
+        let t = match (mapped.squeeze_to_2d, t.dims()) {
+            // [C, C, 1, 1] -> [C, C].
+            (true, [a, b, 1, 1]) => t.reshape((*a, *b))?,
+            (true, other) => {
+                return Err(LoadError::Unsupported {
+                    path: info.path.clone(),
+                    reason: format!(
+                        "{name} was expected to be a 1x1 convolution standing in for a \
+                         linear, but its shape is {other:?}"
+                    ),
+                })
+            }
+            (false, _) => t,
+        };
+        tensors.insert(mapped.name, t);
+    }
+
+    tracing::debug!(tensors = tensors.len(), "loaded vae from gguf");
+    Ok(VarBuilder::from_tensors(tensors, dtype, device))
+}
