@@ -158,3 +158,160 @@ pub fn vae_key(key: &str, blocks: usize) -> Option<Mapped> {
         _ => None,
     }
 }
+
+/// Rewrite the leaf of a UNet resnet key.
+///
+/// LDM names these by their position in an `nn.Sequential`, which is why the
+/// indices look arbitrary: `in_layers` is `[GroupNorm, SiLU, Conv2d]`, so the
+/// norm is `.0` and the conv is `.2`; `out_layers` adds a Dropout, so its
+/// conv is `.3`. Nothing in the name says which is which.
+fn unet_resnet_leaf(leaf: &str) -> Option<String> {
+    let (head, tail) = leaf.split_once('.')?;
+    Some(match (head, tail) {
+        ("in_layers", t) => match t.split_once('.')? {
+            ("0", x) => format!("norm1.{x}"),
+            ("2", x) => format!("conv1.{x}"),
+            _ => return None,
+        },
+        ("emb_layers", t) => match t.split_once('.')? {
+            ("1", x) => format!("time_emb_proj.{x}"),
+            _ => return None,
+        },
+        ("out_layers", t) => match t.split_once('.')? {
+            ("0", x) => format!("norm2.{x}"),
+            ("3", x) => format!("conv2.{x}"),
+            _ => return None,
+        },
+        ("skip_connection", t) => format!("conv_shortcut.{t}"),
+        _ => return None,
+    })
+}
+
+/// Where an `input_blocks.{i}` slot lands.
+///
+/// LDM flattens the down pass into one list: slot 0 is `conv_in`, then each
+/// block contributes `layers_per_block` resnets followed by a downsampler,
+/// except the last which has no downsampler. Nothing in the name says which
+/// block a slot belongs to — it is arithmetic, and an off-by-one loads
+/// cleanly and denoises toward nothing.
+fn down_slot(i: usize, layers: usize) -> Option<(usize, DownRole)> {
+    if i == 0 {
+        return Some((0, DownRole::ConvIn));
+    }
+    let stride = layers + 1;
+    let block = (i - 1) / stride;
+    let within = (i - 1) % stride;
+    if within < layers {
+        Some((block, DownRole::Resnet(within)))
+    } else {
+        Some((block, DownRole::Downsampler))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownRole {
+    ConvIn,
+    Resnet(usize),
+    Downsampler,
+}
+
+/// Translate one LDM UNet key.
+///
+/// `layers` is `layers_per_block` — 2 for SD 1.5. Up blocks carry
+/// `layers + 1` resnets, which is why the two lists divide differently.
+pub fn unet_key(key: &str, layers: usize) -> Option<Mapped> {
+    let rest = key.strip_prefix("model.diffusion_model.")?;
+
+    // The timestep MLP, named by Sequential position again.
+    if let Some(t) = rest.strip_prefix("time_embed.") {
+        return match t.split_once('.')? {
+            ("0", x) => Some(Mapped::plain(format!("time_embedding.linear_1.{x}"))),
+            ("2", x) => Some(Mapped::plain(format!("time_embedding.linear_2.{x}"))),
+            _ => None,
+        };
+    }
+    // The output head: [GroupNorm, SiLU, Conv2d].
+    if let Some(t) = rest.strip_prefix("out.") {
+        return match t.split_once('.')? {
+            ("0", x) => Some(Mapped::plain(format!("conv_norm_out.{x}"))),
+            ("2", x) => Some(Mapped::plain(format!("conv_out.{x}"))),
+            _ => None,
+        };
+    }
+    if let Some(t) = rest.strip_prefix("middle_block.") {
+        let (idx, leaf) = t.split_once('.')?;
+        return match idx {
+            "0" => Some(Mapped::plain(format!(
+                "mid_block.resnets.0.{}",
+                unet_resnet_leaf(leaf)?
+            ))),
+            // The transformer's own names already agree with diffusers.
+            "1" => Some(Mapped::plain(format!("mid_block.attentions.0.{leaf}"))),
+            "2" => Some(Mapped::plain(format!(
+                "mid_block.resnets.1.{}",
+                unet_resnet_leaf(leaf)?
+            ))),
+            _ => None,
+        };
+    }
+
+    if let Some(t) = rest.strip_prefix("input_blocks.") {
+        let (i, t) = t.split_once('.')?;
+        let (sub, leaf) = t.split_once('.')?;
+        let i: usize = i.parse().ok()?;
+        let (block, role) = down_slot(i, layers)?;
+        return match (role, sub) {
+            (DownRole::ConvIn, "0") => Some(Mapped::plain(format!("conv_in.{leaf}"))),
+            (DownRole::Resnet(j), "0") => Some(Mapped::plain(format!(
+                "down_blocks.{block}.resnets.{j}.{}",
+                unet_resnet_leaf(leaf)?
+            ))),
+            (DownRole::Resnet(j), "1") => Some(Mapped::plain(format!(
+                "down_blocks.{block}.attentions.{j}.{leaf}"
+            ))),
+            // The downsampler's conv is called `op`, and only here.
+            (DownRole::Downsampler, "0") => {
+                let x = leaf.strip_prefix("op.")?;
+                Some(Mapped::plain(format!(
+                    "down_blocks.{block}.downsamplers.0.conv.{x}"
+                )))
+            }
+            _ => None,
+        };
+    }
+
+    if let Some(t) = rest.strip_prefix("output_blocks.") {
+        let (i, t) = t.split_once('.')?;
+        let (sub, leaf) = t.split_once('.')?;
+        let i: usize = i.parse().ok()?;
+        // Up blocks hold layers + 1 resnets, so they divide by that.
+        let per = layers + 1;
+        let block = i / per;
+        let j = i % per;
+        return match sub {
+            "0" => Some(Mapped::plain(format!(
+                "up_blocks.{block}.resnets.{j}.{}",
+                unet_resnet_leaf(leaf)?
+            ))),
+            // Ambiguous by position: `.1` is the attention where the block
+            // has one, and the upsampler where it does not. `conv.` on the
+            // leaf is what distinguishes them.
+            "1" => match leaf.strip_prefix("conv.") {
+                Some(x) => Some(Mapped::plain(format!(
+                    "up_blocks.{block}.upsamplers.0.conv.{x}"
+                ))),
+                None => Some(Mapped::plain(format!(
+                    "up_blocks.{block}.attentions.{j}.{leaf}"
+                ))),
+            },
+            "2" => {
+                let x = leaf.strip_prefix("conv.")?;
+                Some(Mapped::plain(format!(
+                    "up_blocks.{block}.upsamplers.0.conv.{x}"
+                )))
+            }
+            _ => None,
+        };
+    }
+    None
+}

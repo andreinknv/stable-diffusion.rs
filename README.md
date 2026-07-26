@@ -10,8 +10,8 @@ have a binary.
 > **Status: it renders.** Text-to-image and image-to-image work for
 > Stable Diffusion 1.5 and SDXL, on CPU and Apple GPU. Every model component is
 > verified tensor-by-tensor against `diffusers`/`transformers` — not eyeballed.
-> GGUF reads and dequantises (`sdrs inspect`), and its VAE loads from a real
-> quantised checkpoint; the UNet name map is still to write. CUDA compiles but
+> GGUF reads, dequantises and name-maps — VAE, UNet and text encoder all load
+> from a real quantised checkpoint — but is not yet wired into the pipelines. CUDA compiles but
 > is untested. See the [roadmap](docs/roadmap.md).
 
 <p align="center">

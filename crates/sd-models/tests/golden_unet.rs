@@ -222,3 +222,60 @@ fn full_unet_matches_diffusers() {
     // against, rather than slack granted up front.
     testing::assert_close(&got, want, testing::DEFAULT_ATOL, "full UNet").unwrap();
 }
+
+/// The UNet loaded from a real quantised LDM checkpoint, run against the same
+/// reference the safetensors path is held to.
+///
+/// This is what proves the 686-tensor name map. Totality and injectivity say
+/// every key translated to *something* unique; only running the model says
+/// they translated to the *right* things — a plausible-but-wrong mapping
+/// loads without complaint and denoises toward nothing.
+#[test]
+fn a_quantised_ldm_unet_runs_through_the_name_map() {
+    let Some(refs) = refs() else { return };
+    let gguf =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/gguf/sd15-q4_0.gguf");
+    if !gguf.exists() {
+        eprintln!("SKIP: no sd15-q4_0.gguf");
+        return;
+    }
+
+    let dev = Device::Cpu;
+    let vb = sd_loader::unet_var_builder_from_gguf(&gguf, DType::F32, &dev)
+        .expect("loading the UNet from a GGUF checkpoint");
+    let unet = UNet2DConditionModel::new(&UNetConfig::sd15(), vb)
+        .expect("every mapped name must be one the UNet asks for");
+
+    let got = unet
+        .forward(
+            refs.get("sample").expect("sample"),
+            refs.get("timestep").expect("timestep"),
+            refs.get("context").expect("context"),
+        )
+        .expect("forward");
+    let want = refs.get("output").expect("output");
+    assert_eq!(got.dims(), want.dims());
+
+    let c = testing::closeness(&got, want).expect("comparing");
+
+    // An absolute threshold would be arbitrary here: 4-bit weights make some
+    // error certain, and "how much is too much" has no principled value.
+    // Correlation does have one. A correct mapping predicts the same noise
+    // field slightly imprecisely; a wrong mapping predicts a different field
+    // entirely, and lands near zero however small its magnitude happens to
+    // be. That is the property worth asserting.
+    let a = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let n = a.len() as f32;
+    let (ma, mb) = (a.iter().sum::<f32>() / n, b.iter().sum::<f32>() / n);
+    let cov: f32 = a.iter().zip(&b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+    let va: f32 = a.iter().map(|x| (x - ma).powi(2)).sum();
+    let vb: f32 = b.iter().map(|y| (y - mb).powi(2)).sum();
+    let corr = cov / (va.sqrt() * vb.sqrt());
+    eprintln!("gguf Q4_0 unet vs f32 reference: {c}, correlation {corr:.4}");
+
+    assert!(
+        corr > 0.97,
+        "the prediction is not the reference's: correlation {corr:.4} ({c})"
+    );
+}

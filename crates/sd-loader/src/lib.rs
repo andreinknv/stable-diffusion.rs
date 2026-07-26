@@ -14,7 +14,9 @@
 pub mod gguf;
 pub mod ldm;
 
-pub use gguf::{gguf_var_builder, vae_var_builder_from_gguf, GgufInfo, Layout};
+pub use gguf::{
+    gguf_var_builder, unet_var_builder_from_gguf, vae_var_builder_from_gguf, GgufInfo, Layout,
+};
 
 use std::path::{Path, PathBuf};
 

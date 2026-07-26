@@ -185,3 +185,161 @@ fn only_the_attention_weight_is_reshaped_not_its_bias() {
     assert!(!b.squeeze_to_2d, "the bias does not");
     assert_eq!(b.name, "decoder.mid_block.attentions.0.to_q.bias");
 }
+
+// -- the UNet --------------------------------------------------------------
+
+use sd_loader::ldm::unet_key;
+
+const LAYERS: usize = 2;
+
+fn umap(k: &str) -> Option<Mapped> {
+    unet_key(k, LAYERS)
+}
+
+#[test]
+fn resnet_leaves_are_named_by_sequential_position_not_by_role() {
+    // LDM names these by index into an nn.Sequential, so nothing in the name
+    // says which is the norm and which is the conv. in_layers is
+    // [GroupNorm, SiLU, Conv2d]; out_layers inserts a Dropout, which is why
+    // its conv is .3 and not .2.
+    let base = "model.diffusion_model.input_blocks.1.0";
+    for (ldm, ours) in [
+        ("in_layers.0.weight", "norm1.weight"),
+        ("in_layers.2.weight", "conv1.weight"),
+        ("emb_layers.1.bias", "time_emb_proj.bias"),
+        ("out_layers.0.weight", "norm2.weight"),
+        ("out_layers.3.bias", "conv2.bias"),
+    ] {
+        assert_eq!(
+            umap(&format!("{base}.{ldm}")).unwrap().name,
+            format!("down_blocks.0.resnets.0.{ours}")
+        );
+    }
+}
+
+#[test]
+fn the_flat_slot_list_divides_into_blocks_by_arithmetic() {
+    // Slot 0 is conv_in; then two resnets and a downsampler per block, with
+    // the last block having no downsampler. None of that is in the name.
+    let n = |i: usize, sub: &str, leaf: &str| {
+        umap(&format!(
+            "model.diffusion_model.input_blocks.{i}.{sub}.{leaf}"
+        ))
+        .map(|m| m.name)
+    };
+    assert_eq!(n(0, "0", "weight").as_deref(), Some("conv_in.weight"));
+    assert_eq!(
+        n(2, "0", "in_layers.0.weight").as_deref(),
+        Some("down_blocks.0.resnets.1.norm1.weight")
+    );
+    // The downsampler's conv is called `op`, and only here.
+    assert_eq!(
+        n(3, "0", "op.weight").as_deref(),
+        Some("down_blocks.0.downsamplers.0.conv.weight")
+    );
+    assert_eq!(
+        n(4, "0", "in_layers.0.weight").as_deref(),
+        Some("down_blocks.1.resnets.0.norm1.weight")
+    );
+    // The deepest block: resnets only, no attention, no downsampler.
+    assert_eq!(
+        n(11, "0", "in_layers.0.weight").as_deref(),
+        Some("down_blocks.3.resnets.1.norm1.weight")
+    );
+}
+
+#[test]
+fn an_up_slot_index_one_is_attention_or_upsampler_depending_on_the_block() {
+    // The genuinely ambiguous case. up_blocks.0 has no attention, so its
+    // `.1` is the upsampler; every other block's `.1` is the attention and
+    // the upsampler moves to `.2`. Position alone cannot tell them apart —
+    // the `conv.` leaf is what does.
+    assert_eq!(
+        umap("model.diffusion_model.output_blocks.2.1.conv.weight")
+            .unwrap()
+            .name,
+        "up_blocks.0.upsamplers.0.conv.weight"
+    );
+    assert_eq!(
+        umap("model.diffusion_model.output_blocks.3.1.norm.weight")
+            .unwrap()
+            .name,
+        "up_blocks.1.attentions.0.norm.weight"
+    );
+    assert_eq!(
+        umap("model.diffusion_model.output_blocks.5.2.conv.bias")
+            .unwrap()
+            .name,
+        "up_blocks.1.upsamplers.0.conv.bias"
+    );
+}
+
+#[test]
+fn the_head_and_the_timestep_mlp_are_sequential_indices_too() {
+    assert_eq!(
+        umap("model.diffusion_model.time_embed.0.weight")
+            .unwrap()
+            .name,
+        "time_embedding.linear_1.weight"
+    );
+    assert_eq!(
+        umap("model.diffusion_model.time_embed.2.bias")
+            .unwrap()
+            .name,
+        "time_embedding.linear_2.bias"
+    );
+    assert_eq!(
+        umap("model.diffusion_model.out.0.weight").unwrap().name,
+        "conv_norm_out.weight"
+    );
+    assert_eq!(
+        umap("model.diffusion_model.out.2.bias").unwrap().name,
+        "conv_out.bias"
+    );
+    assert_eq!(
+        umap("model.diffusion_model.middle_block.1.norm.weight")
+            .unwrap()
+            .name,
+        "mid_block.attentions.0.norm.weight"
+    );
+}
+
+#[test]
+fn every_unet_tensor_in_a_real_checkpoint_maps() {
+    // As with the VAE: unit cases prove the keys I looked at, this proves
+    // there is nothing in the file I did not. 686 tensors.
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/gguf/sd15-q4_0.gguf");
+    if !p.exists() {
+        eprintln!("SKIP: no sd15-q4_0.gguf");
+        return;
+    }
+    let info = sd_loader::GgufInfo::open(&p).expect("reading");
+
+    let unet: Vec<&String> = info
+        .tensors
+        .keys()
+        .filter(|k| k.starts_with("model.diffusion_model."))
+        .collect();
+    assert!(
+        unet.len() > 600,
+        "expected a full UNet, found {}",
+        unet.len()
+    );
+
+    let unmapped: Vec<&&String> = unet.iter().filter(|k| umap(k).is_none()).collect();
+    assert!(
+        unmapped.is_empty(),
+        "{} of {} UNet tensors did not translate, e.g. {:?}",
+        unmapped.len(),
+        unet.len(),
+        &unmapped[..unmapped.len().min(6)]
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    for k in &unet {
+        let m = umap(k).unwrap();
+        assert!(seen.insert(m.name.clone()), "two keys map to {}", m.name);
+    }
+    eprintln!("{} UNet tensors, all mapped, no collisions", unet.len());
+}

@@ -68,7 +68,7 @@ leave the order-1 range; `testing::assert_close` is absolute-only.
 | ✅ | SDXL — text encoder 2 | verified vs `transformers` |
 | ✅ | SDXL — UNet | verified vs `diffusers`, max_abs 1.4e-5 |
 | ✅ | SDXL — end to end | 1024 on Metal in 89 s, f16 weights + tiled decode |
-| 🔴 | GGUF | VAE loads from a real Q4_0 checkpoint; UNet name map remains |
+| ✅ | GGUF | VAE and UNet both load from a real Q4_0 checkpoint |
 | ⬜ | Metal and CUDA paths through the seam | Metal verified end to end |
 
 The VAE encoder's downsampler pads **asymmetrically** (bottom and right only).
@@ -79,45 +79,13 @@ any other downsampling path.
 Remaining milestone 2 work:
 
 - SDXL (same geometry, second text encoder, different latent scaling)
-- **LDM -> diffusers name translation for the UNet.** The VAE is done —
-  `vae_var_builder_from_gguf` loads a real Q4_0 checkpoint and decodes it
-  through the existing decoder at `mean_abs` 8.9e-3 against the f32
-  reference, which is quantisation error rather than mapping error. All 248
-  VAE tensors translate, injectively, checked against the real file.
-
-  Two things learned there that the UNet will hit as well: the decoder's
-  block order is **reversed** while the encoder's is not, and attention is
-  stored as 1x1 convolutions needing a reshape, not just a rename. Neither is
-  visible in a name.
-
-  What remains is the 686-tensor UNet:
-
-  This is now specified rather than guessed at, from a real
-  `stable-diffusion.cpp` SD 1.5 checkpoint (`dump_reference.py gguf` links it;
-  1131 tensors, 955 Q4_0 + 176 F16):
-
-  | tower | tensors | LDM name | ours |
-  |---|---:|---|---|
-  | CLIP | 196 | `cond_stage_model.transformer.text_model.encoder.layers.0.layer_norm1.weight` | strip the prefix — **done** |
-  | VAE | 248 | `first_stage_model.decoder.up.0.block.0.conv1.weight` | `decoder.up_blocks.3.resnets.0.conv1.weight` — **done** |
-  | UNet | 686 | `model.diffusion_model.input_blocks.1.0.in_layers.0.weight` | `down_blocks.0.resnets.0.norm1.weight` |
-
-  LDM flattens the UNet into `input_blocks.N.M` slots that map onto
-  `down_blocks`/`mid_block`/`up_blocks` by arithmetic rather than by name.
-  Verify it the way the VAE was verified: make the translation **total** over
-  the real file and **injective**, then run the UNet golden test through it —
-  a plausible-but-wrong mapping loads without complaint.
-
-  **The file declares nothing about itself** — no metadata at all, not even
-  `general.architecture` — so `GgufInfo::layout()` infers the convention from
-  tensor prefixes. Any mapping work builds on that, not on metadata.
-
-  The reader is tested against real llama.cpp files as well as synthetic ones — `dump_reference.py gguf` links three small fixtures (16 MB
-  to 67 MB). That found one thing immediately: big-endian builds exist, candle
-  rejects them as `unsupported magic/version Gguf/50331648`, and we now say
-  what that actually means. Still uncovered: non-UTF8 and null-terminated
-  strings, and v2 layouts — candle has code paths for all three, so real files
-  clearly produce them.
+- **Wire the GGUF loaders into the pipelines.** All three towers translate
+  and load from a real `stable-diffusion.cpp` checkpoint — VAE, UNet, and the
+  text encoder — each verified against the same golden references the
+  safetensors path uses. What is left is plumbing: a `--gguf` path through
+  `Txt2ImgPipeline` that reads one file instead of a directory, and a
+  tokenizer, since GGUF carries the vocabulary as metadata rather than as
+  `tokenizer.json`.
 - CUDA through the seam. Metal is verified end to end at 512; CUDA is untested.
 - **SD 1.5 in f16 too**, if it is ever worth it. SDXL needed it to fit; SD 1.5
   does not, and switching would mean re-verifying every golden test against f16

@@ -282,28 +282,60 @@ pub fn vae_var_builder_from_gguf<'a>(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'a>> {
+    // Every SD VAE has four resolution levels.
+    ldm_tower(path, dtype, device, "VAE", "first_stage_model.", |k| {
+        crate::ldm::vae_key(k, 4)
+    })
+}
+
+/// Load just the UNet from an LDM-layout GGUF, translated to `diffusers`
+/// names. See [`vae_var_builder_from_gguf`].
+pub fn unet_var_builder_from_gguf<'a>(
+    path: impl AsRef<Path>,
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'a>> {
+    // SD 1.5 carries two resnets per down block.
+    ldm_tower(path, dtype, device, "UNet", "model.diffusion_model.", |k| {
+        crate::ldm::unet_key(k, 2)
+    })
+}
+
+/// Shared body: dequantise one tower of an LDM checkpoint, renaming as it
+/// goes and skipping everything the mapping declines.
+fn ldm_tower<'a>(
+    path: impl AsRef<Path>,
+    dtype: DType,
+    device: &Device,
+    what: &str,
+    prefix: &str,
+    map: impl Fn(&str) -> Option<crate::ldm::Mapped>,
+) -> Result<VarBuilder<'a>> {
     let info = GgufInfo::open(&path)?;
     if info.layout() != Layout::Ldm {
         return Err(LoadError::Unsupported {
             path: info.path.clone(),
             reason: format!(
-                "expected an LDM-layout checkpoint (stable-diffusion.cpp writes these);                  tensor names look like {:?}",
+                "expected an LDM-layout checkpoint (stable-diffusion.cpp writes \
+                 these); tensor names look like {:?}",
                 info.layout()
             ),
         });
     }
 
-    // Only the VAE is expanded, so size the guard on that rather than on the
-    // whole file — a full SD checkpoint is mostly UNet, which is skipped.
-    let vae_params: u64 = info
+    // Size the guard on the tower actually being expanded, not the whole
+    // file — a full SD checkpoint holds all three and only one is loaded
+    // here. Sizing it on the wrong one under-reports by an order of
+    // magnitude: the UNet is 686 of the 1131 tensors, the VAE 248.
+    let params: u64 = info
         .tensors
         .iter()
-        .filter(|(k, _)| k.starts_with("first_stage_model."))
+        .filter(|(k, _)| k.starts_with(prefix))
         .map(|(_, (shape, _))| shape.iter().map(|&d| d as u64).product::<u64>())
         .sum();
     sd_tensor::sysmem::check_headroom(
-        vae_params.saturating_mul(dtype.size_in_bytes() as u64),
-        &format!("dequantising the VAE from {}", info.path.display()),
+        params.saturating_mul(dtype.size_in_bytes() as u64),
+        &format!("dequantising the {what} from {}", info.path.display()),
     )?;
 
     let mut file = std::fs::File::open(&info.path).map_err(|e| LoadError::Unsupported {
@@ -313,13 +345,9 @@ pub fn vae_var_builder_from_gguf<'a>(
     preflight(&mut file, &info.path)?;
     let content = Content::read(&mut file)?;
 
-    // Every SD VAE has four resolution levels; the decoder's block order is
-    // reversed against it.
-    const BLOCKS: usize = 4;
-
     let mut tensors: HashMap<String, Tensor> = HashMap::new();
     for name in content.tensor_infos.keys() {
-        let Some(mapped) = crate::ldm::vae_key(name, BLOCKS) else {
+        let Some(mapped) = map(name) else {
             continue;
         };
         let t = content
@@ -345,6 +373,6 @@ pub fn vae_var_builder_from_gguf<'a>(
         tensors.insert(mapped.name, t);
     }
 
-    tracing::debug!(tensors = tensors.len(), "loaded vae from gguf");
+    tracing::debug!(tensors = tensors.len(), what, "loaded tower from gguf");
     Ok(VarBuilder::from_tensors(tensors, dtype, device))
 }
