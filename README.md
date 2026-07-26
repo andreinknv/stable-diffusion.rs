@@ -175,6 +175,9 @@ transposed axis yields a plausible but wrong image with no stack trace.
 Per-module reference tensors turn "the output looks off" into "`up_block_2`
 diverged." See [xtask/golden/README.md](xtask/golden/README.md).
 
+Work in progress and what to pick up next is in
+[docs/handoff.md](docs/handoff.md).
+
 ## Contributing
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). There is no
