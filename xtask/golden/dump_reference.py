@@ -60,7 +60,7 @@ def dump_flux_vae(output: pathlib.Path, model_id: str) -> None:
     from diffusers import AutoencoderKL
     from safetensors.torch import save_file
 
-    out = output / "flux_vae"
+    out = output / ("sd35_vae" if "3.5" in model_id else "flux_vae")
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"loading {model_id} (subfolder=vae)")

@@ -72,6 +72,19 @@ impl VaeConfig {
         }
     }
 
+    /// SD 3 / SD 3.5. Identical to [`Self::flux`] in every structural
+    /// respect — 16 latent channels, no quant convolutions, the same
+    /// `[128, 256, 512, 512]` stack — and different only in the two latent
+    /// constants. Worth noting because it means one decoder now serves SD 1.5,
+    /// SDXL, Flux and SD 3 with nothing but a config between them.
+    pub fn sd35() -> Self {
+        Self {
+            scaling_factor: 1.5305,
+            shift_factor: 0.0609,
+            ..Self::flux()
+        }
+    }
+
     /// Flux. The same convolutional geometry as SD — `[128, 256, 512, 512]`,
     /// two layers per block, 32 groups — with a 16-channel latent instead of
     /// 4, and a shifted latent distribution.
