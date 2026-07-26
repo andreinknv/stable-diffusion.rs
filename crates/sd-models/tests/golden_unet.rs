@@ -60,6 +60,8 @@ fn config_sd15_has_four_blocks_and_768_cross_dim() {
     assert_eq!(cfg.transformer_layers_per_block, vec![1; 4]);
     // No micro-conditioning: that is SDXL's.
     assert!(cfg.addition.is_none());
+    // SD 1.5 projects the spatial transformer with 1x1 convolutions.
+    assert!(!cfg.use_linear_projection);
     // 1e-5 in the UNet, unlike the VAE's 1e-6.
     assert!((cfg.norm_eps - 1e-5).abs() < f64::EPSILON);
 }
@@ -90,6 +92,7 @@ fn tiny_config() -> UNetConfig {
         cross_attention_dim: 16,
         norm_num_groups: 8,
         norm_eps: 1e-5,
+        use_linear_projection: false,
         addition: None,
     }
 }

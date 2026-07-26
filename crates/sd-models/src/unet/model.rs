@@ -33,6 +33,10 @@ pub struct UNetConfig {
     pub cross_attention_dim: usize,
     pub norm_num_groups: usize,
     pub norm_eps: f64,
+    /// SDXL projects the spatial transformer in and out with `Linear`;
+    /// SD 1.5 uses 1x1 convolutions. The stored weights differ in rank, so
+    /// getting it wrong fails to load rather than running wrong.
+    pub use_linear_projection: bool,
     /// SDXL's micro-conditioning. `None` for SD 1.5, which has none.
     pub addition: Option<AdditionEmbedding>,
 }
@@ -60,6 +64,7 @@ impl UNetConfig {
             cross_attention_dim: 768,
             norm_num_groups: 32,
             norm_eps: 1e-5,
+            use_linear_projection: false,
             addition: None,
         }
     }
@@ -82,6 +87,7 @@ impl UNetConfig {
             cross_attention_dim: 2048,
             norm_num_groups: 32,
             norm_eps: 1e-5,
+            use_linear_projection: true,
             addition: Some(AdditionEmbedding {
                 time_embed_dim: 256,
                 // 6 ids * 256 = 1536, plus the 1280-wide pooled embedding.
@@ -99,6 +105,7 @@ impl UNetConfig {
             heads: *self.attention_head_dim.get(i)?,
             cross_dim: self.cross_attention_dim,
             depth: *self.transformer_layers_per_block.get(i)?,
+            linear_projection: self.use_linear_projection,
         })
     }
 
@@ -205,6 +212,7 @@ impl UNet2DConditionModel {
                         "transformer_layers_per_block must not be empty".to_string(),
                     )
                 })?,
+                linear_projection: cfg.use_linear_projection,
             },
             cfg.norm_num_groups,
             cfg.norm_eps,
@@ -327,7 +335,11 @@ impl UNet2DConditionModel {
                 let flat = time_ids.flatten_all()?;
                 let sinusoid = timestep_embedding(&flat, cfg.time_embed_dim)?;
                 let sinusoid = sinusoid.reshape((b, n * cfg.time_embed_dim))?;
-                let combined = Tensor::cat(&[&sinusoid, pooled], 1)?;
+                // Pooled text embedding **first**, then the time sinusoid.
+                // The halves are 1280 and 1536, so either order sums to 2816
+                // and loads and runs — the reversed one just conditions on
+                // nonsense.
+                let combined = Tensor::cat(&[pooled, &sinusoid], 1)?;
                 // Added to the timestep embedding, not concatenated with it.
                 (temb + embed.forward(&combined)?)?
             }

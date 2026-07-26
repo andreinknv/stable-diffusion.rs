@@ -164,23 +164,61 @@ impl BasicTransformerBlock {
     }
 }
 
+/// How the spatial wrapper projects in and out.
+///
+/// SD 1.5 uses 1x1 convolutions; SDXL sets `use_linear_projection` and uses
+/// `Linear`. The stored weights differ in rank — `[c, c, 1, 1]` against
+/// `[c, c]` — so loading the wrong one fails outright, which is the good case.
+/// The subtler part is that the *order* changes with it: the linear form
+/// reshapes to a sequence before projecting and projects before reshaping
+/// back, exactly reversing the convolutional form.
+#[derive(Debug)]
+enum Projection {
+    Conv { proj_in: Conv2d, proj_out: Conv2d },
+    Linear { proj_in: Linear, proj_out: Linear },
+}
+
 /// Spatial wrapper: `[b, c, h, w]` in and out, transformer in the middle.
 #[derive(Debug)]
 pub struct Transformer2DModel {
     norm: GroupNorm,
-    proj_in: Conv2d,
+    projection: Projection,
     blocks: Vec<BasicTransformerBlock>,
-    proj_out: Conv2d,
     inner: usize,
 }
 
 impl Transformer2DModel {
+    /// 1x1-convolution projections, as SD 1.5 uses.
     pub fn new(
         channels: usize,
         heads: usize,
         dim_head: usize,
         depth: usize,
         cross_dim: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        Self::build(channels, heads, dim_head, depth, cross_dim, false, vb)
+    }
+
+    /// Linear projections, as SDXL uses.
+    pub fn new_linear_projection(
+        channels: usize,
+        heads: usize,
+        dim_head: usize,
+        depth: usize,
+        cross_dim: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        Self::build(channels, heads, dim_head, depth, cross_dim, true, vb)
+    }
+
+    fn build(
+        channels: usize,
+        heads: usize,
+        dim_head: usize,
+        depth: usize,
+        cross_dim: usize,
+        linear_projection: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
         let inner = heads * dim_head;
@@ -196,6 +234,30 @@ impl Transformer2DModel {
             )?);
         }
 
+        let projection = if linear_projection {
+            Projection::Linear {
+                proj_in: linear(channels, inner, vb.pp("proj_in"))?,
+                proj_out: linear(inner, channels, vb.pp("proj_out"))?,
+            }
+        } else {
+            Projection::Conv {
+                proj_in: conv2d(
+                    channels,
+                    inner,
+                    1,
+                    Conv2dConfig::default(),
+                    vb.pp("proj_in"),
+                )?,
+                proj_out: conv2d(
+                    inner,
+                    channels,
+                    1,
+                    Conv2dConfig::default(),
+                    vb.pp("proj_out"),
+                )?,
+            }
+        };
+
         Ok(Self {
             // 1e-6 here, unlike the 1e-5 LayerNorms inside the blocks.
             norm: group_norm(
@@ -204,21 +266,8 @@ impl Transformer2DModel {
                 SPATIAL_NORM_EPS,
                 vb.pp("norm"),
             )?,
-            proj_in: conv2d(
-                channels,
-                inner,
-                1,
-                Conv2dConfig::default(),
-                vb.pp("proj_in"),
-            )?,
+            projection,
             blocks,
-            proj_out: conv2d(
-                inner,
-                channels,
-                1,
-                Conv2dConfig::default(),
-                vb.pp("proj_out"),
-            )?,
             inner,
         })
     }
@@ -229,26 +278,37 @@ impl Transformer2DModel {
         let residual = xs;
 
         let ys = self.norm.forward(xs)?;
-        let ys = self.proj_in.forward(&ys)?;
 
         // permute *then* reshape, with contiguous between. A bare reshape from
         // [b, c, h, w] to [b, h*w, c] interleaves channels with spatial
         // positions: right shape, wrong numbers.
-        let ys = ys
-            .permute((0, 2, 3, 1))?
-            .contiguous()?
-            .reshape((b, h * w, self.inner))?;
+        let to_sequence = |t: &Tensor| -> Result<Tensor> {
+            t.permute((0, 2, 3, 1))?
+                .contiguous()?
+                .reshape((b, h * w, self.inner))
+        };
+        let to_spatial = |t: &Tensor| -> Result<Tensor> {
+            t.reshape((b, h, w, self.inner))?
+                .permute((0, 3, 1, 2))?
+                .contiguous()
+        };
 
-        let mut ys = ys;
+        // The convolutional form projects in NCHW and then flattens; the
+        // linear form flattens first. Doing it the other way round is a shape
+        // error in one direction and silently wrong in the other.
+        let mut ys = match &self.projection {
+            Projection::Conv { proj_in, .. } => to_sequence(&proj_in.forward(&ys)?)?,
+            Projection::Linear { proj_in, .. } => proj_in.forward(&to_sequence(&ys)?)?,
+        };
+
         for block in &self.blocks {
             ys = block.forward(&ys, context)?;
         }
 
-        let ys = ys
-            .reshape((b, h, w, self.inner))?
-            .permute((0, 3, 1, 2))?
-            .contiguous()?;
-        let ys = self.proj_out.forward(&ys)?;
+        let ys = match &self.projection {
+            Projection::Conv { proj_out, .. } => proj_out.forward(&to_spatial(&ys)?)?,
+            Projection::Linear { proj_out, .. } => to_spatial(&proj_out.forward(&ys)?)?,
+        };
         ys + residual
     }
 }
