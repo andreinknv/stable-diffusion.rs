@@ -302,6 +302,77 @@ def dump_flux_transformer(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out}/reference.safetensors, output {tuple(result.shape)}")
 
 
+
+def dump_flux_sampling(output: pathlib.Path, model_id: str) -> None:
+    """Twenty steps of diffusers' Flux loop, from fixed inputs.
+
+    The per-component tests verify one forward pass. This verifies the *loop*
+    — twenty steps of schedule, step rule and re-entry, where a small error
+    compounds instead of showing up once.
+
+    Conditioning and the initial noise are supplied rather than generated, so
+    the only thing under comparison is the loop. Export them from Rust with
+    `cargo run --release -p sd-cli --example flux_export_inputs`, which writes
+    the same file this reads.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import FluxTransformer2DModel, FlowMatchEulerDiscreteScheduler
+    from safetensors.torch import load_file, save_file
+
+    out = output / "flux_sampling"
+    src = out / "reference.safetensors"
+    if not src.exists():
+        raise SystemExit(
+            f"{src} not found. Export the inputs from Rust first:\n"
+            "  cargo run --release -p sd-cli --example flux_export_inputs -- "
+            f"{src}"
+        )
+    d = load_file(str(src))
+    txt, pooled = d["txt"].float(), d["pooled"].float()
+    xs = d["init_packed"].float().clone()
+
+    model = FluxTransformer2DModel.from_single_file(
+        str(output / "flux" / "flux-mini.safetensors"),
+        config=model_id,
+        torch_dtype=torch.float32,
+    ).eval()
+
+    steps, seq = 20, xs.shape[1]
+    sched = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        "Freepik/flux.1-lite-8B", subfolder="scheduler"
+    )
+    mu = calculate_shift_compat(sched.config, seq)
+    sched.set_timesteps(num_inference_steps=steps, mu=mu)
+
+    ph = pw = int(seq ** 0.5)
+    img_ids = torch.zeros(seq, 3)
+    img_ids[:, 1] = torch.arange(ph).repeat_interleave(pw).float()
+    img_ids[:, 2] = torch.arange(pw).repeat(ph).float()
+    txt_ids = torch.zeros(txt.shape[1], 3)
+    guidance = torch.tensor([3.5])
+
+    with torch.no_grad():
+        for t in sched.timesteps:
+            v = model(
+                hidden_states=xs, encoder_hidden_states=txt,
+                pooled_projections=pooled, timestep=t.expand(1) / 1000,
+                img_ids=img_ids, txt_ids=txt_ids, guidance=guidance,
+                return_dict=False,
+            )[0]
+            xs = sched.step(v, t, xs, return_dict=False)[0]
+
+    b, n, cc = xs.shape
+    lat = (
+        xs.view(b, ph, pw, cc // 4, 2, 2)
+        .permute(0, 3, 1, 4, 2, 5)
+        .reshape(b, cc // 4, ph * 2, pw * 2)
+    )
+    d["reference_latent"] = lat.detach().contiguous().clone()
+    save_file({k: v.contiguous() for k, v in d.items()}, str(src))
+    print(f"wrote {src}")
+
+
 def dump_vae(output: pathlib.Path, model_id: str) -> None:
     torch = _require("torch")
     _require("diffusers")
@@ -1066,6 +1137,10 @@ def main() -> None:
     fluxt.add_argument("--model-id", default="TencentARC/flux-mini")
     fluxt.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    fs = sub.add_parser("flux_sampling", help="dump a 20-step Flux loop reference")
+    fs.add_argument("--model-id", default="TencentARC/flux-mini")
+    fs.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     clip = sub.add_parser("clip_tokenizer", help="dump CLIP tokenizer references")
     clip.add_argument(
         "--model-id",
@@ -1149,6 +1224,8 @@ def main() -> None:
         dump_t5(args.output, args.model_id)
     elif args.component == "flux_transformer":
         dump_flux_transformer(args.output, args.model_id)
+    elif args.component == "flux_sampling":
+        dump_flux_sampling(args.output, args.model_id)
     elif args.component == "vae":
         dump_vae(args.output, args.model_id)
     elif args.component == "clip_tokenizer":

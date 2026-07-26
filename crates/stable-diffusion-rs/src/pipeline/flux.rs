@@ -180,6 +180,16 @@ impl FluxPipeline {
     pub fn run_with_progress(
         &self,
         cfg: &FluxConfigRun,
+        progress: impl FnMut(usize, usize),
+    ) -> Result<Tensor, PipelineError> {
+        let latents = self.denoise(cfg, progress)?;
+        Ok(self.vae.decode_tiled(&latents)?)
+    }
+
+    /// The sampling loop, returning the unpacked latent before decoding.
+    fn denoise(
+        &self,
+        cfg: &FluxConfigRun,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<Tensor, PipelineError> {
         if cfg.steps == 0 {
@@ -245,8 +255,39 @@ impl FluxPipeline {
             progress(i + 1, cfg.steps);
         }
 
-        let latents = unpack_latents(&xs.to_dtype(VAE_DTYPE)?, lat_h, lat_w)?;
-        Ok(self.vae.decode_tiled(&latents)?)
+        Ok(unpack_latents(&xs.to_dtype(VAE_DTYPE)?, lat_h, lat_w)?)
+    }
+
+    /// Everything the sampling loop consumes, for a controlled comparison
+    /// against another implementation.
+    ///
+    /// Handing a reference pipeline our conditioning *and* our initial noise
+    /// removes every difference except the loop itself — otherwise a
+    /// mismatch could be the tokenizer, the encoder, or the RNG.
+    pub fn sampling_inputs(
+        &self,
+        cfg: &FluxConfigRun,
+    ) -> Result<(Tensor, Tensor, Tensor), PipelineError> {
+        let (txt, pooled) = self.conditioning(&cfg.prompt)?;
+        let (lat_h, lat_w) = (cfg.height / 8, cfg.width / 8);
+        let mut rng = sd_tensor::rng::SeededRng::new(cfg.seed);
+        let noise = rng.normals(16 * lat_h * lat_w);
+        let latents =
+            Tensor::from_vec(noise, (1, 16, lat_h, lat_w), &self.device)?.to_dtype(MODEL_DTYPE)?;
+        Ok((txt, pooled, pack_latents(&latents)?))
+    }
+
+    /// Like [`Self::run`], but also returns the unpacked latent it decoded.
+    ///
+    /// For locating an artifact: if it is present in the latent then the VAE
+    /// is not the cause, and vice versa. Cheaper than bisecting the stack.
+    pub fn run_capturing_latent(
+        &self,
+        cfg: &FluxConfigRun,
+    ) -> Result<(Tensor, Tensor), PipelineError> {
+        let latents = self.denoise(cfg, |_, _| {})?;
+        let image = self.vae.decode_tiled(&latents)?;
+        Ok((latents, image))
     }
 }
 

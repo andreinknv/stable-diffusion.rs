@@ -157,6 +157,7 @@ architecture is independent and verifiable against its own golden data.
 | flow Euler step | `diffusers` | 1.2e-7 |
 | T5 v1.1 encoder | `transformers` | output 1.9e-5 |
 | Flux MMDiT | `diffusers` | relative drift 2.1e-6 |
+| 20-step sampling loop | `diffusers` | `max_abs` 6.5e-5 |
 
 Three things worth carrying to SD 3, which shares most of this:
 
@@ -166,11 +167,28 @@ quantised and expanded per matmul, which keeps activations in f32 and costs
 2.7 GB instead of 18.8. bf16 would suit both, but candle's CPU backend has no
 bf16 matmul — that is the single change that would most simplify this.
 
-**A striping artifact remains in the bottom ~15% of the image.** Not
-attributed. Everything upstream is independently verified, so it is none of
-those; flux-mini is a heavily distilled student and edge artifacts are a known
-failure mode, but that is a hypothesis. Worth resolving before trusting the
-pipeline on a full-size checkpoint.
+~~**A striping artifact remains in the bottom ~15% of the image.**~~
+**Resolved: it is the checkpoint's, not ours.** flux-mini's output carries an
+elevated horizontal gradient in its last two latent rows — 1.31x a typical
+row — which the VAE renders as a band of vertical striping.
+
+Attributed by elimination, each step measured rather than argued:
+
+| question | test | answer |
+|---|---|---|
+| Is it the VAE? | decode *our* latent with `diffusers`' VAE | no — 2.8e-5 agreement, and diffusers renders the identical band |
+| Is it the sampling loop? | run `diffusers`' loop on *our* inputs and noise | no — final latents agree to 6.5e-5 |
+| Is it the model? | compare last-row gradient | yes — diffusers' own latent shows the same 1.31x |
+
+Handing the reference implementation our conditioning *and* our initial noise
+is what made this quick: it removes the tokenizer, both text encoders and the
+RNG from the comparison, so a mismatch could only have been the loop.
+
+Both checks are now permanent, in `golden_flux_sampling.rs`. One verifies the
+twenty-step loop, which no per-component test covers — a compounding error
+shows up there and nowhere else. The other pins the artifact itself, so it is
+not re-investigated, and so a genuine regression in the last rows is still
+caught.
 
 **Full Flux is still out of reach on 36 GB.** dev and schnell are 12B, which
 is 48 GB at f32. Reaching them means quantised residency for the *transformer*
