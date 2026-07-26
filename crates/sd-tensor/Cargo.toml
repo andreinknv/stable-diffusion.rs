@@ -10,6 +10,9 @@ authors.workspace = true
 
 [dependencies]
 candle-core.workspace = true
+# Pure bindings, no C compiled — asks the OS how much memory is free. See
+# src/sysmem.rs for why a fixed budget is not enough.
+libc = "0.2"
 candle-nn.workspace = true
 thiserror.workspace = true
 

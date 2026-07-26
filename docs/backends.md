@@ -323,6 +323,42 @@ Three things had to stay f32, and each for a stated reason:
 SD 1.5 still runs entirely in f32: it fits comfortably, and changing it would
 mean re-verifying every golden test against f16 tolerances for no gain.
 
+## Two guards, and why they are separate
+
+**A shape guard**, `ops::check_alloc_budget`, deterministic: a shape goes in,
+a byte count comes out, and the same input always gives the same answer. It
+catches the `n^4` attention blowup and the 9.66 GB conv im2col. Being
+deterministic is what makes it testable, and it is why the golden tests can
+assert on it.
+
+It is also blind. It compares one allocation against a fixed ceiling and has
+no idea whether the machine has 8 GB or 128 GB, or that something else is
+holding 13 GB right now. A run can pass it and still spend fifteen minutes
+paging — which is exactly what happened to an img2img run at 1024.
+
+**A memory guard**, `sysmem::check_headroom`, runtime: it asks the OS what is
+free and refuses a job that would take more than 80% of it. Applied once where
+a pipeline loads, not per operation, so the deterministic tests stay
+deterministic.
+
+The projection includes the **weights**, via `sd_loader::resident_bytes`,
+which reads safetensors headers and computes what they will occupy at the
+target dtype. That is the term that matters: weights stay resident for the
+whole run and dominate everything else. A fp16 checkpoint loaded as f32
+occupies twice its file size, and that doubling is what made SDXL fail to fit.
+
+The 80% is calibrated, not picked. SDXL in f16 needs about 8.9 GB and renders
+fine when that much is spare; the same model in f32 needs 16.3 GB and used to
+page for fifteen minutes before failing. Override with `SD_MEMORY_HEADROOM`.
+
+Worth seeing the consequence plainly: **the same command can be admitted or
+refused depending on what else is running.** SDXL rendered in 89 s with
+15.2 GB free, and was refused later the same day with 9.7 GB free. That is the
+guard working, not flapping — the second run would have thrashed.
+
+Where the platform cannot be asked, the check allows. A guard that refuses on
+missing information is worse than one that admits it does not know.
+
 ## When to revisit
 
 Switch to burn if **all three** hold:

@@ -190,6 +190,23 @@ impl Txt2ImgPipeline {
         let unet_path = require(model_dir.join("unet/diffusion_pytorch_model.safetensors"))?;
         let vae_path = require(model_dir.join("vae/diffusion_pytorch_model.safetensors"))?;
 
+        // See the same check in sdxl.rs: weights stay resident for the whole
+        // run and dominate, so the projection has to include them.
+        let weights =
+            sd_loader::resident_bytes(&[&text_encoder_path, &unet_path, &vae_path], DType::F32)?;
+        let decode_peak = sd_models::vae::DecoderConfig::from(&VaeConfig::sd15())
+            .peak_alloc_bytes(
+                1,
+                sd_models::vae::TILE_LATENT_EDGE,
+                sd_models::vae::TILE_LATENT_EDGE,
+                DType::F32,
+            )
+            .unwrap_or(0);
+        sd_tensor::sysmem::check_headroom(
+            weights.saturating_add(decode_peak),
+            &format!("loading the pipeline from {}", model_dir.display()),
+        )?;
+
         let tokenizer = ClipTokenizer::from_file(&tokenizer_path)?;
 
         let vb = sd_loader::safetensors_var_builder(&[&text_encoder_path], DType::F32, device)?;

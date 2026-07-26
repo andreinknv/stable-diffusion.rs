@@ -487,6 +487,8 @@ pub mod ops {
     }
 }
 
+pub mod sysmem;
+
 /// Device selection.
 pub mod device {
     use super::{Device, Result};

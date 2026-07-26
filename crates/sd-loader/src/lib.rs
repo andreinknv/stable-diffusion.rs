@@ -97,6 +97,28 @@ fn uses_legacy_attention_names(paths: &[PathBuf]) -> Result<bool> {
     Ok(false)
 }
 
+/// Bytes these checkpoints will occupy once loaded at `dtype`.
+///
+/// Reads only the safetensors headers, so this is cheap even for a
+/// multi-gigabyte UNet and can be asked *before* committing to the load.
+///
+/// Not the file size: a fp16 checkpoint loaded as f32 occupies twice what it
+/// takes on disk, and that doubling is precisely what made SDXL fail to fit.
+pub fn resident_bytes<P: AsRef<Path>>(paths: &[P], dtype: DType) -> Result<u64> {
+    let mut total: u64 = 0;
+    for path in paths {
+        let path = path.as_ref();
+        // SAFETY: mapped read-only for the duration of this call and dropped
+        // before returning; the caller's contract is the same as elsewhere.
+        let mapped = unsafe { sd_tensor::safetensors::MmapedSafetensors::new(path)? };
+        for (_, view) in mapped.tensors() {
+            let elems: u64 = view.shape().iter().map(|&d| d as u64).product();
+            total = total.saturating_add(elems.saturating_mul(dtype.size_in_bytes() as u64));
+        }
+    }
+    Ok(total)
+}
+
 /// Open one or more `.safetensors` files as a [`VarBuilder`].
 ///
 /// Checkpoints using the legacy diffusers attention names are adapted

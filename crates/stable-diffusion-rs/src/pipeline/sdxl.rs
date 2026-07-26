@@ -85,6 +85,27 @@ impl SdxlPipeline {
         let unet_path = require(model_dir.join("unet/diffusion_pytorch_model.safetensors"))?;
         let vae_path = require(model_dir.join("vae/diffusion_pytorch_model.safetensors"))?;
 
+        // Cost the whole thing before committing to it. The weights dominate
+        // — 6.9 GB of files here — and they stay resident for the entire run,
+        // so checking a single activation against a fixed ceiling would never
+        // have caught the case that mattered.
+        let weights = sd_loader::resident_bytes(&[&te_path, &te2_path, &unet_path], MODEL_DTYPE)?
+            .saturating_add(sd_loader::resident_bytes(&[&vae_path], VAE_DTYPE)?);
+        // Plus the largest single allocation a decode will make. Tiling keeps
+        // this to one tile.
+        let decode_peak = sd_models::vae::DecoderConfig::from(&VaeConfig::sdxl())
+            .peak_alloc_bytes(
+                1,
+                sd_models::vae::TILE_LATENT_EDGE,
+                sd_models::vae::TILE_LATENT_EDGE,
+                VAE_DTYPE,
+            )
+            .unwrap_or(0);
+        sd_tensor::sysmem::check_headroom(
+            weights.saturating_add(decode_peak),
+            &format!("loading SDXL from {}", model_dir.display()),
+        )?;
+
         let tokenizer = ClipTokenizer::from_file(&tok_path)?;
         let tokenizer_2 = ClipTokenizer::from_file(&tok2_path)?.with_pad_token(TOKENIZER_2_PAD)?;
 
