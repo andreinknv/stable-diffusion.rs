@@ -399,6 +399,95 @@ def dump_unet_attention(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out / 'attention.safetensors'}")
 
 
+def dump_unet_full(output: pathlib.Path, model_id: str) -> None:
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import UNet2DConditionModel
+    from safetensors.torch import save_file
+
+    out = output / "unet_full"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id} (subfolder=unet)")
+    unet = UNet2DConditionModel.from_pretrained(
+        model_id, subfolder="unet", torch_dtype=torch.float32
+    )
+    unet.eval()
+
+    gen = torch.Generator().manual_seed(SEED)
+    sample = torch.randn(1, 4, 32, 32, generator=gen)
+    timestep = torch.tensor([500.0])
+    context = torch.randn(1, 77, 768, generator=gen)
+
+    # diffusers returns the skip stack from its own down pass, but only
+    # internally, so reproduce the push order with hooks instead: conv_in
+    # first, then each resnet(+attn) pair, then each downsampler.
+    skips: list["torch.Tensor"] = []
+    mid_out: dict[str, "torch.Tensor"] = {}
+
+    def push(_module, _inputs, output):
+        t = output[0] if isinstance(output, tuple) else output
+        skips.append(t.detach().contiguous().float().clone())
+
+    handles = [unet.conv_in.register_forward_hook(push)]
+    for block in unet.down_blocks:
+        for j, _ in enumerate(block.resnets):
+            # Push after the attention when there is one, else after the
+            # resnet — that is the pair the down pass records.
+            target = (
+                block.attentions[j]
+                if getattr(block, "attentions", None) is not None
+                and j < len(block.attentions)
+                else block.resnets[j]
+            )
+            handles.append(target.register_forward_hook(push))
+        if getattr(block, "downsamplers", None):
+            handles.append(block.downsamplers[0].register_forward_hook(push))
+
+    def capture_mid(_module, _inputs, output):
+        t = output[0] if isinstance(output, tuple) else output
+        mid_out["mid_output"] = t.detach().contiguous().float().clone()
+
+    handles.append(unet.mid_block.register_forward_hook(capture_mid))
+
+    with torch.no_grad():
+        result = unet(sample, timestep, encoder_hidden_states=context).sample
+
+    for h in handles:
+        h.remove()
+
+    if len(skips) != 12:
+        sys.exit(f"error: expected 12 skip tensors, captured {len(skips)}")
+
+    tensors = {
+        "sample": sample.contiguous(),
+        "timestep": timestep.contiguous(),
+        "context": context.contiguous(),
+        "output": result.detach().contiguous().clone(),
+        **mid_out,
+        **{f"down_{i:02d}": t for i, t in enumerate(skips)},
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    # Symlink the checkpoint's own weights rather than re-saving 3.4 GB. The
+    # test then has one fixed path to open and no knowledge of the HF cache.
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    weights = hf_hub_download(
+        repo_id=model_id, filename="unet/diffusion_pytorch_model.safetensors"
+    )
+    link = out / "unet.safetensors"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(weights)
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<14} {tuple(v.shape)}")
+    print(f"linked {link} -> {weights}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="component", required=True)
@@ -443,8 +532,18 @@ def main() -> None:
     )
     unet_attn.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    unet_full = sub.add_parser("unet_full", help="dump whole-UNet references")
+    unet_full.add_argument(
+        "--model-id",
+        default="stable-diffusion-v1-5/stable-diffusion-v1-5",
+        help="HuggingFace model id",
+    )
+    unet_full.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     args = ap.parse_args()
-    if args.component == "unet_attention":
+    if args.component == "unet_full":
+        dump_unet_full(args.output, args.model_id)
+    elif args.component == "unet_attention":
         dump_unet_attention(args.output, args.model_id)
     elif args.component == "unet_blocks":
         dump_unet_blocks(args.output, args.model_id)
