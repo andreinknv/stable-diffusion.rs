@@ -68,6 +68,27 @@ jobs:
       # against generated references. See xtask/golden/README.md.
       - run: cargo test --workspace
 
+  metal:
+    name: metal (build + device tests)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Nothing else in this file compiles the Metal backend, so a
+      # Metal-only break — a cfg-gated branch that stops building, a
+      # signature that changed under a feature flag — shipped undetected.
+      # That is not hypothetical: every GPU defect found so far lived in
+      # code no CI job touched.
+      - name: build with metal
+        run: cargo clippy --workspace --all-targets --features metal -- -D warnings
+      # The device tests skip themselves when no Metal device is present, so
+      # this is a compile gate first and a device gate only where the runner
+      # provides one. Golden data is absent here, so the numerical tests skip
+      # exactly as they do on the other jobs.
+      - name: test with metal
+        run: cargo test --workspace --features metal
+
   deny:
     name: cargo-deny (licenses, advisories)
     runs-on: ubuntu-latest
