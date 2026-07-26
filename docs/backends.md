@@ -211,6 +211,28 @@ matmul that adds **no native compilation** (it links a system framework). Worth
 enabling for CPU builds regardless of the GPU story — see
 [native-deps.md](native-deps.md).
 
+## Does the whole pipeline work on Metal?
+
+Yes. `sdrs txt2img --features metal` runs end to end and produces the same
+picture as CPU. Verified 2026-07-26 at 256x256, 20 steps, DPM++ 2M, seed 42.
+
+The two images are **not** byte-identical, and that is expected rather than a
+defect: `SeededRng` makes the *noise* device-independent, but f32 reduction
+order is not, and twenty sequential UNet evaluations compound the difference.
+
+| | CPU vs Metal, same seed |
+|---|---|
+| mean abs difference | 0.9 / 255 |
+| max abs difference | 35 / 255 |
+| pixels exactly equal | 27% |
+
+Indistinguishable by eye; not interchangeable as files. Reproducing a PNG
+byte-for-byte requires the same device and build.
+
+Metal took 14.3 s against CPU's 27.5 s for that run. **That is one run on a
+machine with other work on it, not a benchmark** — see the spread warning
+above before quoting it.
+
 ## When to revisit
 
 Switch to burn if **all three** hold:

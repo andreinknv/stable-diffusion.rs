@@ -517,8 +517,24 @@ pub mod device {
 /// acceptable for a tool whose output people share and reproduce.
 ///
 /// So we generate noise ourselves and upload it. Same seed produces bit-
-/// identical latents on every device and every candle version. It costs one
+/// identical *noise* on every device and every candle version. It costs one
 /// host-to-device copy per image, which is nothing next to a denoise loop.
+///
+/// # What this does and does not guarantee
+///
+/// The noise is bit-identical across devices. The **image is not**, because
+/// the arithmetic between them is not: f32 reduction order differs per
+/// backend, and twenty sequential UNet evaluations compound the difference.
+///
+/// Measured on 2026-07-26, same seed and prompt at 256x256, CPU against
+/// Metal: mean absolute difference 0.9/255, max 35/255, and only 27% of
+/// pixels exactly equal. The two images are indistinguishable by eye and not
+/// interchangeable byte-for-byte.
+///
+/// So: same seed on the same device and build reproduces exactly — that is
+/// what `--seed` is for. Across devices it reproduces the *picture*, not the
+/// file. Do not build a cache key or a regression test on cross-device
+/// byte equality.
 ///
 /// This deliberately does *not* try to match PyTorch's `randn`. Matching torch
 /// bit-for-bit is a separate problem and not worth solving to make our own

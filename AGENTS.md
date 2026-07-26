@@ -193,7 +193,13 @@ SeededRng::new(seed: u64) -> SeededRng
 
 **Use this, never `Device::set_seed`.** candle's `set_seed` returns an error on
 CPU ("cannot seed the CPU rng"), and its GPU generator would not match CPU
-output anyway. `SeededRng` gives bit-identical results across devices.
+output anyway. `SeededRng` gives bit-identical *noise* across devices.
+
+The noise, not the image. f32 reduction order differs per backend, and twenty
+UNet steps compound it: the same seed on CPU and Metal gives images that are
+indistinguishable by eye but differ by a mean of 0.9/255, with only 27% of
+pixels exactly equal. Reproducing a file byte-for-byte needs the same device
+and build; reproducing the picture does not.
 
 Do not add `rand` to any `Cargo.toml`. It is not reachable and you do not need
 it.
