@@ -233,6 +233,42 @@ Metal took 14.3 s against CPU's 27.5 s for that run. **That is one run on a
 machine with other work on it, not a benchmark** — see the spread warning
 above before quoting it.
 
+## Known Metal defect: the VAE decode at 1024
+
+**candle 0.11's Metal backend miscomputes a VAE decode at a 128x128 latent**
+(1024px output). Smaller latents are fine. Measured, same weights and same
+input latent, CPU against Metal:
+
+| latent | output | max abs difference |
+|---:|---:|---:|
+| 32x32 | 256px | 0.0001 |
+| 64x64 | 512px | 0.0001 |
+| **128x128** | **1024px** | **7.99** |
+
+On a [-1, 1] image that is total corruption — the decode comes out as
+horizontal noise bands. `metal_decoder_parity.rs` pins the boundary and will
+fail informatively if a candle upgrade fixes it.
+
+What it is not, each checked directly:
+
+- **not any single op.** `conv2d`, `silu`, `softmax_last_dim` and `matmul`
+  were each compared CPU against Metal at these shapes and at tensor sizes up
+  to 2.15 GB. All agree to 3e-6.
+- **not chunked attention.** The divergence is identical with chunking
+  disabled and with chunks 64x smaller.
+- **not SDXL.** SD 1.5 shares this decoder architecture; it is size-triggered.
+  SD 1.5 at 512 stays inside the good range, which is why this went unnoticed
+  until SDXL made 1024 the default.
+
+**Consequence: SDXL at its native 1024 is correct on CPU and wrong on Metal.**
+Use `--cpu` for 1024 until this is fixed. SD 1.5 at 512 is unaffected on
+either backend.
+
+The obvious mitigation is to run the VAE decode on CPU when the latent is
+large, leaving the UNet on GPU — the decode is a single pass and a small part
+of the total. That is a deliberate perf/correctness trade, so it is written
+down here rather than applied silently.
+
 ## When to revisit
 
 Switch to burn if **all three** hold:

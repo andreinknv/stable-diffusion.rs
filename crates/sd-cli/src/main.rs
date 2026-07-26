@@ -89,6 +89,10 @@ enum Command {
 
         #[arg(short, long, default_value = "out.png")]
         output: String,
+
+        /// Treat the model directory as SDXL (two text encoders).
+        #[arg(long)]
+        sdxl: bool,
     },
 
     /// Generate an image from a text prompt and an existing image.
@@ -215,6 +219,7 @@ fn main() -> Result<()> {
             seed,
             sampler,
             output,
+            sdxl,
         } => {
             let cfg = Txt2ImgConfig {
                 prompt,
@@ -227,24 +232,26 @@ fn main() -> Result<()> {
                 sampler: parse_sampler(&sampler)?,
             };
 
-            tracing::info!(model = %model, "loading pipeline");
-            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                .with_context(|| format!("loading pipeline from {model}"))?;
-
-            tracing::info!(
-                prompt = %cfg.prompt,
-                steps = cfg.steps,
-                seed = cfg.seed,
-                "generating"
-            );
+            tracing::info!(model = %model, sdxl, "loading pipeline");
             let started = std::time::Instant::now();
+            let mut report = |step, total, sigma: f64| {
+                tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
+            };
             // A 20-step CPU run takes minutes; without per-step output it
             // looks hung.
-            let img = pipeline
-                .run_with_progress(&cfg, &mut |step, total, sigma| {
-                    tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
-                })
-                .context("running txt2img")?;
+            let img = if sdxl {
+                let pipeline = sd::pipeline::SdxlPipeline::load(Path::new(&model), &dev)
+                    .with_context(|| format!("loading SDXL pipeline from {model}"))?;
+                pipeline
+                    .run_with_progress(&cfg, &mut report)
+                    .context("running SDXL txt2img")?
+            } else {
+                let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
+                    .with_context(|| format!("loading pipeline from {model}"))?;
+                pipeline
+                    .run_with_progress(&cfg, &mut report)
+                    .context("running txt2img")?
+            };
 
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             println!("wrote {output} in {:.1?}", started.elapsed());

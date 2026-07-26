@@ -228,3 +228,38 @@ fn img2img_round_trips_an_image_through_the_encoder() {
     assert!(max <= 1.5, "values outside [-1.5, 1.5]: max abs {max}");
     eprintln!("img2img ok: {:?}, max abs {max:.4}", img.dims());
 }
+
+// -- SDXL ------------------------------------------------------------------
+
+#[test]
+fn sdxl_end_to_end_produces_finite_image_in_range() {
+    let Ok(dir) = std::env::var("SD_TEST_SDXL_DIR") else {
+        eprintln!(
+            "SKIP sdxl_end_to_end_produces_finite_image_in_range: set SD_TEST_SDXL_DIR \
+             to a diffusers-layout SDXL directory to run it."
+        );
+        return;
+    };
+
+    use stable_diffusion_rs::pipeline::SdxlPipeline;
+    let dev = Device::Cpu;
+    let pipeline = SdxlPipeline::load(std::path::Path::new(&dir), &dev).expect("loading SDXL");
+
+    // 512 rather than SDXL's native 1024: this checks the plumbing, and the
+    // CPU cost scales with the square. The picture will be poor at this size,
+    // which is a property of the model, not of the pipeline.
+    let cfg = Txt2ImgConfig {
+        prompt: "a rusty crab on a beach".to_string(),
+        width: 512,
+        height: 512,
+        steps: 4,
+        seed: 42,
+        ..Default::default()
+    };
+    let img = pipeline.run(&cfg).expect("running SDXL");
+
+    assert_eq!(img.dims(), &[1, 3, 512, 512]);
+    let values = img.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert!(values.iter().all(|v| v.is_finite()), "SDXL produced NaN");
+    eprintln!("sdxl ok: {:?}", img.dims());
+}

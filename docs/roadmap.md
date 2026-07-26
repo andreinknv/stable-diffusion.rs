@@ -65,7 +65,9 @@ leave the order-1 range; `testing::assert_close` is absolute-only.
 |---|---|---|
 | ✅ | VAE encoder | verified vs `diffusers`, max_abs 8.2e-5 |
 | ✅ | img2img | works; strength verified visually at 0.35 and 0.75 |
-| ⬜ | SDXL | same geometry, second text encoder, different latent scaling |
+| ✅ | SDXL — text encoder 2 | verified vs `transformers` |
+| ✅ | SDXL — UNet | verified vs `diffusers`, max_abs 1.4e-5 |
+| 🔴 | SDXL — end to end | correct on CPU; Metal corrupts the 1024 decode |
 | ⬜ | GGUF loading, then k-quants | |
 | ⬜ | Metal and CUDA paths through the seam | Metal verified end to end |
 
@@ -79,7 +81,10 @@ Remaining milestone 2 work:
 - SDXL (same geometry, second text encoder, different latent scaling)
 - GGUF loading, then k-quant dequantization (`Q4_K`, `Q5_K`, `Q8_0` first —
   they cover most community models)
-- CUDA through the seam. Metal is verified end to end; CUDA is untested.
+- CUDA through the seam. Metal is verified end to end at 512; CUDA is untested.
+- **The Metal 1024 decode defect** (see backends.md). Either find it in candle
+  and fix upstream, or run the decode on CPU above the known-good latent size.
+  It is the only thing between SDXL and working on GPU.
 
 ## Milestone 3 — breadth
 
