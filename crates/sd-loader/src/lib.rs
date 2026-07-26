@@ -13,7 +13,7 @@
 
 pub mod gguf;
 
-pub use gguf::{gguf_var_builder, GgufInfo};
+pub use gguf::{gguf_var_builder, GgufInfo, Layout};
 
 use std::path::{Path, PathBuf};
 

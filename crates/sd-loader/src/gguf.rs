@@ -214,3 +214,55 @@ pub fn gguf_var_builder<'a>(
     );
     Ok(VarBuilder::from_tensors(tensors, dtype, device))
 }
+
+/// Which parameter-naming convention a checkpoint uses.
+///
+/// GGUF files carry no reliable declaration of this — a real
+/// `stable-diffusion.cpp` SD 1.5 checkpoint has **no metadata at all**, not
+/// even `general.architecture` — so it has to be inferred from tensor names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// The original CompVis/LDM names, as `stable-diffusion.cpp` writes them:
+    /// `model.diffusion_model.*`, `first_stage_model.*`,
+    /// `cond_stage_model.transformer.*`.
+    Ldm,
+    /// The `diffusers` names these models expect.
+    Diffusers,
+    /// Neither — a language model, or something we do not recognise.
+    Unknown,
+}
+
+impl GgufInfo {
+    /// Infer the naming convention from tensor names.
+    ///
+    /// By prefix rather than by metadata, because the metadata is not there.
+    pub fn layout(&self) -> Layout {
+        let has = |p: &str| self.tensors.keys().any(|k| k.starts_with(p));
+        if has("model.diffusion_model.") || has("first_stage_model.") {
+            Layout::Ldm
+        } else if has("down_blocks.") || has("conv_in.") && has("mid_block.") {
+            Layout::Diffusers
+        } else {
+            Layout::Unknown
+        }
+    }
+
+    /// Rename an LDM key to its `diffusers` equivalent, where that is a
+    /// straight rewrite.
+    ///
+    /// Only the text encoder is a straight rewrite: LDM prefixes CLIP with
+    /// `cond_stage_model.transformer.` and leaves the rest identical to what
+    /// `transformers` writes, so stripping the prefix is the whole mapping.
+    ///
+    /// The VAE and UNet are **not** rewrites. LDM stores the VAE as
+    /// `decoder.up.0.block.0.conv1` against `decoder.up_blocks.N.resnets.0
+    /// .conv1`, with the block order reversed and `nin_shortcut` for
+    /// `conv_shortcut`; the UNet flattens everything into `input_blocks.N.M`
+    /// slots that map onto `down_blocks`/`mid_block`/`up_blocks` by
+    /// arithmetic rather than by name. Both need index translation, not
+    /// substitution, and are not implemented — see docs/roadmap.md.
+    pub fn ldm_to_diffusers(key: &str) -> Option<String> {
+        key.strip_prefix("cond_stage_model.transformer.")
+            .map(|rest| rest.to_string())
+    }
+}

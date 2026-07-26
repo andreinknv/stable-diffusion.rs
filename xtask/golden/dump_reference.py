@@ -751,6 +751,11 @@ GGUF_FIXTURES = [
     ("ggml-org/stories15M_MOE", "moe_shakespeare15M.gguf"),
     ("ggml-org/stories15M_MOE", "stories15M_MOE-Q8_0.gguf"),
     ("ggml-org/models", "bert-bge-small/ggml-model-f16-big-endian.gguf"),
+    # A real Stable Diffusion checkpoint as stable-diffusion.cpp writes it:
+    # CompVis/LDM names, no metadata whatsoever. 1.5 GB, and the only fixture
+    # here that exercises the *naming* rather than the format.
+    ("second-state/stable-diffusion-v1-5-GGUF",
+     "stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf"),
 ]
 
 
@@ -762,7 +767,9 @@ def dump_gguf(output: pathlib.Path, _model_id: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     for repo, name in GGUF_FIXTURES:
         src = hf_hub_download(repo_id=repo, filename=name)
-        link = out / pathlib.Path(name).name
+        # The SD checkpoint gets a short stable name; the rest keep theirs.
+        short = "sd15-q4_0.gguf" if "stable-diffusion-v1-5" in name else pathlib.Path(name).name
+        link = out / short
         if link.is_symlink() or link.exists():
             link.unlink()
         link.symlink_to(src)

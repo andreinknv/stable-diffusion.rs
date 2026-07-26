@@ -337,3 +337,68 @@ fn a_load_too_large_for_the_machine_is_refused_before_reading() {
         "should be the memory guard, not a parse error: {msg}"
     );
 }
+
+// -- naming layout ---------------------------------------------------------
+
+#[test]
+fn a_real_sd_gguf_is_recognised_as_ldm_despite_declaring_nothing() {
+    // The finding that makes this necessary: a stable-diffusion.cpp SD 1.5
+    // checkpoint carries *no metadata at all* — no `general.architecture`,
+    // nothing. Identification has to come from tensor names.
+    let Some(p) = fixture("sd15-q4_0.gguf") else {
+        return;
+    };
+    let info = GgufInfo::open(&p).expect("reading a real SD GGUF");
+
+    assert!(
+        info.metadata.is_empty(),
+        "expected no metadata; got {} keys — if this file gained some, the \
+         detection below is no longer the only option",
+        info.metadata.len()
+    );
+    assert_eq!(info.architecture(), None);
+    assert_eq!(info.layout(), sd_loader::Layout::Ldm);
+
+    // The three towers, all in one file.
+    let count = |p: &str| info.tensors.keys().filter(|k| k.starts_with(p)).count();
+    assert!(count("model.diffusion_model.") > 600, "unet");
+    assert!(count("first_stage_model.") > 200, "vae");
+    assert!(count("cond_stage_model.transformer.") > 150, "clip");
+}
+
+#[test]
+fn a_language_model_is_not_mistaken_for_a_diffusion_one() {
+    let Some(p) = fixture("stories15M_MOE-Q8_0.gguf") else {
+        return;
+    };
+    let info = GgufInfo::open(&p).expect("header");
+    assert_eq!(
+        info.layout(),
+        sd_loader::Layout::Unknown,
+        "a llama checkpoint is neither layout"
+    );
+}
+
+#[test]
+fn the_text_encoder_prefix_is_the_whole_clip_mapping() {
+    // LDM leaves CLIP exactly as `transformers` writes it and only adds a
+    // prefix, so stripping it is the entire translation for that tower.
+    assert_eq!(
+        GgufInfo::ldm_to_diffusers(
+            "cond_stage_model.transformer.text_model.encoder.layers.0.layer_norm1.weight"
+        )
+        .as_deref(),
+        Some("text_model.encoder.layers.0.layer_norm1.weight")
+    );
+
+    // The other two towers are index translation, not substitution, and this
+    // function must not pretend otherwise by passing them through unchanged.
+    assert_eq!(
+        GgufInfo::ldm_to_diffusers("first_stage_model.decoder.up.0.block.0.conv1.weight"),
+        None
+    );
+    assert_eq!(
+        GgufInfo::ldm_to_diffusers("model.diffusion_model.input_blocks.1.0.in_layers.0.weight"),
+        None
+    );
+}

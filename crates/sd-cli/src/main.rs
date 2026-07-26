@@ -205,10 +205,26 @@ fn main() -> Result<()> {
             }
             if verbose {
                 println!("metadata:");
-                let mut keys: Vec<_> = info.metadata.keys().collect();
-                keys.sort();
-                for k in keys {
-                    println!("  {k}");
+                if info.metadata.is_empty() {
+                    // Not hypothetical: stable-diffusion.cpp writes none.
+                    println!("  (none — the file declares nothing about itself)");
+                } else {
+                    let mut keys: Vec<_> = info.metadata.keys().collect();
+                    keys.sort();
+                    for k in keys {
+                        println!("  {k}");
+                    }
+                }
+                // Grouped by top-level prefix: 1131 individual names is not
+                // something anyone reads, but the prefixes say what is inside.
+                println!("tensor name prefixes:");
+                let mut groups: std::collections::BTreeMap<String, usize> = Default::default();
+                for name in info.tensors.keys() {
+                    let prefix: String = name.split('.').take(2).collect::<Vec<_>>().join(".");
+                    *groups.entry(prefix).or_default() += 1;
+                }
+                for (prefix, count) in groups {
+                    println!("  {count:>6}  {prefix}.*");
                 }
             }
         }

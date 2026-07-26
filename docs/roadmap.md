@@ -79,17 +79,29 @@ any other downsampling path.
 Remaining milestone 2 work:
 
 - SDXL (same geometry, second text encoder, different latent scaling)
-- **A name map for SD GGUF checkpoints.** Reading and dequantising both work:
-  `gguf_var_builder` turns any GGUF into a `VarBuilder`, verified on real
-  llama.cpp files. What it does *not* do is rename anything, and that is the
-  last gap. GGUF checkpoints from `stable-diffusion.cpp` carry the original
-  CompVis/LDM parameter names while these models use the `diffusers` names, so
-  the keys will not match.
+- **LDM -> diffusers name translation for the VAE and UNet.** Everything else
+  in the GGUF path works: reading, dequantising, layout detection, and the
+  text encoder. What remains is index translation for the other two towers.
 
-  That belongs beside the legacy-attention conversion in `sd-loader`, and it
-  wants the same treatment: a real SD GGUF as a fixture, not a guess at the
-  naming. The fixtures used so far are language models — they exercise the
-  format, not the naming.
+  This is now specified rather than guessed at, from a real
+  `stable-diffusion.cpp` SD 1.5 checkpoint (`dump_reference.py gguf` links it;
+  1131 tensors, 955 Q4_0 + 176 F16):
+
+  | tower | tensors | LDM name | ours |
+  |---|---:|---|---|
+  | CLIP | 196 | `cond_stage_model.transformer.text_model.encoder.layers.0.layer_norm1.weight` | strip the prefix — **done** |
+  | VAE | 248 | `first_stage_model.decoder.up.0.block.0.conv1.weight` | `decoder.up_blocks.N.resnets.0.conv1.weight` |
+  | UNet | 686 | `model.diffusion_model.input_blocks.1.0.in_layers.0.weight` | `down_blocks.0.resnets.0.norm1.weight` |
+
+  The VAE needs the `up` list reversed against `up_blocks`, `nin_shortcut` ->
+  `conv_shortcut`, `mid.attn_1.{q,k,v,proj_out}` -> `to_q/to_k/to_v/to_out.0`,
+  and `norm_out` -> `conv_norm_out`. The UNet is the bulk: LDM flattens
+  everything into `input_blocks.N.M` slots that map onto
+  `down_blocks`/`mid_block`/`up_blocks` by arithmetic, not by name.
+
+  **The file declares nothing about itself** — no metadata at all, not even
+  `general.architecture` — so `GgufInfo::layout()` infers the convention from
+  tensor prefixes. Any mapping work builds on that, not on metadata.
 
   The reader is tested against real llama.cpp files as well as synthetic ones — `dump_reference.py gguf` links three small fixtures (16 MB
   to 67 MB). That found one thing immediately: big-endian builds exist, candle
