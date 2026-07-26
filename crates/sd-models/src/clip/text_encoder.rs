@@ -68,7 +68,21 @@ impl ClipTextConfig {
         Self::sd15()
     }
 
-    /// SDXL's second text encoder: OpenCLIP ViT-bigG.
+    /// SD 3's first text encoder: SD 1.5's geometry with a projection head.
+    ///
+    /// The projection is the difference that matters. SD 1.5 ships a plain
+    /// `CLIPTextModel` and Flux takes its raw `pooler_output`; SD 3 ships
+    /// `CLIPTextModelWithProjection` and takes the *projected* embedding, so
+    /// [`ClipTextEncoder::pooled`] is correct here where
+    /// [`ClipTextEncoder::pooled_hidden`] is correct for Flux.
+    pub fn sd3_l() -> Self {
+        Self {
+            projection_dim: Some(768),
+            ..Self::sd15()
+        }
+    }
+
+    /// SDXL's second text encoder, and SD 3's: OpenCLIP ViT-bigG.
     ///
     /// Bigger in every dimension, and it activates with plain `gelu`.
     pub fn sdxl_2() -> Self {

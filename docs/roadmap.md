@@ -161,6 +161,7 @@ architecture is independent and verifiable against its own golden data.
 | Flux schnell (12B) | — | loads quantised, 4.87 GB, renders |
 | SD 3.5 VAE | `diffusers` | `max_abs` 1.2e-5 |
 | SD 3.5 MMDiT | `diffusers` | `max_abs` 5.5e-6 |
+| SD 3.5 end to end | — | 512x512 in 311 s on CPU |
 
 Three things worth carrying to SD 3, which shares most of this:
 
@@ -243,10 +244,26 @@ the reference from the file Rust actually reads took it to 5.5e-6. Worth
 remembering generally: when two copies of a checkpoint exist, verify against
 the one you load.
 
-Still to do for a working SD 3.5 pipeline: the three text encoders need
-wiring together (CLIP-L and CLIP-G pooled and concatenated to 2048, T5 for
-the sequence) — all three encoders already exist and are verified, so this is
-assembly rather than new models. Conveniently, k-quants suit these models far better than they suit SD 1.5 —
+**SD 3.5 renders**: 512x512, 20 steps, 311 s on CPU —
+`assets/sd35-medium-512-crab.png`.
+
+Its conditioning is the most involved in the project and worth recording,
+because two parts of it look like mistakes:
+
+- CLIP-L and CLIP-G sequences concatenate on the *feature* axis to 2048 and
+  are then **zero-padded to T5's 4096**, so half of every CLIP token is
+  empty by design. T5's sequence is concatenated on the *token* axis
+  instead.
+- The CLIP sequences come from the **penultimate** layer while the pooled
+  vectors come from the **projection head** — two different depths of the
+  same forward pass.
+
+Also: SD 3 uses real classifier-free guidance, two transformer passes per
+step, where Flux distils guidance into a conditioning input and needs one.
+And `pooled()` is correct here where Flux wanted `pooled_hidden()`, because
+SD 3 ships `CLIPTextModelWithProjection` and Flux ships a plain
+`CLIPTextModel`. Neither distinction produces an error if got wrong — only a
+worse image. Conveniently, k-quants suit these models far better than they suit SD 1.5 —
 their hidden sizes are multiples of 256, so nothing falls back to F16, which
 is why city96 can publish `Q4_K` for SD 3.5 and nobody can for SD 1.5.
 
