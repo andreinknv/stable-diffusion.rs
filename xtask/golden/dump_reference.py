@@ -265,6 +265,72 @@ def dump_clip_encoder(output: pathlib.Path, model_id: str) -> None:
     )
 
 
+def dump_unet_blocks(output: pathlib.Path, model_id: str) -> None:
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import UNet2DConditionModel
+    from diffusers.models.embeddings import get_timestep_embedding
+    from safetensors.torch import save_file
+
+    out = output / "unet_blocks"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id} (subfolder=unet)")
+    unet = UNet2DConditionModel.from_pretrained(
+        model_id, subfolder="unet", torch_dtype=torch.float32
+    )
+    unet.eval()
+
+    gen = torch.Generator().manual_seed(SEED)
+    timesteps = torch.tensor([0.0, 1.0, 500.0, 999.0])
+
+    # Part A — the raw sinusoid. flip_sin_to_cos=True means cos then sin.
+    sin_emb = get_timestep_embedding(
+        timesteps, 320, flip_sin_to_cos=True, downscale_freq_shift=0
+    )
+
+    # Part B — the MLP that widens 320 -> 1280.
+    with torch.no_grad():
+        temb = unet.time_embedding(sin_emb)
+
+    # Part C — the first resnet of the first down block.
+    blk = unet.down_blocks[0].resnets[0]
+    x = torch.randn(2, 320, 16, 16, generator=gen)
+    t2 = temb[:2]
+    with torch.no_grad():
+        resnet_output = blk(x, t2)
+
+    tensors = {
+        "timesteps": timesteps.contiguous(),
+        "sin_emb": sin_emb.detach().contiguous().clone(),
+        "temb": temb.detach().contiguous().clone(),
+        "resnet_input": x.contiguous(),
+        "resnet_temb": t2.detach().contiguous().clone(),
+        "resnet_output": resnet_output.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    # The isolated blocks, so Rust runs the same parameters rather than a
+    # random-weight approximation of them.
+    save_file(
+        {k: v.detach().contiguous().clone() for k, v in blk.state_dict().items()},
+        str(out / "resnet.safetensors"),
+    )
+    save_file(
+        {
+            k: v.detach().contiguous().clone()
+            for k, v in unet.time_embedding.state_dict().items()
+        },
+        str(out / "time_embedding.safetensors"),
+    )
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<16} {tuple(v.shape)}")
+    print(f"wrote {out / 'resnet.safetensors'}")
+    print(f"wrote {out / 'time_embedding.safetensors'}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="component", required=True)
@@ -293,8 +359,18 @@ def main() -> None:
     )
     encoder.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    blocks = sub.add_parser("unet_blocks", help="dump UNet resnet/embedding references")
+    blocks.add_argument(
+        "--model-id",
+        default="stable-diffusion-v1-5/stable-diffusion-v1-5",
+        help="HuggingFace model id",
+    )
+    blocks.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     args = ap.parse_args()
-    if args.component == "vae":
+    if args.component == "unet_blocks":
+        dump_unet_blocks(args.output, args.model_id)
+    elif args.component == "vae":
         dump_vae(args.output, args.model_id)
     elif args.component == "clip_tokenizer":
         dump_clip_tokenizer(args.output, args.model_id)
