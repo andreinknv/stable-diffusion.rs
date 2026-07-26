@@ -9,7 +9,8 @@ have a binary.
 
 > **Status: it renders.** Text-to-image and image-to-image work for
 > Stable Diffusion 1.5 and SDXL, on CPU and Apple GPU, and text-to-image works
-> for **Flux** (MMDiT, rectified flow, T5-XXL). Every model component is
+> for **Flux** — including full-size schnell at 12B, held quantised in 4.9 GB.
+> Every model component is
 > verified tensor-by-tensor against `diffusers`/`transformers` — not eyeballed.
 > GGUF works end to end (`sdrs txt2img --gguf`); prefer Q4_K over Q4_0, which
 > is visibly soft. CUDA compiles but is untested. See the

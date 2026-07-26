@@ -158,6 +158,7 @@ architecture is independent and verifiable against its own golden data.
 | T5 v1.1 encoder | `transformers` | output 1.9e-5 |
 | Flux MMDiT | `diffusers` | relative drift 2.1e-6 |
 | 20-step sampling loop | `diffusers` | `max_abs` 6.5e-5 |
+| Flux schnell (12B) | — | loads quantised, 4.87 GB, renders |
 
 Three things worth carrying to SD 3, which shares most of this:
 
@@ -190,11 +191,29 @@ shows up there and nowhere else. The other pins the artifact itself, so it is
 not re-investigated, and so a genuine regression in the last rows is still
 caught.
 
-**Full Flux is still out of reach on 36 GB.** dev and schnell are 12B, which
-is 48 GB at f32. Reaching them means quantised residency for the *transformer*
-too — QLinear already exists and does this for T5, so the remaining work is
-wiring it through `sd-models/flux` and requantising the safetensors
-checkpoint, not new machinery.
+~~**Full Flux is still out of reach on 36 GB.**~~ **Done — schnell runs.**
+12B parameters, **4.87 GB resident** against ~48 GB at F32, rendering 512x512
+in 166 s on CPU: `assets/flux-schnell-512-crab.png`. The whole stack comes to
+about 8 GB, so the constraint is gone rather than merely met.
+
+Quantised residency did that, and it is worth being precise about why it was
+worth building. It began as a memory optimisation, turned out to be the
+*correctness* fix for T5 (F16 overflows), and is now the only reason a 12B
+model runs here at all. One mechanism, three payoffs.
+
+No name mapping was needed: published Flux GGUFs carry the original
+black-forest-labs names, which is what `sd-models/flux` already asks for.
+Geometry and guidance are read from the file (`flux_block_counts`,
+`flux_has_guidance`) rather than assumed, so schnell's 19/38 blocks and dev's
+guidance embedding are picked up automatically and passing a guidance scale
+to schnell is an error instead of a silent no-op.
+
+The schnell image also settles the artifact question from the other
+direction: it shows no bottom-edge striping, which is what the elimination
+already concluded — that band belongs to flux-mini.
+
+Still open here: **dev**, which is gated on HuggingFace and needs an account,
+and **Metal**, since all Flux work so far is CPU-only.
 
 **SD 3 is blocked on much less than Flux was**, since the sampler, T5, and the
 MMDiT pattern are now all in place. Conveniently, k-quants suit these models far better than they suit SD 1.5 —

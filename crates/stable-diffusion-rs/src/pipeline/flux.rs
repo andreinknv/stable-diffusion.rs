@@ -132,8 +132,18 @@ impl FluxPipeline {
         let weights = sd_loader::t5_qtensors_from_gguf(&paths.t5_gguf, device)?;
         let t5 = T5EncoderModel::from_quantized(&T5Config::xxl(), &weights)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&paths.transformer], MODEL_DTYPE, device)?;
-        let transformer = FluxTransformer::new(cfg, vb)?;
+        // A GGUF transformer keeps its weights quantised, which is what makes
+        // full-size Flux reachable: schnell and dev are 12B parameters, 48 GB
+        // at F32 and 4.9 GB held as Q4_K. safetensors are read dense, since
+        // that is the only form they come in.
+        let transformer = if paths.transformer.extension().is_some_and(|e| e == "gguf") {
+            let weights = sd_loader::flux_qtensors_from_gguf(&paths.transformer, device)?;
+            FluxTransformer::from_quantized(cfg, &weights)?
+        } else {
+            let vb =
+                sd_loader::safetensors_var_builder(&[&paths.transformer], MODEL_DTYPE, device)?;
+            FluxTransformer::new(cfg, vb)?
+        };
 
         let vb = sd_loader::safetensors_var_builder(&[&paths.vae], VAE_DTYPE, device)?;
         let vae = AutoencoderKlDecoder::new(&VaeConfig::flux(), vb)?;
@@ -221,8 +231,17 @@ impl FluxPipeline {
 
         let img_ids = rope::image_ids(1, patch_h, patch_w, &self.device)?;
         let txt_ids = rope::text_ids(1, txt.dim(1)?, &self.device)?;
-        let guidance =
-            Tensor::from_vec(vec![cfg.guidance as f32], 1, &self.device)?.to_dtype(MODEL_DTYPE)?;
+        // schnell is not distilled on a guidance scale and rejects one; dev
+        // and flux-mini require it. Driven by the model rather than by the
+        // caller, so a `guidance` setting cannot be silently discarded.
+        let guidance = if self.transformer.config().guidance_embed {
+            Some(
+                Tensor::from_vec(vec![cfg.guidance as f32], 1, &self.device)?
+                    .to_dtype(MODEL_DTYPE)?,
+            )
+        } else {
+            None
+        };
 
         for (i, &t) in timesteps.iter().enumerate() {
             // Flux's timestep is the sigma itself, in [0, 1], not an index.
@@ -238,7 +257,7 @@ impl FluxPipeline {
                 &txt_ids,
                 &t,
                 &pooled,
-                Some(&guidance),
+                guidance.as_ref(),
             )?;
 
             // The step itself in F32. It is a scaled add over the whole
@@ -302,8 +321,16 @@ pub fn image_token_count(width: usize, height: usize) -> usize {
 /// Convenience for the common layout: everything under one directory, with the
 /// names this project's fixtures use.
 pub fn paths_in(dir: &Path) -> FluxPaths {
+    // Prefer a full-size quantised checkpoint when one is present, since it is
+    // the better model; fall back to flux-mini.
+    let schnell = dir.join("flux-schnell-q4_k_s.gguf");
+    let transformer = if schnell.exists() {
+        schnell
+    } else {
+        dir.join("flux-mini.safetensors")
+    };
     FluxPaths {
-        transformer: dir.join("flux-mini.safetensors"),
+        transformer,
         t5_gguf: dir.join("t5-xxl-q4_k_s.gguf"),
         t5_tokenizer: dir.join("t5-tokenizer.json"),
         clip: dir.join("clip-l.safetensors"),

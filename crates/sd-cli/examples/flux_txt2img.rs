@@ -16,7 +16,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("device: {dev:?}; loading four models…");
     let t0 = std::time::Instant::now();
     let paths = paths_in(std::path::Path::new("tests/golden/flux"));
-    let pipe = FluxPipeline::load(&paths, &FluxConfig::mini(), &dev)?;
+    // Read the geometry from the file rather than assuming: schnell and dev
+    // are 19/38 blocks, flux-mini 5/10.
+    let cfg = if paths.transformer.extension().is_some_and(|e| e == "gguf") {
+        let (d, s) = stable_diffusion_rs::loader::flux_block_counts(&paths.transformer)?;
+        let guidance = stable_diffusion_rs::loader::flux_has_guidance(&paths.transformer)?;
+        eprintln!("checkpoint: {d} double + {s} single blocks, guidance={guidance}");
+        FluxConfig {
+            depth: d,
+            depth_single_blocks: s,
+            guidance_embed: guidance,
+            ..FluxConfig::mini()
+        }
+    } else {
+        FluxConfig::mini()
+    };
+    let pipe = FluxPipeline::load(&paths, &cfg, &dev)?;
     eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     let cfg = FluxConfigRun {

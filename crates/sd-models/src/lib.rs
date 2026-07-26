@@ -18,3 +18,4 @@ pub mod flux;
 pub mod t5;
 pub mod unet;
 pub mod vae;
+pub mod weights;

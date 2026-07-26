@@ -24,8 +24,9 @@
 
 pub mod rope;
 
-use sd_tensor::nn::{linear, Linear, VarBuilder};
-use sd_tensor::{ops, DType, Module, Result, Tensor, D};
+use crate::weights::{Proj, QuantizedWeights, Source};
+use sd_tensor::nn::VarBuilder;
+use sd_tensor::{ops, DType, Result, Tensor, D};
 
 /// Flux transformer geometry.
 #[derive(Debug, Clone)]
@@ -129,15 +130,15 @@ pub fn timestep_embedding(t: &Tensor, dim: usize, max_period: f64) -> Result<Ten
 /// Two-layer MLP with SiLU between, used for every conditioning input.
 #[derive(Debug)]
 struct MlpEmbedder {
-    in_layer: Linear,
-    out_layer: Linear,
+    in_layer: Proj,
+    out_layer: Proj,
 }
 
 impl MlpEmbedder {
-    fn new(in_dim: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(in_dim: usize, hidden: usize, src: Source, path: &str) -> Result<Self> {
         Ok(Self {
-            in_layer: linear(in_dim, hidden, vb.pp("in_layer"))?,
-            out_layer: linear(hidden, hidden, vb.pp("out_layer"))?,
+            in_layer: src.linear(&format!("{path}.in_layer"), in_dim, hidden)?,
+            out_layer: src.linear(&format!("{path}.out_layer"), hidden, hidden)?,
         })
     }
 
@@ -158,9 +159,9 @@ struct RmsNorm {
 }
 
 impl RmsNorm {
-    fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(dim: usize, src: Source, path: &str) -> Result<Self> {
         Ok(Self {
-            scale: vb.get(dim, "scale")?,
+            scale: src.tensor(&format!("{path}.scale"), dim)?,
         })
     }
 
@@ -182,10 +183,10 @@ struct QkNorm {
 }
 
 impl QkNorm {
-    fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(dim: usize, src: Source, path: &str) -> Result<Self> {
         Ok(Self {
-            query_norm: RmsNorm::new(dim, vb.pp("query_norm"))?,
-            key_norm: RmsNorm::new(dim, vb.pp("key_norm"))?,
+            query_norm: RmsNorm::new(dim, src, &format!("{path}.query_norm"))?,
+            key_norm: RmsNorm::new(dim, src, &format!("{path}.key_norm"))?,
         })
     }
 }
@@ -204,15 +205,15 @@ struct Mod {
 /// single-stream one.
 #[derive(Debug)]
 struct Modulation {
-    lin: Linear,
+    lin: Proj,
     double: bool,
 }
 
 impl Modulation {
-    fn new(dim: usize, double: bool, vb: VarBuilder) -> Result<Self> {
+    fn new(dim: usize, double: bool, src: Source, path: &str) -> Result<Self> {
         let multiplier = if double { 6 } else { 3 };
         Ok(Self {
-            lin: linear(dim, multiplier * dim, vb.pp("lin"))?,
+            lin: src.linear(&format!("{path}.lin"), dim, multiplier * dim)?,
             double,
         })
     }
@@ -302,56 +303,70 @@ fn merge_heads(xs: &Tensor) -> Result<Tensor> {
 struct DoubleStreamBlock {
     img_mod: Modulation,
     img_norm1: PlainLayerNorm,
-    img_qkv: Linear,
+    img_qkv: Proj,
     img_qk_norm: QkNorm,
-    img_proj: Linear,
+    img_proj: Proj,
     img_norm2: PlainLayerNorm,
-    img_mlp_in: Linear,
-    img_mlp_out: Linear,
+    img_mlp_in: Proj,
+    img_mlp_out: Proj,
 
     txt_mod: Modulation,
     txt_norm1: PlainLayerNorm,
-    txt_qkv: Linear,
+    txt_qkv: Proj,
     txt_qk_norm: QkNorm,
-    txt_proj: Linear,
+    txt_proj: Proj,
     txt_norm2: PlainLayerNorm,
-    txt_mlp_in: Linear,
-    txt_mlp_out: Linear,
+    txt_mlp_in: Proj,
+    txt_mlp_out: Proj,
 
     num_heads: usize,
     head_dim: usize,
 }
 
 impl DoubleStreamBlock {
-    fn new(cfg: &FluxConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &FluxConfig, src: Source, path: &str) -> Result<Self> {
         let (h, mlp) = (cfg.hidden_size, cfg.mlp_hidden());
         let hd = cfg.head_dim();
-        let img_attn = vb.pp("img_attn");
-        let txt_attn = vb.pp("txt_attn");
         Ok(Self {
-            img_mod: Modulation::new(h, true, vb.pp("img_mod"))?,
+            img_mod: Modulation::new(h, true, src, &format!("{path}.img_mod"))?,
             img_norm1: PlainLayerNorm::new(),
-            img_qkv: linear(h, 3 * h, img_attn.pp("qkv"))?,
-            img_qk_norm: QkNorm::new(hd, img_attn.pp("norm"))?,
-            img_proj: linear(h, h, img_attn.pp("proj"))?,
+            img_qkv: src.linear(&format!("{path}.img_attn.qkv"), h, 3 * h)?,
+            img_qk_norm: QkNorm::new(hd, src, &format!("{path}.img_attn.norm"))?,
+            img_proj: src.linear(&format!("{path}.img_attn.proj"), h, h)?,
             img_norm2: PlainLayerNorm::new(),
             // `img_mlp` is a Sequential: 0 is the projection, 1 the GELU,
             // 2 the output — hence the index-named weights.
-            img_mlp_in: linear(h, mlp, vb.pp("img_mlp").pp("0"))?,
-            img_mlp_out: linear(mlp, h, vb.pp("img_mlp").pp("2"))?,
+            img_mlp_in: src.linear(&format!("{path}.img_mlp.0"), h, mlp)?,
+            img_mlp_out: src.linear(&format!("{path}.img_mlp.2"), mlp, h)?,
 
-            txt_mod: Modulation::new(h, true, vb.pp("txt_mod"))?,
+            txt_mod: Modulation::new(h, true, src, &format!("{path}.txt_mod"))?,
             txt_norm1: PlainLayerNorm::new(),
-            txt_qkv: linear(h, 3 * h, txt_attn.pp("qkv"))?,
-            txt_qk_norm: QkNorm::new(hd, txt_attn.pp("norm"))?,
-            txt_proj: linear(h, h, txt_attn.pp("proj"))?,
+            txt_qkv: src.linear(&format!("{path}.txt_attn.qkv"), h, 3 * h)?,
+            txt_qk_norm: QkNorm::new(hd, src, &format!("{path}.txt_attn.norm"))?,
+            txt_proj: src.linear(&format!("{path}.txt_attn.proj"), h, h)?,
             txt_norm2: PlainLayerNorm::new(),
-            txt_mlp_in: linear(h, mlp, vb.pp("txt_mlp").pp("0"))?,
-            txt_mlp_out: linear(mlp, h, vb.pp("txt_mlp").pp("2"))?,
+            txt_mlp_in: src.linear(&format!("{path}.txt_mlp.0"), h, mlp)?,
+            txt_mlp_out: src.linear(&format!("{path}.txt_mlp.2"), mlp, h)?,
 
             num_heads: cfg.num_heads,
             head_dim: hd,
         })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        [
+            &self.img_qkv,
+            &self.img_proj,
+            &self.img_mlp_in,
+            &self.img_mlp_out,
+            &self.txt_qkv,
+            &self.txt_proj,
+            &self.txt_mlp_in,
+            &self.txt_mlp_out,
+        ]
+        .iter()
+        .map(|p| p.resident_bytes())
+        .sum()
     }
 
     fn forward(
@@ -436,8 +451,8 @@ impl DoubleStreamBlock {
 struct SingleStreamBlock {
     modulation: Modulation,
     pre_norm: PlainLayerNorm,
-    linear1: Linear,
-    linear2: Linear,
+    linear1: Proj,
+    linear2: Proj,
     qk_norm: QkNorm,
     num_heads: usize,
     head_dim: usize,
@@ -446,21 +461,25 @@ struct SingleStreamBlock {
 }
 
 impl SingleStreamBlock {
-    fn new(cfg: &FluxConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &FluxConfig, src: Source, path: &str) -> Result<Self> {
         let (h, mlp) = (cfg.hidden_size, cfg.mlp_hidden());
         Ok(Self {
-            modulation: Modulation::new(h, false, vb.pp("modulation"))?,
+            modulation: Modulation::new(h, false, src, &format!("{path}.modulation"))?,
             pre_norm: PlainLayerNorm::new(),
             // One projection producing qkv *and* the feed-forward input.
-            linear1: linear(h, 3 * h + mlp, vb.pp("linear1"))?,
+            linear1: src.linear(&format!("{path}.linear1"), h, 3 * h + mlp)?,
             // And one consuming attention output *and* the gated MLP.
-            linear2: linear(h + mlp, h, vb.pp("linear2"))?,
-            qk_norm: QkNorm::new(cfg.head_dim(), vb.pp("norm"))?,
+            linear2: src.linear(&format!("{path}.linear2"), h + mlp, h)?,
+            qk_norm: QkNorm::new(cfg.head_dim(), src, &format!("{path}.norm"))?,
             num_heads: cfg.num_heads,
             head_dim: cfg.head_dim(),
             hidden_size: h,
             mlp_hidden: mlp,
         })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.linear1.resident_bytes() + self.linear2.resident_bytes()
     }
 
     fn forward(&self, xs: &Tensor, vec: &Tensor, pe: &Tensor) -> Result<Tensor> {
@@ -488,19 +507,19 @@ impl SingleStreamBlock {
 #[derive(Debug)]
 struct LastLayer {
     norm_final: PlainLayerNorm,
-    ada_ln: Linear,
-    linear: Linear,
+    ada_ln: Proj,
+    linear: Proj,
 }
 
 impl LastLayer {
-    fn new(cfg: &FluxConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &FluxConfig, src: Source, path: &str) -> Result<Self> {
         let h = cfg.hidden_size;
         Ok(Self {
             norm_final: PlainLayerNorm::new(),
             // `adaLN_modulation` is Sequential(SiLU, Linear); index 1 is the
             // Linear, and index 0 has no weights.
-            ada_ln: linear(h, 2 * h, vb.pp("adaLN_modulation").pp("1"))?,
-            linear: linear(h, cfg.in_channels, vb.pp("linear"))?,
+            ada_ln: src.linear(&format!("{path}.adaLN_modulation.1"), h, 2 * h)?,
+            linear: src.linear(&format!("{path}.linear"), h, cfg.in_channels)?,
         })
     }
 
@@ -523,8 +542,8 @@ impl LastLayer {
 /// The Flux transformer.
 #[derive(Debug)]
 pub struct FluxTransformer {
-    img_in: Linear,
-    txt_in: Linear,
+    img_in: Proj,
+    txt_in: Proj,
     time_in: MlpEmbedder,
     vector_in: MlpEmbedder,
     guidance_in: Option<MlpEmbedder>,
@@ -536,27 +555,52 @@ pub struct FluxTransformer {
 
 impl FluxTransformer {
     pub fn new(cfg: &FluxConfig, vb: VarBuilder) -> Result<Self> {
+        Self::from_source(cfg, Source::Dense(&vb))
+    }
+
+    /// Build with the weights left quantised.
+    ///
+    /// This is what makes full-size Flux reachable at all: dev and schnell are
+    /// 12B parameters, or 48 GB at F32, against roughly 6.8 GB held as Q4_K.
+    /// It is also the only way the model runs on this machine at any size,
+    /// since F16 — the obvious way to halve F32 — produces NaN velocities.
+    pub fn from_quantized(cfg: &FluxConfig, weights: &QuantizedWeights) -> Result<Self> {
+        Self::from_source(cfg, Source::Quantized(weights))
+    }
+
+    fn from_source(cfg: &FluxConfig, src: Source) -> Result<Self> {
         cfg.validate()?;
         let h = cfg.hidden_size;
         Ok(Self {
-            img_in: linear(cfg.in_channels, h, vb.pp("img_in"))?,
-            txt_in: linear(cfg.context_in_dim, h, vb.pp("txt_in"))?,
-            time_in: MlpEmbedder::new(TIME_EMBED_DIM, h, vb.pp("time_in"))?,
-            vector_in: MlpEmbedder::new(cfg.vec_in_dim, h, vb.pp("vector_in"))?,
+            img_in: src.linear("img_in", cfg.in_channels, h)?,
+            txt_in: src.linear("txt_in", cfg.context_in_dim, h)?,
+            time_in: MlpEmbedder::new(TIME_EMBED_DIM, h, src, "time_in")?,
+            vector_in: MlpEmbedder::new(cfg.vec_in_dim, h, src, "vector_in")?,
             guidance_in: if cfg.guidance_embed {
-                Some(MlpEmbedder::new(TIME_EMBED_DIM, h, vb.pp("guidance_in"))?)
+                Some(MlpEmbedder::new(TIME_EMBED_DIM, h, src, "guidance_in")?)
             } else {
                 None
             },
             double_blocks: (0..cfg.depth)
-                .map(|i| DoubleStreamBlock::new(cfg, vb.pp("double_blocks").pp(i.to_string())))
+                .map(|i| DoubleStreamBlock::new(cfg, src, &format!("double_blocks.{i}")))
                 .collect::<Result<Vec<_>>>()?,
             single_blocks: (0..cfg.depth_single_blocks)
-                .map(|i| SingleStreamBlock::new(cfg, vb.pp("single_blocks").pp(i.to_string())))
+                .map(|i| SingleStreamBlock::new(cfg, src, &format!("single_blocks.{i}")))
                 .collect::<Result<Vec<_>>>()?,
-            final_layer: LastLayer::new(cfg, vb.pp("final_layer"))?,
+            final_layer: LastLayer::new(cfg, src, "final_layer")?,
             cfg: cfg.clone(),
         })
+    }
+
+    /// Weight bytes held by the quantised projections. Zero when dense.
+    pub fn resident_bytes(&self) -> usize {
+        let block: usize = self
+            .double_blocks
+            .iter()
+            .map(|b| b.resident_bytes())
+            .chain(self.single_blocks.iter().map(|b| b.resident_bytes()))
+            .sum();
+        block + self.img_in.resident_bytes() + self.txt_in.resident_bytes()
     }
 
     pub fn config(&self) -> &FluxConfig {
