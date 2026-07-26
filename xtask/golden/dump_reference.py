@@ -66,7 +66,12 @@ def dump_vae(output: pathlib.Path, model_id: str) -> None:
     def capture(name: str):
         def hook(_module, _inputs, output):
             t = output[0] if isinstance(output, tuple) else output
-            captured[name] = t.detach().contiguous().float()
+            # `.clone()` is load-bearing: the last hook (`conv_out`) captures
+            # the very tensor the decoder returns as `image`, and `.detach()`,
+            # `.contiguous()` and `.float()` are all no-ops on it, so the two
+            # entries would alias one storage. safetensors refuses to serialize
+            # tensors that share memory.
+            captured[name] = t.detach().contiguous().float().clone()
 
         return hook
 
@@ -95,9 +100,19 @@ def dump_vae(output: pathlib.Path, model_id: str) -> None:
 
     save_file(tensors, str(out / "reference.safetensors"))
 
+    # The weights, too. Reference activations alone cannot verify anything —
+    # the Rust decoder has to be run with the *same* parameters that produced
+    # them, and `state_dict()` is by construction in the diffusers naming the
+    # loader expects. Writing them here is what makes this script sufficient on
+    # its own; without it the numerical test finds the activations, cannot find
+    # the weights, and skips.
+    weights = {k: v.detach().contiguous().clone() for k, v in vae.state_dict().items()}
+    save_file(weights, str(out / "vae.safetensors"))
+
     print(f"\nwrote {out / 'reference.safetensors'}")
     for k, v in sorted(tensors.items()):
         print(f"  {k:<18} {tuple(v.shape)}")
+    print(f"\nwrote {out / 'vae.safetensors'} ({len(weights)} tensors)")
     print(
         "\nIntermediate tensors are included on purpose: when the final image "
         "\nmismatches, they tell you *which block* diverged first."

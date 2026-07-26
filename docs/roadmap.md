@@ -9,15 +9,24 @@ Ordered by **ops validated per unit of effort**, with visible output early.
 | ✅ | Workspace, seam, CI, seam lint | done |
 | ✅ | safetensors loading | done |
 | ✅ | VAE decoder — structural tests | done |
-| 🔴 | VAE decoder — numerical vs `diffusers` | harness ready, unverified |
+| ✅ | VAE decoder — numerical vs `diffusers` | verified, max_abs 3.7e-5 |
 | ⬜ | CLIP tokenizer (BPE) | |
 | ⬜ | CLIP text encoder | |
 | ⬜ | UNet | |
 | ⬜ | Euler ancestral, DPM++ 2M | |
 | ⬜ | `sdrs txt2img` | |
 
-The VAE decoder is written but **not numerically verified** — that's the next
-concrete task. Run the golden harness and find out.
+The VAE decoder is **numerically verified** against `diffusers` as of
+2026-07-25: `max_abs = 3.678e-5`, `mean_abs = 4.408e-7` on the full 256x256
+decode, against a tolerance of 1e-4. So the port is correct, and it is now a
+usable oracle for changes to the ops underneath it.
+
+Reproduce with `python3 xtask/golden/dump_reference.py vae --output tests/golden`
+followed by `cargo test --release -p sd-models --test golden_vae`. The
+references are ~460 MB and stay out of git, so this remains a local step.
+
+Next concrete task: the CLIP tokenizer and text encoder, which is the last
+piece before a UNet has anything to condition on.
 
 ## Milestone 2 — usable
 
