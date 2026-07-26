@@ -193,6 +193,78 @@ def dump_clip_tokenizer(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out / 'tokenizer.json'}")
 
 
+ENCODER_PROMPT = "a photo of an astronaut riding a horse on mars"
+
+
+def dump_clip_encoder(output: pathlib.Path, model_id: str) -> None:
+    torch = _require("torch")
+    _require("transformers")
+    from safetensors.torch import save_file
+    from transformers import CLIPTextModel, CLIPTokenizer
+
+    out = output / "clip_encoder"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id}")
+    tok = CLIPTokenizer.from_pretrained(model_id)
+    model = CLIPTextModel.from_pretrained(model_id, torch_dtype=torch.float32)
+    model.eval()
+
+    batch = tok(
+        ENCODER_PROMPT,
+        padding="max_length",
+        max_length=MAX_LENGTH,
+        truncation=True,
+        return_tensors="pt",
+    )
+    token_ids = batch["input_ids"]
+
+    captured: dict[str, "torch.Tensor"] = {}
+
+    def capture(name: str):
+        def hook(_module, _inputs, output):
+            t = output[0] if isinstance(output, tuple) else output
+            # `.clone()` for the same reason as in dump_vae: the last capture
+            # can alias the returned tensor, and safetensors refuses to
+            # serialize tensors that share storage.
+            captured[name] = t.detach().contiguous().float().clone()
+
+        return hook
+
+    handles = [
+        model.text_model.embeddings.register_forward_hook(capture("embeddings"))
+    ]
+    for i, layer in enumerate(model.text_model.encoder.layers):
+        handles.append(layer.register_forward_hook(capture(f"layer_{i:02d}")))
+
+    with torch.no_grad():
+        outputs = model(input_ids=token_ids)
+
+    for h in handles:
+        h.remove()
+
+    tensors = {
+        "token_ids": token_ids.contiguous(),
+        "last_hidden_state": outputs.last_hidden_state.detach().contiguous().clone(),
+        **captured,
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    # Weights too, so the Rust test can run the same parameters that produced
+    # these activations. See dump_vae for why this is not optional.
+    weights = {k: v.detach().contiguous().clone() for k, v in model.state_dict().items()}
+    save_file(weights, str(out / "clip.safetensors"))
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<18} {tuple(v.shape)}")
+    print(f"wrote {out / 'clip.safetensors'} ({len(weights)} tensors)")
+    print(
+        "\nPer-layer captures are the point: when last_hidden_state mismatches "
+        "\nthey tell you which layer diverged first."
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="component", required=True)
@@ -213,11 +285,21 @@ def main() -> None:
     )
     clip.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    encoder = sub.add_parser("clip_encoder", help="dump CLIP text encoder references")
+    encoder.add_argument(
+        "--model-id",
+        default="openai/clip-vit-large-patch14",
+        help="HuggingFace model id",
+    )
+    encoder.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     args = ap.parse_args()
     if args.component == "vae":
         dump_vae(args.output, args.model_id)
     elif args.component == "clip_tokenizer":
         dump_clip_tokenizer(args.output, args.model_id)
+    elif args.component == "clip_encoder":
+        dump_clip_encoder(args.output, args.model_id)
 
 
 if __name__ == "__main__":
