@@ -227,6 +227,9 @@ pub struct ClipTextEncoder {
     /// Present when the checkpoint has one. SDXL's second encoder projects the
     /// pooled hidden state through this to produce `text_embeds`.
     text_projection: Option<Linear>,
+    /// The weights' dtype. Everything this module builds itself — the causal
+    /// mask especially — has to match it, or the first `broadcast_add` fails.
+    dtype: DType,
 }
 
 impl ClipTextEncoder {
@@ -263,14 +266,18 @@ impl ClipTextEncoder {
         )?;
 
         let device = vb.device();
+        let dtype = vb.dtype();
         let seq = cfg.max_position_embeddings;
         Ok(Self {
             token_embedding,
             position_embedding,
             layers,
             final_layer_norm,
-            causal_mask: ops::causal_mask(seq, device)?,
+            // Built in f32 and cast: the mask is -inf and 0, both exact in
+            // f16, so this loses nothing.
+            causal_mask: ops::causal_mask(seq, device)?.to_dtype(dtype)?,
             positions: Tensor::arange(0u32, seq as u32, device)?,
+            dtype,
             text_projection: match cfg.projection_dim {
                 // No bias: `CLIPTextModelWithProjection` uses
                 // `nn.Linear(hidden, projection, bias=False)`.
@@ -358,6 +365,16 @@ impl ClipTextEncoder {
         }
         let pooled = Tensor::cat(&rows, 0)?;
         Ok(Some(projection.forward(&pooled)?))
+    }
+
+    /// The dtype this encoder's weights are in.
+    ///
+    /// Callers hand it token ids and get this back; anything concatenated with
+    /// the result has to match. Exposed because the pipeline runs the models
+    /// in f16 and the sampler in f32, so it needs to know where the boundary
+    /// is rather than assume.
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// The embedding sum, before any encoder layer. Step 3 of the forward.

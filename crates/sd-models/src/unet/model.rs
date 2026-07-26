@@ -6,7 +6,7 @@
 //! alongside its input.
 
 use sd_tensor::nn::{conv2d, group_norm, Conv2d, Conv2dConfig, GroupNorm};
-use sd_tensor::{ops, Module, Result, Tensor, VarBuilder};
+use sd_tensor::{ops, DType, Module, Result, Tensor, VarBuilder};
 
 use super::blocks::{AttentionSpec, BlockConfig, DownBlock2D, MidBlock2DCrossAttn, UpBlock2D};
 use super::embeddings::{timestep_embedding, TimestepEmbedding};
@@ -144,6 +144,11 @@ pub struct UNet2DConditionModel {
     conv_out: Conv2d,
     /// `block_out_channels[0]`, the width of the raw sinusoid.
     freq_dim: usize,
+    /// The weights' dtype. `timestep_embedding` computes in f32 for accuracy —
+    /// the frequencies span several orders of magnitude — and the result is
+    /// cast here. Without that, f16 weights meet an f32 embedding and the
+    /// first linear fails on a dtype mismatch.
+    dtype: DType,
     /// SDXL only. Projects the micro-conditioning into the time embedding.
     add_embedding: Option<(TimestepEmbedding, AdditionEmbedding)>,
 }
@@ -271,6 +276,7 @@ impl UNet2DConditionModel {
             )?,
             conv_out: conv3x3(first, cfg.out_channels, vb.pp("conv_out"))?,
             freq_dim: first,
+            dtype: vb.dtype(),
             add_embedding: match cfg.addition {
                 Some(add) => Some((
                     TimestepEmbedding::new(
@@ -283,6 +289,14 @@ impl UNet2DConditionModel {
                 None => None,
             },
         })
+    }
+
+    /// The dtype this UNet's weights are in.
+    ///
+    /// `sample` and `context` must arrive in it, and the output comes back in
+    /// it. The pipeline keeps the sampler in f32 and casts at this boundary.
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// `sample`: `[b, 4, h, w]`, `timestep`: `[b]`, `context`: `[b, 77, dim]`.
@@ -324,7 +338,7 @@ impl UNet2DConditionModel {
     ) -> Result<(Tensor, Vec<Tensor>, Tensor)> {
         // `timestep` is [b], not a scalar: a scalar yields [1, 1280] where
         // [b, 1280] is needed, and that only surfaces deep inside a resnet.
-        let temb = timestep_embedding(timestep, self.freq_dim)?;
+        let temb = timestep_embedding(timestep, self.freq_dim)?.to_dtype(self.dtype)?;
         let temb = self.time_embedding.forward(&temb)?;
 
         let temb = match (&self.add_embedding, added) {
@@ -333,7 +347,8 @@ impl UNet2DConditionModel {
                 // flattened and concatenated with the pooled text embedding.
                 let (b, n) = time_ids.dims2()?;
                 let flat = time_ids.flatten_all()?;
-                let sinusoid = timestep_embedding(&flat, cfg.time_embed_dim)?;
+                let sinusoid =
+                    timestep_embedding(&flat, cfg.time_embed_dim)?.to_dtype(self.dtype)?;
                 let sinusoid = sinusoid.reshape((b, n * cfg.time_embed_dim))?;
                 // Pooled text embedding **first**, then the time sinusoid.
                 // The halves are 1280 and 1536, so either order sums to 2816

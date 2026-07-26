@@ -301,12 +301,27 @@ which on a 36 GiB machine shared with other work leaves too little for the
 decode — SDXL fails at 768 as well as 1024, while the same tiled decode
 succeeds standalone.
 
-The fix is to stop upcasting: hold the UNet and text encoders in f16 and keep
-only the VAE in f32, which is what every other implementation does and what
-the SDXL VAE's known fp16 overflow requires. That halves residency to about
-7 GB. It is dtype plumbing through the pipeline rather than a one-line
-change — `timestep_embedding` and the sinusoid helpers currently produce f32
-unconditionally — so it is the next piece of work, not a footnote to this one.
+**Fixed by holding the models in f16.** The SDXL pipeline now loads the UNet
+and both text encoders as f16 and keeps only the VAE in f32, halving
+residency to about 7 GB. SDXL renders at its native 1024 on Metal in 89 s —
+see `assets/sdxl-crab-1024-metal-f16.png`.
+
+Three things had to stay f32, and each for a stated reason:
+
+- **the VAE.** SDXL's overflows in fp16 — a well-known defect, which is why
+  `madebyollin/sdxl-vae-fp16-fix` exists. At 167 MB, keeping it f32 costs
+  nothing worth having.
+- **the sampler.** Sigmas reach 14.6, and `sigma^2 + 1` in the input scaling
+  would lose precision in f16 for no benefit — the latent is tiny beside the
+  weights.
+- **the timestep sinusoids.** Their frequencies span several orders of
+  magnitude, so they are computed in f32 and cast to the model dtype at the
+  boundary. `UNet2DConditionModel::dtype()` and
+  `ClipTextEncoder::dtype()` expose where that boundary is, so callers cast
+  deliberately rather than by assumption.
+
+SD 1.5 still runs entirely in f32: it fits comfortably, and changing it would
+mean re-verifying every golden test against f16 tolerances for no gain.
 
 ## When to revisit
 

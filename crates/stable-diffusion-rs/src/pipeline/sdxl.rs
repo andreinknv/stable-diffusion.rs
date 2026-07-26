@@ -25,6 +25,21 @@ use super::{PipelineError, ProgressFn, SamplerKind, Txt2ImgConfig};
 /// SDXL's second tokenizer pads with `!`, not `<|endoftext|>`.
 const TOKENIZER_2_PAD: &str = "!";
 
+/// Dtype for the UNet and text encoders.
+///
+/// SDXL's checkpoints ship as fp16. Upcasting them to f32 doubles what sits
+/// on the GPU — 13.9 GB for this model, 10.3 GB of it the UNet — which does
+/// not leave room for a decode on a 36 GiB machine. Holding them in f16
+/// roughly halves that, and is what every other implementation does.
+const MODEL_DTYPE: DType = DType::F16;
+
+/// Dtype for the VAE, and for the sampler's own arithmetic.
+///
+/// Deliberately not f16. SDXL's VAE overflows in fp16 — a well-known defect,
+/// which is why `madebyollin/sdxl-vae-fp16-fix` exists — and it is small
+/// enough (167 MB) that keeping it in f32 costs nothing worth having.
+const VAE_DTYPE: DType = DType::F32;
+
 /// A loaded SDXL pipeline.
 pub struct SdxlPipeline {
     tokenizer: ClipTokenizer,
@@ -72,16 +87,16 @@ impl SdxlPipeline {
         let tokenizer = ClipTokenizer::from_file(&tok_path)?;
         let tokenizer_2 = ClipTokenizer::from_file(&tok2_path)?.with_pad_token(TOKENIZER_2_PAD)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&te_path], DType::F32, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&te_path], MODEL_DTYPE, device)?;
         let text_encoder = ClipTextEncoder::new(&ClipTextConfig::sdxl_1(), vb)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&te2_path], DType::F32, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&te2_path], MODEL_DTYPE, device)?;
         let text_encoder_2 = ClipTextEncoder::new(&ClipTextConfig::sdxl_2(), vb)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&unet_path], DType::F32, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&unet_path], MODEL_DTYPE, device)?;
         let unet = UNet2DConditionModel::new(&UNetConfig::sdxl(), vb)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&vae_path], DType::F32, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&vae_path], VAE_DTYPE, device)?;
         // SDXL's VAE differs from SD 1.5's only in `scaling_factor`.
         let vae = AutoencoderKlDecoder::new(&VaeConfig::sdxl(), vb).map_err(|source| {
             PipelineError::VaeWeights {
@@ -158,6 +173,8 @@ impl SdxlPipeline {
         // than it was, measurably degrades output — these are conditioning
         // inputs the model was trained on, not metadata.
         let (h, w) = (cfg.height as f32, cfg.width as f32);
+        // The sinusoid inside the UNet is computed in f32 and cast there, so
+        // these stay f32.
         let time_ids = Tensor::new(&[h, w, 0.0, 0.0, h, w], &self.device)?
             .reshape((1, 6))?
             .repeat((2, 1))?;
@@ -179,9 +196,20 @@ impl SdxlPipeline {
             let t = super::sigma_to_timestep(&self.schedule, sigma);
             let timestep = Tensor::new(&[t as f32, t as f32], &self.device)?;
 
+            // Into the model's dtype for the forward, and straight back out.
+            // The latent and every sigma calculation stay f32: they are tiny
+            // next to the weights, and f16 has neither the range for a sigma
+            // of 14.6 squared nor the precision for the guidance subtraction.
             let out = self
                 .unet
-                .forward_sdxl(&latent_in, &timestep, &context, &pooled, &time_ids)?;
+                .forward_sdxl(
+                    &latent_in.to_dtype(self.unet.dtype())?,
+                    &timestep,
+                    &context,
+                    &pooled,
+                    &time_ids,
+                )?
+                .to_dtype(VAE_DTYPE)?;
             let out_uncond = out.narrow(0, 0, 1)?;
             let out_cond = out.narrow(0, 1, 1)?;
             let noise_pred = (&out_uncond + ((out_cond - &out_uncond)? * cfg.cfg_scale)?)?;

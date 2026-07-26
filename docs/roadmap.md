@@ -67,7 +67,7 @@ leave the order-1 range; `testing::assert_close` is absolute-only.
 | ✅ | img2img | works; strength verified visually at 0.35 and 0.75 |
 | ✅ | SDXL — text encoder 2 | verified vs `transformers` |
 | ✅ | SDXL — UNet | verified vs `diffusers`, max_abs 1.4e-5 |
-| 🔴 | SDXL — end to end | correct on CPU; Metal needs f16 weights to fit |
+| ✅ | SDXL — end to end | 1024 on Metal in 89 s, f16 weights + tiled decode |
 | ⬜ | GGUF loading, then k-quants | |
 | ⬜ | Metal and CUDA paths through the seam | Metal verified end to end |
 
@@ -82,12 +82,11 @@ Remaining milestone 2 work:
 - GGUF loading, then k-quant dequantization (`Q4_K`, `Q5_K`, `Q8_0` first —
   they cover most community models)
 - CUDA through the seam. Metal is verified end to end at 512; CUDA is untested.
-- **f16 weight residency.** The pipeline upcasts fp16 checkpoints to f32, so
-  SDXL keeps 13.9 GB on the GPU before any activation — it will not fit
-  alongside a decode on a 36 GiB machine. Hold the UNet and text encoders in
-  f16 and keep the VAE in f32 (its fp16 overflow is well known). Roughly halves
-  residency. Needs dtype plumbing: `timestep_embedding` and friends produce f32
-  unconditionally today. This is the last thing between SDXL and working on GPU.
+- **SD 1.5 in f16 too**, if it is ever worth it. SDXL needed it to fit; SD 1.5
+  does not, and switching would mean re-verifying every golden test against f16
+  tolerances. Measure first.
+- **img2img and SDXL together.** The SDXL pipeline is txt2img only; the encoder
+  and `Strength` already exist, so this is composition rather than new maths.
 
 ## Milestone 3 — breadth
 
