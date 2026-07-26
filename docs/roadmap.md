@@ -12,7 +12,7 @@ Ordered by **ops validated per unit of effort**, with visible output early.
 | ✅ | VAE decoder — numerical vs `diffusers` | verified, max_abs 3.7e-5 |
 | ✅ | CLIP tokenizer (BPE) | verified id-for-id vs HuggingFace |
 | ✅ | CLIP text encoder | verified layer by layer vs `transformers` |
-| ⬜ | UNet | |
+| ✅ | UNet | verified: 12 skips, mid block, output vs `diffusers` |
 | ⬜ | Euler ancestral, DPM++ 2M | |
 | ⬜ | `sdrs txt2img` | |
 
@@ -28,9 +28,14 @@ references are ~460 MB and stay out of git, so this remains a local step.
 The CLIP tokenizer matches HuggingFace id for id, and the text encoder matches
 `transformers` layer by layer. Both halves of the conditioning path are done.
 
-Next concrete task: the **UNet** (docs/agent-tasks/03 through 05), which is the
-large one — build it block by block and verify each against golden data rather
-than waiting for a whole-model comparison.
+The UNet is done and verified end to end (tasks 03-05): timestep embedding,
+time-conditioned resnets, the spatial transformer, and the assembly, each
+checked against `diffusers` at `atol = 1e-4` — including all twelve skip
+tensors individually, which is what makes a failure localizable across 25
+blocks.
+
+Next concrete task: the **samplers** (docs/agent-tasks/06), then `txt2img`
+(07), which is the point at which an image comes out of the end.
 
 A note for whoever verifies it. CLIP's activations peak at 851 and f32 cannot
 hold 1e-4 absolute at that magnitude, so `golden_clip_encoder.rs` compares with
