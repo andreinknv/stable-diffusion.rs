@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use sd_models::clip::{ClipTextConfig, ClipTextEncoder, ClipTokenizer};
 use sd_models::unet::{UNet2DConditionModel, UNetConfig};
-use sd_models::vae::{AutoencoderKlDecoder, VaeConfig};
+use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, VaeConfig};
 use sd_sample::{euler_ancestral_step, sigmas_for_steps, DpmSolverPlusPlus2M, Schedule};
 use sd_tensor::rng::SeededRng;
 use sd_tensor::{DType, Device, Tensor};
@@ -86,12 +86,57 @@ pub enum PipelineError {
 /// a 20-step CPU run needs it — it takes minutes and otherwise looks hung.
 pub type ProgressFn<'a> = &'a mut dyn FnMut(usize, usize, f64);
 
+/// How much of the schedule an img2img run replaces.
+///
+/// `1.0` ignores the input entirely; `0.0` returns it unchanged. The value
+/// selects where in the sigma ladder to start: at strength `s` with `n` steps,
+/// the run begins at index `n - round(n*s)` and executes the remaining steps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Strength(f64);
+
+impl Strength {
+    /// Clamped to `[0, 1]`; anything outside is a caller error, not a mode.
+    pub fn new(v: f64) -> Self {
+        Self(v.clamp(0.0, 1.0))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+
+    /// Index into a `steps + 1` sigma ladder at which to begin.
+    ///
+    /// Public because it is the whole meaning of the parameter: `steps -
+    /// start_index(steps)` is how much work a run will actually do, and a
+    /// caller sizing a progress bar or a time estimate needs it.
+    pub fn start_index(self, steps: usize) -> usize {
+        let run = (steps as f64 * self.0).round() as usize;
+        steps.saturating_sub(run.min(steps))
+    }
+}
+
+impl Default for Strength {
+    fn default() -> Self {
+        Self(0.75)
+    }
+}
+
+/// Everything an img2img generation needs.
+#[derive(Debug, Clone)]
+pub struct Img2ImgConfig {
+    pub base: Txt2ImgConfig,
+    /// Source image, resized to `base.width` x `base.height` on load.
+    pub init_image: std::path::PathBuf,
+    pub strength: Strength,
+}
+
 /// A loaded SD 1.5 pipeline.
 pub struct Txt2ImgPipeline {
     tokenizer: ClipTokenizer,
     text_encoder: ClipTextEncoder,
     unet: UNet2DConditionModel,
     vae: AutoencoderKlDecoder,
+    vae_encoder: AutoencoderKlEncoder,
     schedule: Schedule,
     device: Device,
 }
@@ -161,11 +206,22 @@ impl Txt2ImgPipeline {
             }
         })?;
 
+        // Same file, both halves. The encoder is only used by img2img, but it
+        // is cheap to build and mmap means the weights are not read twice.
+        let vb = sd_loader::safetensors_var_builder(&[&vae_path], DType::F32, device)?;
+        let vae_encoder = AutoencoderKlEncoder::new(&VaeConfig::sd15(), vb).map_err(|source| {
+            PipelineError::VaeWeights {
+                path: vae_path.clone(),
+                source,
+            }
+        })?;
+
         Ok(Self {
             tokenizer,
             text_encoder,
             unet,
             vae,
+            vae_encoder,
             schedule: Schedule::sd15(),
             device: device.clone(),
         })
@@ -215,11 +271,35 @@ impl Txt2ImgPipeline {
         let mut rng = SeededRng::new(cfg.seed);
         // Scaled by the first sigma — unit-variance noise gives washed-out
         // output.
-        let mut latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+        let latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
 
+        let latent = self.denoise(cfg, latent, &sigmas, &context, &mut rng, progress)?;
+
+        // `decode` applies the scaling factor; `decode_raw` does not. Using
+        // the latter here would double-scale.
+        Ok(self.vae.decode(&latent)?)
+    }
+
+    /// The sampling loop, shared by txt2img and img2img.
+    ///
+    /// `sigmas` is a full ladder of `n + 1` boundaries; img2img passes a
+    /// suffix of one. `rng` is threaded in rather than created here so the
+    /// caller controls draw order, which is what makes a seed reproducible.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise(
+        &self,
+        cfg: &Txt2ImgConfig,
+        mut latent: Tensor,
+        sigmas: &[f64],
+        context: &Tensor,
+        rng: &mut SeededRng,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let (lh, lw) = (cfg.height / 8, cfg.width / 8);
+        let steps = sigmas.len().saturating_sub(1);
         let mut dpm = DpmSolverPlusPlus2M::new();
 
-        for i in 0..cfg.steps {
+        for i in 0..steps {
             let sigma = sigmas[i];
             let sigma_next = sigmas[i + 1];
 
@@ -232,7 +312,7 @@ impl Txt2ImgPipeline {
             let t = sigma_to_timestep(&self.schedule, sigma);
             let timestep = Tensor::new(&[t as f32, t as f32], &self.device)?;
 
-            let out = self.unet.forward(&latent_in, &timestep, &context)?;
+            let out = self.unet.forward(&latent_in, &timestep, context)?;
             let out_uncond = out.narrow(0, 0, 1)?;
             let out_cond = out.narrow(0, 1, 1)?;
             let noise_pred = (&out_uncond + ((out_cond - &out_uncond)? * cfg.cfg_scale)?)?;
@@ -248,11 +328,63 @@ impl Txt2ImgPipeline {
                 SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next)?,
             };
 
-            progress(i + 1, cfg.steps, sigma);
+            progress(i + 1, steps, sigma);
+        }
+        Ok(latent)
+    }
+
+    /// Generate from an existing image. Returns `[1, 3, height, width]`.
+    pub fn run_img2img(&self, cfg: &Img2ImgConfig) -> Result<Tensor, PipelineError> {
+        self.run_img2img_with_progress(cfg, &mut |_, _, _| {})
+    }
+
+    /// [`Self::run_img2img`], reporting progress after each step.
+    pub fn run_img2img_with_progress(
+        &self,
+        cfg: &Img2ImgConfig,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let base = &cfg.base;
+        if base.width % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("width", base.width));
+        }
+        if base.height % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("height", base.height));
+        }
+        if base.steps == 0 {
+            return Err(PipelineError::NoSteps);
         }
 
-        // `decode` applies the scaling factor; `decode_raw` does not. Using
-        // the latter here would double-scale.
+        let cond = self.encode(&base.prompt)?;
+        let uncond = self.encode(&base.negative_prompt)?;
+        let context = Tensor::cat(&[&uncond, &cond], 0)?;
+
+        let image = crate::image_io::load_image(
+            &cfg.init_image,
+            base.width as u32,
+            base.height as u32,
+            &self.device,
+        )?;
+        // The distribution mean, not a draw from it: the sampler supplies all
+        // the randomness, so this stays a function of the seed alone.
+        let latent = self.vae_encoder.encode(&image)?;
+
+        let sigmas = sigmas_for_steps(&self.schedule, base.steps);
+        let start = cfg.strength.start_index(base.steps);
+        // Strength 0 means "return the input", and there is nothing to run.
+        if start >= base.steps {
+            return Ok(self.vae.decode(&latent)?);
+        }
+
+        let mut rng = SeededRng::new(base.seed);
+        let (lh, lw) = (base.height / 8, base.width / 8);
+        // Noise the encoded latent to the sigma the run starts at. This is
+        // what makes strength mean something: a later start is less noise and
+        // so a smaller departure from the input.
+        let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+        let latent = (latent + (noise * sigmas[start])?)?;
+
+        let latent = self.denoise(base, latent, &sigmas[start..], &context, &mut rng, progress)?;
         Ok(self.vae.decode(&latent)?)
     }
 }

@@ -113,7 +113,7 @@ fn conv3x3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
 
 /// `ResnetBlock2D` without time embedding (the VAE variant).
 #[derive(Debug)]
-struct ResnetBlock {
+pub(super) struct ResnetBlock {
     norm1: GroupNorm,
     conv1: Conv2d,
     norm2: GroupNorm,
@@ -123,7 +123,13 @@ struct ResnetBlock {
 }
 
 impl ResnetBlock {
-    fn new(in_c: usize, out_c: usize, groups: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+    pub(super) fn new(
+        in_c: usize,
+        out_c: usize,
+        groups: usize,
+        eps: f64,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let norm1 = group_norm(groups, in_c, eps, vb.pp("norm1"))?;
         let conv1 = conv3x3(in_c, out_c, vb.pp("conv1"))?;
         let norm2 = group_norm(groups, out_c, eps, vb.pp("norm2"))?;
@@ -148,7 +154,7 @@ impl ResnetBlock {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let h = self.norm1.forward(xs)?;
         let h = ops::silu(&h)?;
         let h = self.conv1.forward(&h)?;
@@ -235,14 +241,14 @@ impl Upsample2D {
 
 /// `UNetMidBlock2D`: resnet, attention, resnet.
 #[derive(Debug)]
-struct MidBlock {
+pub(super) struct MidBlock {
     resnet_in: ResnetBlock,
     attention: AttentionBlock,
     resnet_out: ResnetBlock,
 }
 
 impl MidBlock {
-    fn new(channels: usize, groups: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+    pub(super) fn new(channels: usize, groups: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let resnets = vb.pp("resnets");
         Ok(Self {
             resnet_in: ResnetBlock::new(channels, channels, groups, eps, resnets.pp("0"))?,
@@ -251,7 +257,7 @@ impl MidBlock {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let h = self.resnet_in.forward(xs)?;
         let h = self.attention.forward(&h)?;
         self.resnet_out.forward(&h)

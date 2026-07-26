@@ -111,6 +111,17 @@ def dump_vae(output: pathlib.Path, model_id: str) -> None:
     weights = {k: v.detach().contiguous().clone() for k, v in vae.state_dict().items()}
     save_file(weights, str(out / "vae.safetensors"))
 
+    # Encoder references. The encoder is what img2img needs, and its
+    # downsampler pads asymmetrically — one row at the bottom, one column at
+    # the right — so a symmetric implementation produces a half-pixel shift
+    # per level that only a numerical comparison catches.
+    image = torch.randn(1, 3, 256, 256, generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        moments = vae.quant_conv(vae.encoder(image))
+    tensors["encoder_input"] = image.contiguous()
+    tensors["encoder_moments"] = moments.detach().contiguous().clone()
+    save_file(tensors, str(out / "reference.safetensors"))
+
     # Also link the *raw* checkpoint, unmodified. `vae.safetensors` above went
     # through `state_dict()`, which silently renames the legacy attention keys
     # on load — so it cannot catch a loader that only understands the modern

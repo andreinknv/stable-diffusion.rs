@@ -177,3 +177,40 @@ fn an_oversized_decode_is_refused_before_it_allocates() {
         "unexpected error: {err}"
     );
 }
+
+/// The encoder, which img2img needs. Its downsampler pads asymmetrically —
+/// bottom and right only — and a symmetric `padding: 1` produces the right
+/// shape with a half-pixel shift per level. Only a numerical comparison sees
+/// that, which is why this test exists rather than a shape check.
+#[test]
+fn encoder_matches_diffusers_reference() {
+    let path = golden_path();
+    let vae_weights = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/vae_decoder/vae.safetensors");
+    if !path.exists() || !vae_weights.exists() {
+        eprintln!("SKIP encoder_matches_diffusers_reference: no reference data.");
+        return;
+    }
+
+    let dev = Device::Cpu;
+    let refs = sd_tensor::safetensors::load(&path, &dev).expect("loading reference tensors");
+    let Some(image) = refs.get("encoder_input") else {
+        eprintln!("SKIP: reference predates the encoder; regenerate it.");
+        return;
+    };
+    let expected = refs.get("encoder_moments").expect("encoder_moments");
+
+    let vb = sd_loader::safetensors_var_builder(&[&vae_weights], DType::F32, &dev)
+        .expect("loading VAE weights");
+    let encoder = sd_models::vae::AutoencoderKlEncoder::new(&VaeConfig::sd15(), vb)
+        .expect("building encoder");
+
+    let (mean, logvar) = encoder.encode_dist(image).expect("encode_dist");
+    // The reference is the concatenated moments; compare the halves we split.
+    let got = sd_tensor::Tensor::cat(&[&mean, &logvar], 1).expect("cat");
+    assert_eq!(got.dims(), expected.dims());
+
+    let c = testing::closeness(&got, expected).expect("comparing tensors");
+    eprintln!("vae encoder vs diffusers: {c}");
+    testing::assert_close(&got, expected, testing::DEFAULT_ATOL, "vae encoder moments").unwrap();
+}

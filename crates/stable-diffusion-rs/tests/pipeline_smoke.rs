@@ -138,3 +138,93 @@ fn end_to_end_produces_finite_image_in_range() {
     assert!(max <= 1.5, "values outside [-1.5, 1.5]: max abs {max}");
     eprintln!("end-to-end ok: {:?}, max abs {max:.4}", img.dims());
 }
+
+// -- img2img ---------------------------------------------------------------
+
+#[test]
+fn strength_selects_where_in_the_schedule_to_start() {
+    use stable_diffusion_rs::pipeline::Strength;
+
+    // 1.0 replaces everything: start at 0 and run all 20 steps, which is the
+    // same work txt2img does.
+    assert_eq!(Strength::new(1.0).get(), 1.0);
+    // 0.0 keeps the input: nothing left to run.
+    assert_eq!(Strength::new(0.0).get(), 0.0);
+    // Out of range is a caller error, not a mode — clamp rather than wrap or
+    // panic, since a negative strength has no sensible meaning.
+    assert_eq!(Strength::new(-1.0).get(), 0.0);
+    assert_eq!(Strength::new(7.0).get(), 1.0);
+    // The documented default.
+    assert_eq!(Strength::default().get(), 0.75);
+}
+
+#[test]
+fn strength_maps_to_the_number_of_steps_actually_run() {
+    use stable_diffusion_rs::pipeline::Strength;
+
+    // This mapping *is* the feature: strength is only meaningful as "how many
+    // of the steps get replaced", and an off-by-one here shows up as an image
+    // that is subtly too close to, or too far from, the input.
+    let steps = 20;
+    assert_eq!(Strength::new(1.0).start_index(steps), 0, "full run");
+    assert_eq!(
+        Strength::new(0.0).start_index(steps),
+        steps,
+        "nothing to run"
+    );
+    assert_eq!(Strength::new(0.75).start_index(steps), 5, "15 of 20 steps");
+    assert_eq!(Strength::new(0.5).start_index(steps), 10);
+
+    // Monotonic: more strength never means less work.
+    let mut prev = usize::MAX;
+    for i in 0..=10 {
+        let idx = Strength::new(i as f64 / 10.0).start_index(steps);
+        assert!(idx <= prev, "start index must not increase with strength");
+        prev = idx;
+    }
+
+    // Never runs past the end of the ladder, whatever the step count.
+    for steps in [1usize, 3, 20, 50] {
+        for s in [0.0, 0.01, 0.5, 0.99, 1.0] {
+            assert!(Strength::new(s).start_index(steps) <= steps);
+        }
+    }
+}
+
+#[test]
+fn img2img_round_trips_an_image_through_the_encoder() {
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP img2img_round_trips_an_image_through_the_encoder: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let Ok(init) = std::env::var("SD_TEST_INIT_IMAGE") else {
+        eprintln!("SKIP: set SD_TEST_INIT_IMAGE to a source image.");
+        return;
+    };
+
+    use stable_diffusion_rs::pipeline::{Img2ImgConfig, Strength, Txt2ImgPipeline};
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+
+    let cfg = Img2ImgConfig {
+        base: Txt2ImgConfig {
+            prompt: "a watercolour painting of a crab".to_string(),
+            width: 256,
+            height: 256,
+            steps: 12,
+            seed: 42,
+            ..Default::default()
+        },
+        init_image: std::path::PathBuf::from(&init),
+        strength: Strength::new(0.6),
+    };
+    let img = pipeline.run_img2img(&cfg).expect("running img2img");
+
+    assert_eq!(img.dims(), &[1, 3, 256, 256]);
+    let values = img.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert!(values.iter().all(|v| v.is_finite()), "img2img produced NaN");
+    let max = values.iter().fold(0f32, |m, v| m.max(v.abs()));
+    assert!(max <= 1.5, "values outside [-1.5, 1.5]: max abs {max}");
+    eprintln!("img2img ok: {:?}, max abs {max:.4}", img.dims());
+}

@@ -27,6 +27,35 @@ pub fn tensor_to_rgb8(xs: &Tensor) -> Result<(u32, u32, Vec<u8>)> {
     Ok((w as u32, h as u32, bytes))
 }
 
+/// Read an image file into a `[1, 3, h, w]` tensor in `[-1, 1]`.
+///
+/// The inverse of [`tensor_to_rgb8`], for img2img. Resizes to `(width,
+/// height)` with a Lanczos filter — both must be multiples of 8, since the
+/// encoder reduces by that factor and a non-multiple silently truncates.
+pub fn load_image<P: AsRef<std::path::Path>>(
+    path: P,
+    width: u32,
+    height: u32,
+    device: &sd_tensor::Device,
+) -> Result<Tensor> {
+    let img = image::open(path.as_ref())
+        .map_err(|e| sd_tensor::Error::Msg(format!("failed to read image: {e}")))?;
+    let img = img
+        .resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+        .to_rgb8();
+
+    // [0, 255] -> [-1, 1], interleaved RGB -> CHW.
+    let data: Vec<f32> = img
+        .as_raw()
+        .iter()
+        .map(|&b| b as f32 / 127.5 - 1.0)
+        .collect();
+    Tensor::from_vec(data, (height as usize, width as usize, 3), device)?
+        .permute((2, 0, 1))?
+        .contiguous()?
+        .unsqueeze(0)
+}
+
 /// Write a decoder output tensor to a PNG.
 pub fn save_png<P: AsRef<std::path::Path>>(xs: &Tensor, path: P) -> Result<()> {
     let (w, h, bytes) = tensor_to_rgb8(xs)?;
