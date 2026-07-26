@@ -488,6 +488,113 @@ def dump_unet_full(output: pathlib.Path, model_id: str) -> None:
     print(f"linked {link} -> {weights}")
 
 
+SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
+
+
+def dump_samplers(output: pathlib.Path, _model_id: str) -> None:
+    """Reference steps for Euler ancestral and DPM++ 2M.
+
+    Deliberately does not import k-diffusion. The formulas are written out in
+    numpy right here so the Rust and Python sides are visibly the same
+    equations rather than two libraries that agree for unknown reasons.
+    """
+    torch = _require("torch")
+    np = _require("numpy")
+    from safetensors.torch import save_file
+
+    out = output / "samplers"
+    out.mkdir(parents=True, exist_ok=True)
+
+    shape = (1, 4, 8, 8)
+    x0 = np.random.default_rng(0).standard_normal(shape).astype("float32")
+    denoised = np.random.default_rng(1).standard_normal(shape).astype("float32")
+    noise = np.random.default_rng(2).standard_normal(shape).astype("float32")
+
+    tensors = {
+        "x": torch.from_numpy(x0),
+        "denoised": torch.from_numpy(denoised),
+        "noise": torch.from_numpy(noise),
+    }
+
+    # -- Part A: the sampling sigma schedule -----------------------------
+    #
+    #   step = (len(train) - 1) / (n - 1)
+    #   idx  = (n - 1 - i) * step        <- descending
+    #   out  = lerp(train[floor(idx)], train[floor(idx)+1], frac)
+    #   then a trailing 0.0
+    betas = np.linspace(0.00085**0.5, 0.012**0.5, 1000, dtype=np.float64) ** 2
+    alphas_cumprod = np.cumprod(1.0 - betas)
+    train = np.sqrt((1.0 - alphas_cumprod) / alphas_cumprod)
+
+    n = 20
+    step = (len(train) - 1) / (n - 1)
+    sigmas_20 = []
+    for i in range(n):
+        idx = (n - 1 - i) * step
+        lo = int(np.floor(idx))
+        hi = min(lo + 1, len(train) - 1)
+        frac = idx - lo
+        sigmas_20.append(train[lo] * (1.0 - frac) + train[hi] * frac)
+    sigmas_20.append(0.0)
+    tensors["sigmas_20"] = torch.tensor(sigmas_20, dtype=torch.float64)
+
+    # -- Part B: Euler ancestral, one step per sigma pair ----------------
+    #
+    #   sigma_up   = min(s_next, sqrt(s_next^2 * (s^2 - s_next^2) / s^2))
+    #   sigma_down = sqrt(max(0, s_next^2 - sigma_up^2))
+    #   d = (x - denoised) / sigma
+    #   x = x + d * (sigma_down - sigma)
+    #   x = x + noise * sigma_up      (only when s_next > 0)
+    for i in range(len(SAMPLER_SIGMAS) - 1):
+        s, s_next = SAMPLER_SIGMAS[i], SAMPLER_SIGMAS[i + 1]
+        sigma_up = min(s_next, np.sqrt(s_next**2 * (s**2 - s_next**2) / s**2))
+        sigma_down = np.sqrt(max(0.0, s_next**2 - sigma_up**2))
+        d = (x0 - denoised) / s
+        stepped = x0 + d * (sigma_down - s)
+        if s_next > 0:
+            stepped = stepped + noise * sigma_up
+        tensors[f"euler_step_{i}"] = torch.from_numpy(stepped.astype("float32"))
+
+    # -- Part C: DPM++ 2M, sequential with carried state -----------------
+    #
+    #   t = -ln(sigma);  h = t_next - t
+    #   first step or s_next == 0:  first-order
+    #   else: r = (t - t_prev) / h
+    #         d = (1 + 1/(2r)) * denoised - (1/(2r)) * prev_denoised
+    #   x_next = (s_next / s) * x - (exp(-h) - 1) * d
+    x_cur = x0.copy()
+    prev_denoised = None
+    prev_t = None
+    for i in range(len(SAMPLER_SIGMAS) - 1):
+        s, s_next = SAMPLER_SIGMAS[i], SAMPLER_SIGMAS[i + 1]
+        if s_next == 0.0:
+            x_cur = denoised.copy()
+            prev_denoised, prev_t = denoised.copy(), -np.log(s)
+        else:
+            t = -np.log(s)
+            t_next = -np.log(s_next)
+            h = t_next - t
+            if prev_denoised is None:
+                d = denoised
+            else:
+                r = (t - prev_t) / h
+                inv = 1.0 / (2.0 * r)
+                d = (1.0 + inv) * denoised - inv * prev_denoised
+            x_cur = (s_next / s) * x_cur - (np.exp(-h) - 1.0) * d
+            prev_denoised, prev_t = denoised.copy(), t
+        tensors[f"dpmpp_step_{i}"] = torch.from_numpy(
+            np.ascontiguousarray(x_cur).astype("float32")
+        )
+
+    save_file({k: v.contiguous() for k, v in tensors.items()}, str(out / "reference.safetensors"))
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    print(f"  sigmas_20[0]={sigmas_20[0]:.4f} .. [-1]={sigmas_20[-1]:.1f} ({len(sigmas_20)} values)")
+    for k in sorted(tensors):
+        if k.startswith(("euler", "dpmpp")):
+            print(f"  {k:<16} {tuple(tensors[k].shape)}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="component", required=True)
@@ -540,8 +647,14 @@ def main() -> None:
     )
     unet_full.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    samplers = sub.add_parser("samplers", help="dump sampler step references")
+    samplers.add_argument("--model-id", default="", help="unused; samplers need no weights")
+    samplers.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     args = ap.parse_args()
-    if args.component == "unet_full":
+    if args.component == "samplers":
+        dump_samplers(args.output, args.model_id)
+    elif args.component == "unet_full":
         dump_unet_full(args.output, args.model_id)
     elif args.component == "unet_attention":
         dump_unet_attention(args.output, args.model_id)

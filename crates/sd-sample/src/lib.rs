@@ -3,6 +3,14 @@
 //! Milestone 1 targets Euler ancestral and DPM++ 2M only. Breadth comes after
 //! the pipeline is verified end to end.
 
+pub mod dpmpp;
+pub mod euler;
+pub mod sigmas;
+
+pub use dpmpp::DpmSolverPlusPlus2M;
+pub use euler::euler_ancestral_step;
+pub use sigmas::sigmas_for_steps;
+
 /// Beta schedule shapes used by Stable Diffusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BetaSchedule {
