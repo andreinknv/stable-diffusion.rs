@@ -118,6 +118,18 @@ cargo run --release -p sd-cli --example backend_bench -- 32
 cargo run --release -p sd-cli --features metal --example backend_bench -- 32
 ```
 
+The benchmark times five decodes after a warm-up and reports a **median with
+its spread**, not a best-of-N. A minimum answers "how fast could this go on a
+quiet machine", which is the wrong question when comparing two implementations:
+it reports whichever one caught the quietest moment. Raise the sample count
+with `SD_BENCH_REPEATS`.
+
+Above ~15% spread it prints a warning and you should not quote the median.
+That is not hypothetical — the numbers in this table were taken on a quiet
+machine, and a later attempt to compare chunk sizes on a loaded one produced a
+71% spread and a median twice the figure below for identical code. **Check the
+spread before believing any comparison, including the ones in this file.**
+
 Mind the argument. Memory is `n^4`, so the next size up costs 16x, and on Metal
 the score matrix is wired GPU memory the OS cannot reclaim — overshooting RAM
 panics the machine rather than failing the process (this has happened, at
