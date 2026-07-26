@@ -275,19 +275,43 @@ is why city96 can publish `Q4_K` for SD 3.5 and nobody can for SD 1.5.
   per backend up front is 8–15 months before anything renders.
 - **A GUI.** A good library first; someone else can build the UI.
 
-## Highest-value optimisation available now
+## ~~Highest-value optimisation available now~~ — resolved without a kernel
 
-**A fused attention kernel for Metal.** Our attention materialises a 4096x4096
-score matrix at 512x512, which makes Metal *slower than CPU* despite being
-4-5x faster at smaller resolutions.
+This entry used to call for a hand-written fused attention kernel for Metal,
+on the grounds that our attention materialises a 4096x4096 score matrix and
+that "candle does not expose [a fused kernel] for our shapes". **That was
+wrong, and checking it before writing the kernel is what caught it.**
 
-Chunked attention (`ops::chunked_attention`) is **done** and bounds the memory,
-which is what makes larger latents reachable at all — but it does not close the
-speed gap, and measurement could not distinguish it from unchunked on a noisy
-machine. Closing the gap needs softmax fused into the matmul so the score
-matrix never reaches memory, which candle does not expose for our shapes. That
-is a hand-written kernel, and it is the remaining work. See
-[backends.md](backends.md) for what was measured and what was not.
+candle 0.11 ships `candle_nn::ops::sdpa`, a fused Metal kernel accepting head
+dimensions of 32, 64, 72, 80, 96, 128, 256 and 512 — which covers Flux (128),
+SD 3.5 (64), T5 (64), CLIP (64) and SDXL (64). `attention_with_path` was
+already routing to it; only the doc comment claiming it was unreachable was
+stale, written when SD 1.5 and SDXL were the only models here.
+
+Measured with `--example attention_path`:
+
+| shape | CPU | Metal | |
+|---|---|---|---|
+| SDXL UNet 1024 | 453.7 ms | **14.8 ms** | fused |
+| Flux 1024 | 957.0 ms | **43.8 ms** | fused |
+| Flux 512 | 108.8 ms | **8.5 ms** | fused |
+| SD 3.5 512 | 37.1 ms | **2.7 ms** | fused |
+| T5-XXL 154 tok | 12.6 ms | **0.3 ms** | fused |
+| SD 1.5 UNet 512 | 110.7 ms | 16.8 ms | chunked |
+
+So Metal is no longer slower than CPU for attention — it is 12-30x faster
+wherever the fused path applies. Chunked attention remains the fallback and
+still earns its place: it bounds the allocation, and it is what SD 1.5's
+40- and 160-wide heads use, along with any masked shape, since the kernel
+wants a `[batch, heads, seq_q, seq_k]` mask and `causal_mask` is `[1, 1, s, s]`.
+
+What is genuinely left is narrower than "write a kernel":
+
+- **Run the diffusion models end to end on Metal.** Every Flux and SD 3.5
+  timing in this document is CPU-only. The attention is now fast; whether the
+  rest of the graph is has not been measured.
+- Broadening the fused path to SD 1.5 by materialising the causal mask to the
+  shape the kernel wants, which is a reshape rather than a kernel.
 
 ## Upstream contributions worth making
 

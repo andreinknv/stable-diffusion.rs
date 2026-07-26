@@ -412,12 +412,24 @@ pub mod ops {
     /// outright — so on any other device we go straight to
     /// [`naive_attention`] rather than paying for a guaranteed failure.
     ///
-    /// Even on Metal the fused kernel declines shapes, and as of candle 0.11
-    /// it declines every shape in this workspace: f32 at `head_dim = 512` (the
-    /// VAE attention block) is explicitly excluded, and a mask must be
-    /// `[batch, heads, seq_q, seq_k]` while [`causal_mask`] is `[1, 1, s, s]`.
-    /// So [`AttentionPath::Fused`] is currently unreachable here. Treat it as
-    /// an optimisation that may arrive, not one already banked.
+    /// On Metal, candle 0.11's fused kernel accepts head dimensions of 32,
+    /// 64, 72, 80, 96, 128, 256 and 512, and it takes every unmasked shape in
+    /// this workspace except SD 1.5's UNet, whose 40- and 160-wide heads are
+    /// not in that set. Measured against the chunked path it is worth having:
+    ///
+    /// ```text
+    ///                              CPU        Metal
+    ///   SDXL UNet 1024        453.7 ms    14.8 ms  fused
+    ///   Flux 1024             957.0 ms    43.8 ms  fused
+    ///   SD 3.5 512             37.1 ms     2.7 ms  fused
+    ///   SD 1.5 UNet 512       110.7 ms    16.8 ms  chunked (d=40)
+    /// ```
+    ///
+    /// It still declines two things worth knowing about: f32 at
+    /// `head_dim = 512`, which exceeds Metal's 32 KB of threadgroup memory,
+    /// and a mask that is not `[batch, heads, seq_q, seq_k]` — [`causal_mask`]
+    /// is `[1, 1, s, s]`, so CLIP's masked attention stays on the chunked
+    /// path. Reproduce with `--example attention_path`.
     ///
     /// Everything else goes to [`chunked_attention`], which reports `Chunked`
     /// when it actually splits and `Naive` when one chunk already covers the
