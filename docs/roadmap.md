@@ -68,7 +68,7 @@ leave the order-1 range; `testing::assert_close` is absolute-only.
 | ✅ | SDXL — text encoder 2 | verified vs `transformers` |
 | ✅ | SDXL — UNet | verified vs `diffusers`, max_abs 1.4e-5 |
 | ✅ | SDXL — end to end | 1024 on Metal in 89 s, f16 weights + tiled decode |
-| 🔴 | GGUF | header reading done (`sdrs inspect`); dequantisation next |
+| 🔴 | GGUF | reads and dequantises; needs a name map for SD checkpoints |
 | ⬜ | Metal and CUDA paths through the seam | Metal verified end to end |
 
 The VAE encoder's downsampler pads **asymmetrically** (bottom and right only).
@@ -79,14 +79,19 @@ any other downsampling path.
 Remaining milestone 2 work:
 
 - SDXL (same geometry, second text encoder, different latent scaling)
-- **GGUF dequantisation.** The header half is done: `sd_loader::GgufInfo`
-  reads metadata and the tensor directory, and `sdrs inspect` prints it. What
-  remains is turning quantised tensors into a `VarBuilder` the models can
-  load. candle already dequantises `Q4_K`/`Q5_K`/`Q8_0`, so this is wiring
-  plus a name mapping, not new numerics.
+- **A name map for SD GGUF checkpoints.** Reading and dequantising both work:
+  `gguf_var_builder` turns any GGUF into a `VarBuilder`, verified on real
+  llama.cpp files. What it does *not* do is rename anything, and that is the
+  last gap. GGUF checkpoints from `stable-diffusion.cpp` carry the original
+  CompVis/LDM parameter names while these models use the `diffusers` names, so
+  the keys will not match.
 
-  The header reader is now tested against real llama.cpp files as well as
-  synthetic ones — `dump_reference.py gguf` links three small fixtures (16 MB
+  That belongs beside the legacy-attention conversion in `sd-loader`, and it
+  wants the same treatment: a real SD GGUF as a fixture, not a guess at the
+  naming. The fixtures used so far are language models — they exercise the
+  format, not the naming.
+
+  The reader is tested against real llama.cpp files as well as synthetic ones — `dump_reference.py gguf` links three small fixtures (16 MB
   to 67 MB). That found one thing immediately: big-endian builds exist, candle
   rejects them as `unsupported magic/version Gguf/50331648`, and we now say
   what that actually means. Still uncovered: non-UTF8 and null-terminated

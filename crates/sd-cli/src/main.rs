@@ -192,6 +192,13 @@ fn main() -> Result<()> {
             );
             println!("tensors:      {}", info.tensors.len());
             println!("parameters:   {:.2} M", info.parameter_count() as f64 / 1e6);
+            // The number that matters before loading: there is no quantised
+            // inference path, so a 4-bit file costs what its expanded weights
+            // cost, not what the file does.
+            println!(
+                "as f32:       {:.2} GB in memory once dequantised",
+                info.dequantised_bytes(DType::F32) as f64 / 1e9
+            );
             println!("quantisation:");
             for (dtype, count) in info.quantisations() {
                 println!("  {count:>6} x {dtype:?}");

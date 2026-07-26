@@ -241,3 +241,99 @@ fn a_big_endian_file_is_named_rather_than_reported_as_corrupt() {
         "should say what to use instead: {msg}"
     );
 }
+
+// -- dequantisation --------------------------------------------------------
+
+#[test]
+fn dequantised_size_is_not_the_file_size() {
+    // The number a caller needs before loading. A Q8_0 file is ~1 byte per
+    // parameter on disk and 4 bytes per parameter once expanded to f32, so
+    // sizing a load from the file is wrong by roughly that factor — and for
+    // Q4_K it is wrong by eight.
+    let Some(p) = fixture("stories15M_MOE-Q8_0.gguf") else {
+        return;
+    };
+    let info = GgufInfo::open(&p).expect("header");
+    let on_disk = std::fs::metadata(&p).expect("stat").len();
+    let expanded = info.dequantised_bytes(sd_tensor::DType::F32);
+
+    assert!(
+        expanded > on_disk * 2,
+        "expanded {expanded} should dwarf the {on_disk} byte file"
+    );
+    assert_eq!(expanded, info.parameter_count() * 4);
+}
+
+#[test]
+fn a_quantised_checkpoint_dequantises_to_usable_tensors() {
+    let Some(p) = fixture("stories15M_MOE-Q8_0.gguf") else {
+        return;
+    };
+    let dev = sd_tensor::Device::Cpu;
+    let info = GgufInfo::open(&p).expect("header");
+    let vb = sd_loader::gguf_var_builder(&p, sd_tensor::DType::F32, &dev)
+        .expect("dequantising a real Q8_0 checkpoint");
+
+    // Every tensor the header advertised must be fetchable at its stated
+    // shape. A dequantiser that dropped or reshaped tensors would pass a
+    // count check and fail here.
+    let mut checked = 0;
+    for (name, (shape, _)) in info.tensors.iter().take(12) {
+        let t = vb
+            .get(shape.clone(), name)
+            .unwrap_or_else(|e| panic!("{name} at {shape:?}: {e}"));
+        assert_eq!(t.dims(), shape.as_slice(), "{name}");
+        let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "{name} dequantised to NaN or inf"
+        );
+        // Q8_0 of a real trained weight should not come back all zeros —
+        // that is what a mis-scaled block would produce.
+        assert!(v.iter().any(|x| *x != 0.0), "{name} is entirely zero");
+        checked += 1;
+    }
+    assert!(checked > 0, "no tensors checked");
+}
+
+#[test]
+fn an_f16_checkpoint_dequantises_too() {
+    // F16 is not quantised, so it exercises the pass-through side of the
+    // same path — a dequantiser that only handled block formats would fail.
+    let Some(p) = fixture("moe_shakespeare15M.gguf") else {
+        return;
+    };
+    let dev = sd_tensor::Device::Cpu;
+    let info = GgufInfo::open(&p).expect("header");
+    let vb = sd_loader::gguf_var_builder(&p, sd_tensor::DType::F32, &dev).expect("dequantising");
+
+    let (name, (shape, _)) = info.tensors.iter().next().expect("at least one tensor");
+    let t = vb.get(shape.clone(), name).expect("fetching a tensor");
+    assert_eq!(t.dims(), shape.as_slice());
+    assert_eq!(t.dtype(), sd_tensor::DType::F32, "requested dtype honoured");
+}
+
+#[test]
+fn a_load_too_large_for_the_machine_is_refused_before_reading() {
+    // The guard has to see the *dequantised* figure, not the file size. With
+    // the headroom pinned to nothing, even a 16 MB file must be refused —
+    // and refused before any tensor data is read.
+    let Some(p) = fixture("moe_shakespeare15M.gguf") else {
+        return;
+    };
+    // SAFETY: single-threaded test process; restored below.
+    unsafe { std::env::set_var(sd_tensor::sysmem::HEADROOM_ENV, "0.0000001") };
+    let result = sd_loader::gguf_var_builder(&p, sd_tensor::DType::F32, &sd_tensor::Device::Cpu);
+    unsafe { std::env::remove_var(sd_tensor::sysmem::HEADROOM_ENV) };
+
+    // VarBuilder has no Debug impl, so match on the Result rather than
+    // using expect_err.
+    let msg = match result {
+        Ok(_) => panic!("a tiny headroom must refuse this load"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("refusing to start"),
+        "should be the memory guard, not a parse error: {msg}"
+    );
+}

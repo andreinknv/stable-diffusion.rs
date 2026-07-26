@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use sd_tensor::gguf::{Content, GgmlDType, Value};
+use sd_tensor::{DType, Device, Tensor, VarBuilder};
 
 use crate::{LoadError, Result};
 
@@ -148,4 +149,68 @@ impl GgufInfo {
             .map(|(shape, _)| shape.iter().map(|&d| d as u64).product::<u64>())
             .sum()
     }
+}
+
+impl GgufInfo {
+    /// Bytes these tensors will occupy once dequantised to `dtype`.
+    ///
+    /// Nothing like the file size. A Q4_K checkpoint dequantised to f32 is
+    /// roughly **eight times** what it takes on disk, and a caller sizing a
+    /// load from the file size will be wrong by that factor.
+    pub fn dequantised_bytes(&self, dtype: DType) -> u64 {
+        self.parameter_count()
+            .saturating_mul(dtype.size_in_bytes() as u64)
+    }
+}
+
+/// Load a GGUF checkpoint as a [`VarBuilder`], dequantising as it goes.
+///
+/// Every tensor is expanded to `dtype` and held in memory — there is no
+/// quantised-inference path here, so a 4-bit checkpoint costs what its
+/// dequantised weights cost, not what the file does. The memory guard is
+/// applied against that expanded figure before any of it is read.
+///
+/// # What this does not do
+///
+/// It does not rename anything. GGUF checkpoints from `stable-diffusion.cpp`
+/// carry the original CompVis/LDM parameter names, while the models here use
+/// the `diffusers` names — so this produces a `VarBuilder` whose keys are
+/// whatever the file called them. Mapping those onto our models is a separate
+/// piece of work, and it belongs beside the legacy-attention conversion in
+/// this crate rather than in the models. See docs/roadmap.md.
+pub fn gguf_var_builder<'a>(
+    path: impl AsRef<Path>,
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'a>> {
+    let info = GgufInfo::open(&path)?;
+    let expanded = info.dequantised_bytes(dtype);
+    sd_tensor::sysmem::check_headroom(
+        expanded,
+        &format!(
+            "dequantising {} ({} tensors) to {dtype:?}",
+            info.path.display(),
+            info.tensors.len()
+        ),
+    )?;
+
+    let mut file = std::fs::File::open(&info.path).map_err(|e| LoadError::Unsupported {
+        path: info.path.clone(),
+        reason: format!("cannot open: {e}"),
+    })?;
+    preflight(&mut file, &info.path)?;
+    let content = Content::read(&mut file)?;
+
+    let mut tensors: HashMap<String, Tensor> = HashMap::with_capacity(content.tensor_infos.len());
+    for name in content.tensor_infos.keys() {
+        let q = content.tensor(&mut file, name, device)?;
+        tensors.insert(name.clone(), q.dequantize(device)?.to_dtype(dtype)?);
+    }
+
+    tracing::debug!(
+        tensors = tensors.len(),
+        bytes = expanded,
+        "dequantised gguf"
+    );
+    Ok(VarBuilder::from_tensors(tensors, dtype, device))
 }
