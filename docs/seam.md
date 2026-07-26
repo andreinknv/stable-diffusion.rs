@@ -44,17 +44,19 @@ grows opinions, it becomes a second thing to debug.
 
 Should it come to that, the work is confined to `sd-tensor`:
 
-1. Implement the same surface on the new backend (`burn` is the credible
-   alternative — a real team behind it, and `cubecl` compiles one kernel source
-   to CUDA/ROCm/wgpu/Metal).
+1. Implement the same surface on the new backend. **But read
+   [backends.md](backends.md) first** — for `burn` specifically the seam does
+   *not* suffice, because burn puts tensor rank in the type
+   (`Tensor<const D: usize>`), which changes every signature in the workspace,
+   not just this crate.
 2. Port the golden tests first. They are backend-agnostic and will tell you
    immediately what broke.
-3. No model crate changes.
 
 The realistic path isn't a wholesale swap, though — it's replacing *one kernel*
-when profiling proves it matters. `ops::scaled_dot_product_attention` is the
-current favourite: it materializes the full `seq × seq` score matrix, which is
-fine for VAE attention and won't be for UNet cross-attention.
+when profiling proves it matters. `ops::scaled_dot_product_attention` is not
+just the current favourite, it is **measured** as the bottleneck: it
+materializes a 4096×4096 score matrix at 512×512, enough to make Metal slower
+than CPU. Numbers in [backends.md](backends.md).
 
 ## Native dependencies
 

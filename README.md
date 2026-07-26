@@ -60,8 +60,12 @@ Metal shader kernels, which no dependency choice can make Rust. Full audit in
 
 That keeps one option open: candle is pre-1.0, maintained largely by one
 person, and — like ggml — tuned for language models rather than diffusion. If a
-kernel becomes the bottleneck, or if candle stalls, we replace it in one crate
-instead of rewriting every model. Cheap to keep, impossible to add later.
+kernel becomes the bottleneck, we replace it in one crate instead of rewriting
+every model. Cheap to keep, impossible to add later.
+
+Why candle and not burn, cubecl or rust-gpu — with benchmarks, and an honest
+account of what the seam does *not* protect against — is in
+[docs/backends.md](docs/backends.md).
 
 ## Build
 

@@ -71,11 +71,18 @@ pub mod ops {
     ///
     /// `q`, `k`, `v` are `[batch, heads, seq, head_dim]`.
     ///
-    /// Deliberately naive: it materialises the full `seq x seq` score matrix.
-    /// For 512x512 VAE attention that is fine; for large UNet cross-attention
-    /// it is not. Replacing this with a fused/flash kernel is the single
-    /// highest-value optimisation available behind the seam, and it can be done
-    /// without touching a line of model code.
+    /// Naive: it materialises the full `seq x seq` score matrix. This is
+    /// **measured to be the dominant cost at production resolution**, not a
+    /// theoretical concern.
+    ///
+    /// A 64x64 latent gives `seq = 4096`, so the score matrix is 4096x4096 f32
+    /// — 67 MB allocated per call, before softmax. On an M4 Max that is enough
+    /// to make Metal *slower than CPU* for a 512x512 VAE decode, despite Metal
+    /// being 4-5x faster at smaller sizes. See docs/backends.md for the table.
+    ///
+    /// Replacing this with chunked or flash attention is the single
+    /// highest-value optimisation available, and — being behind the seam — it
+    /// needs no model code changes at all.
     pub fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
         let dim = q.dim(D::Minus1)?;
         let scale = 1f64 / (dim as f64).sqrt();

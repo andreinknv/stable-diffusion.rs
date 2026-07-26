@@ -43,6 +43,14 @@ architecture is independent and verifiable against its own golden data.
   per backend up front is 8–15 months before anything renders.
 - **A GUI.** A good library first; someone else can build the UI.
 
+## Highest-value optimisation available now
+
+**Chunked / flash attention in `sd-tensor`.** Measured, not speculative: our
+naive attention materialises a 4096x4096 score matrix at 512x512, which makes
+Metal *slower than CPU* despite being 4-5x faster at smaller resolutions. Fully
+behind the seam, so it needs no model code changes, and the existing golden
+tests verify it. See [backends.md](backends.md) for the numbers.
+
 ## Upstream contributions worth making
 
 - **candle: drop the `onig` C dependency.** One-line feature swap, verified to
@@ -55,5 +63,7 @@ architecture is independent and verifiable against its own golden data.
 - BPE tokenizer with a golden test against `transformers`
 - Additional samplers (DDIM, Heun, LMS) against reference trajectories
 - GGUF header parsing (metadata only, before dequantization)
-- CPU `scaled_dot_product_attention` that doesn't materialize the full score
-  matrix — a self-contained win entirely behind the seam
+- Chunked `scaled_dot_product_attention` that doesn't materialize the full
+  score matrix — a self-contained win entirely behind the seam, and currently
+  the biggest one. Benchmark it with
+  `cargo run --release -p sd-cli --features metal --example backend_bench -- 64`
