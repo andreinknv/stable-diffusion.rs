@@ -68,7 +68,7 @@ leave the order-1 range; `testing::assert_close` is absolute-only.
 | ✅ | SDXL — text encoder 2 | verified vs `transformers` |
 | ✅ | SDXL — UNet | verified vs `diffusers`, max_abs 1.4e-5 |
 | ✅ | SDXL — end to end | 1024 on Metal in 89 s, f16 weights + tiled decode |
-| ⬜ | GGUF loading, then k-quants | |
+| 🔴 | GGUF | header reading done (`sdrs inspect`); dequantisation next |
 | ⬜ | Metal and CUDA paths through the seam | Metal verified end to end |
 
 The VAE encoder's downsampler pads **asymmetrically** (bottom and right only).
@@ -79,8 +79,17 @@ any other downsampling path.
 Remaining milestone 2 work:
 
 - SDXL (same geometry, second text encoder, different latent scaling)
-- GGUF loading, then k-quant dequantization (`Q4_K`, `Q5_K`, `Q8_0` first —
-  they cover most community models)
+- **GGUF dequantisation.** The header half is done: `sd_loader::GgufInfo`
+  reads metadata and the tensor directory, and `sdrs inspect` prints it. What
+  remains is turning quantised tensors into a `VarBuilder` the models can
+  load. candle already dequantises `Q4_K`/`Q5_K`/`Q8_0`, so this is wiring
+  plus a name mapping, not new numerics.
+
+  **Point it at a real checkpoint first.** The header tests round-trip through
+  candle's own writer, which does not exercise what makes GGUF hard in
+  practice: non-UTF8 strings, null-terminated strings the spec says are not,
+  and v2 layouts beside v3. candle's reader has a lossy-UTF8 path that exists
+  because real files violate the spec, and none of it is covered yet.
 - CUDA through the seam. Metal is verified end to end at 512; CUDA is untested.
 - **SD 1.5 in f16 too**, if it is ever worth it. SDXL needed it to fit; SD 1.5
   does not, and switching would mean re-verifying every golden test against f16

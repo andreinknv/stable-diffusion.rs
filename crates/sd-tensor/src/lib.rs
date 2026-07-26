@@ -487,6 +487,18 @@ pub mod ops {
     }
 }
 
+/// GGUF, the container almost every quantised community model ships in.
+///
+/// Re-exported rather than reimplemented. candle already parses GGUF and
+/// dequantises the k-quant families, in safe Rust, and a second hand-written
+/// parser for a format with this much variation in the wild would be more
+/// risk than the seam is worth. This is the same bargain the project makes
+/// for tensor math: use it, but only from here.
+pub mod gguf {
+    pub use candle_core::quantized::gguf_file::{write, Content, TensorInfo, Value, ValueType};
+    pub use candle_core::quantized::{GgmlDType, QTensor};
+}
+
 pub mod sysmem;
 
 /// Device selection.

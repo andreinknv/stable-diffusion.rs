@@ -141,6 +141,17 @@ enum Command {
         sdxl: bool,
     },
 
+    /// Report what a GGUF checkpoint contains, without loading it.
+    Inspect {
+        /// Path to a `.gguf` file.
+        #[arg(long)]
+        gguf: String,
+
+        /// Print every metadata key, not just the summary.
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// Report the active compute device and build configuration.
     Info,
 }
@@ -169,6 +180,32 @@ fn main() -> Result<()> {
     };
 
     match cli.command {
+        Command::Inspect { gguf, verbose } => {
+            // Header only — no tensor data is read, so this is instant even
+            // for a checkpoint of several gigabytes.
+            let info =
+                sd::loader::GgufInfo::open(&gguf).with_context(|| format!("reading {gguf}"))?;
+            println!("file:         {}", info.path.display());
+            println!(
+                "architecture: {}",
+                info.architecture().unwrap_or("(not declared)")
+            );
+            println!("tensors:      {}", info.tensors.len());
+            println!("parameters:   {:.2} M", info.parameter_count() as f64 / 1e6);
+            println!("quantisation:");
+            for (dtype, count) in info.quantisations() {
+                println!("  {count:>6} x {dtype:?}");
+            }
+            if verbose {
+                println!("metadata:");
+                let mut keys: Vec<_> = info.metadata.keys().collect();
+                keys.sort();
+                for k in keys {
+                    println!("  {k}");
+                }
+            }
+        }
+
         Command::Info => {
             println!("stable-diffusion.rs {}", sd::VERSION);
             println!("device:  {dev:?}");

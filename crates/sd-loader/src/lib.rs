@@ -11,6 +11,10 @@
 //! equivalent C++ parsers have a CVE history. Keep `unsafe` confined to the
 //! mmap call below and justify any addition.
 
+pub mod gguf;
+
+pub use gguf::GgufInfo;
+
 use std::path::{Path, PathBuf};
 
 use sd_tensor::{DType, Device, VarBuilder};

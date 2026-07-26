@@ -10,8 +10,8 @@ have a binary.
 > **Status: it renders.** Text-to-image and image-to-image work for
 > Stable Diffusion 1.5 and SDXL, on CPU and Apple GPU. Every model component is
 > verified tensor-by-tensor against `diffusers`/`transformers` — not eyeballed.
-> GGUF and quantised weights are **not** implemented yet; CUDA compiles but is
-> untested. See the [roadmap](docs/roadmap.md).
+> GGUF is half done — headers can be read (`sdrs inspect`), quantised weights
+> cannot be loaded yet. CUDA compiles but is untested. See the [roadmap](docs/roadmap.md).
 
 <p align="center">
   <img src="assets/sdxl-crab-1024-metal-f16.png" width="420"
@@ -31,7 +31,7 @@ in spite of it. Three things a Rust implementation gets you:
 - **Memory-safe model loading.** Weight parsers ingest files people download
   from the internet, and the C++ equivalents have a CVE history. Ours is safe
   Rust with `unsafe` confined to a single documented `mmap`. (safetensors
-  today; GGUF is on the roadmap and not yet written.)
+  loads today; GGUF headers parse, its quantised weights do not load yet.)
 - **Embeddable.** A normal crate you add to a Rust application, not an FFI
   boundary you marshal across.
 
