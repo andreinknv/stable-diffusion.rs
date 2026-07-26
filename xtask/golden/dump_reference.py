@@ -621,6 +621,55 @@ def dump_samplers(output: pathlib.Path, _model_id: str) -> None:
             print(f"  {k:<16} {tuple(tensors[k].shape)}")
 
 
+def dump_sdxl_text_encoder_2(output: pathlib.Path, model_id: str) -> None:
+    torch = _require("torch")
+    _require("transformers")
+    from safetensors.torch import save_file
+    from transformers import CLIPTextModelWithProjection, CLIPTokenizer
+
+    out = output / "sdxl_text_encoder_2"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id} (subfolder=text_encoder_2)")
+    tok = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer_2")
+    model = CLIPTextModelWithProjection.from_pretrained(
+        model_id, subfolder="text_encoder_2", torch_dtype=torch.float32
+    )
+    model.eval()
+
+    batch = tok(
+        ENCODER_PROMPT,
+        padding="max_length",
+        max_length=MAX_LENGTH,
+        truncation=True,
+        return_tensors="pt",
+    )
+    token_ids = batch["input_ids"]
+
+    with torch.no_grad():
+        outputs = model(input_ids=token_ids, output_hidden_states=True)
+
+    # SDXL conditions on hidden_states[-2] — the penultimate layer, and raw
+    # (no final_layer_norm) — plus the projected pooled embedding. Both are
+    # saved because taking the wrong one still produces plausible images.
+    tensors = {
+        "token_ids": token_ids.contiguous(),
+        "penultimate": outputs.hidden_states[-2].detach().contiguous().clone(),
+        "last_hidden_state": outputs.last_hidden_state.detach().contiguous().clone(),
+        "pooled": outputs.text_embeds.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    save_file(
+        {k: v.detach().contiguous().clone() for k, v in model.state_dict().items()},
+        str(out / "text_encoder_2.safetensors"),
+    )
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<20} {tuple(v.shape)}")
+    print(f"wrote {out / 'text_encoder_2.safetensors'}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="component", required=True)
@@ -677,8 +726,16 @@ def main() -> None:
     samplers.add_argument("--model-id", default="", help="unused; samplers need no weights")
     samplers.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    sdxl2 = sub.add_parser("sdxl_text_encoder_2", help="dump SDXL text encoder 2 references")
+    sdxl2.add_argument(
+        "--model-id", default="stabilityai/stable-diffusion-xl-base-1.0", help="HuggingFace model id"
+    )
+    sdxl2.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     args = ap.parse_args()
-    if args.component == "samplers":
+    if args.component == "sdxl_text_encoder_2":
+        dump_sdxl_text_encoder_2(args.output, args.model_id)
+    elif args.component == "samplers":
         dump_samplers(args.output, args.model_id)
     elif args.component == "unet_full":
         dump_unet_full(args.output, args.model_id)

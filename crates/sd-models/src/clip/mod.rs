@@ -3,5 +3,5 @@
 mod text_encoder;
 mod tokenizer;
 
-pub use text_encoder::{ClipTextConfig, ClipTextEncoder};
+pub use text_encoder::{ClipActivation, ClipTextConfig, ClipTextEncoder};
 pub use tokenizer::{ClipTokenizer, TokenizeError};

@@ -15,7 +15,19 @@
 //! * the layer norm comes *before* attention with the residual added after.
 
 use sd_tensor::nn::{embedding, layer_norm, linear, Embedding, LayerNorm, LayerNormConfig, Linear};
-use sd_tensor::{ops, DType, Module, Result, Tensor, VarBuilder};
+use sd_tensor::{ops, DType, IndexOp, Module, Result, Tensor, VarBuilder};
+
+/// Which GELU the feed-forward uses.
+///
+/// Not cosmetic: `quick_gelu` and `gelu` differ by about 1e-2, which is far
+/// too small to look like a bug and far too large to be right. SD 1.5's
+/// encoder and SDXL's *first* encoder use `quick_gelu`; SDXL's second encoder
+/// (OpenCLIP bigG) uses plain `gelu`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipActivation {
+    QuickGelu,
+    Gelu,
+}
 
 /// Geometry of the text tower.
 #[derive(Debug, Clone)]
@@ -27,6 +39,10 @@ pub struct ClipTextConfig {
     pub num_attention_heads: usize,
     pub max_position_embeddings: usize,
     pub layer_norm_eps: f64,
+    pub activation: ClipActivation,
+    /// `Some(dim)` when the checkpoint carries a `text_projection`, which
+    /// SDXL's second encoder uses to produce the pooled embedding.
+    pub projection_dim: Option<usize>,
 }
 
 impl ClipTextConfig {
@@ -42,6 +58,30 @@ impl ClipTextConfig {
             // 1e-5, not the VAE's 1e-6. Copying the VAE value produces a small
             // uniform offset that is easy to misread as noise.
             layer_norm_eps: 1e-5,
+            activation: ClipActivation::QuickGelu,
+            projection_dim: None,
+        }
+    }
+
+    /// SDXL's first text encoder — identical to [`Self::sd15`].
+    pub fn sdxl_1() -> Self {
+        Self::sd15()
+    }
+
+    /// SDXL's second text encoder: OpenCLIP ViT-bigG.
+    ///
+    /// Bigger in every dimension, and it activates with plain `gelu`.
+    pub fn sdxl_2() -> Self {
+        Self {
+            vocab_size: 49408,
+            hidden_size: 1280,
+            intermediate_size: 5120,
+            num_hidden_layers: 32,
+            num_attention_heads: 20,
+            max_position_embeddings: 77,
+            layer_norm_eps: 1e-5,
+            activation: ClipActivation::Gelu,
+            projection_dim: Some(1280),
         }
     }
 
@@ -111,6 +151,7 @@ impl ClipAttention {
 struct ClipMlp {
     fc1: Linear,
     fc2: Linear,
+    activation: ClipActivation,
 }
 
 impl ClipMlp {
@@ -118,12 +159,16 @@ impl ClipMlp {
         Ok(Self {
             fc1: linear(cfg.hidden_size, cfg.intermediate_size, vb.pp("fc1"))?,
             fc2: linear(cfg.intermediate_size, cfg.hidden_size, vb.pp("fc2"))?,
+            activation: cfg.activation,
         })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // quick_gelu, not gelu. See the module docs.
-        let xs = ops::quick_gelu(&self.fc1.forward(xs)?)?;
+        let xs = self.fc1.forward(xs)?;
+        let xs = match self.activation {
+            ClipActivation::QuickGelu => ops::quick_gelu(&xs)?,
+            ClipActivation::Gelu => ops::gelu(&xs)?,
+        };
         self.fc2.forward(&xs)
     }
 }
@@ -179,6 +224,9 @@ pub struct ClipTextEncoder {
     /// `0..77`, likewise fixed. CLIP attends over the full context, including
     /// the EOS padding, so positions never depend on the prompt.
     positions: Tensor,
+    /// Present when the checkpoint has one. SDXL's second encoder projects the
+    /// pooled hidden state through this to produce `text_embeds`.
+    text_projection: Option<Linear>,
 }
 
 impl ClipTextEncoder {
@@ -223,6 +271,16 @@ impl ClipTextEncoder {
             final_layer_norm,
             causal_mask: ops::causal_mask(seq, device)?,
             positions: Tensor::arange(0u32, seq as u32, device)?,
+            text_projection: match cfg.projection_dim {
+                // No bias: `CLIPTextModelWithProjection` uses
+                // `nn.Linear(hidden, projection, bias=False)`.
+                Some(dim) => Some(sd_tensor::nn::linear_no_bias(
+                    cfg.hidden_size,
+                    dim,
+                    vb.pp("text_projection"),
+                )?),
+                None => None,
+            },
         })
     }
 
@@ -255,6 +313,51 @@ impl ClipTextEncoder {
         // diffusion conditioning.
         let out = self.final_layer_norm.forward(&xs)?;
         Ok((out, per_layer))
+    }
+
+    /// The hidden state SDXL conditions on: the **penultimate** layer, not the
+    /// final one, and without `final_layer_norm`.
+    ///
+    /// SD 1.5 uses the last layer normed; SDXL uses `hidden_states[-2]` raw.
+    /// Taking the wrong one produces images that are recognisably related to
+    /// the prompt but consistently worse, which is easy to blame on the model.
+    pub fn penultimate_hidden_state(&self, token_ids: &Tensor) -> Result<Tensor> {
+        let (_, layers) = self.forward_with_layers(token_ids)?;
+        let idx = layers.len().checked_sub(2).ok_or_else(|| {
+            sd_tensor::Error::Msg("encoder has fewer than two layers".to_string())
+        })?;
+        Ok(layers[idx].clone())
+    }
+
+    /// The pooled text embedding: the final-layer hidden state at the EOS
+    /// position, projected.
+    ///
+    /// `None` when the checkpoint carries no `text_projection`. SDXL feeds
+    /// this into the UNet's additional conditioning alongside the sequence.
+    ///
+    /// EOS is located as the **argmax of the token ids**, which is how
+    /// `transformers` does it and works because EOS is the highest id in
+    /// CLIP's vocabulary. Using the last index instead would pick a padding
+    /// slot — the same token, but at the wrong position, so the wrong vector.
+    pub fn pooled(&self, token_ids: &Tensor) -> Result<Option<Tensor>> {
+        let Some(projection) = &self.text_projection else {
+            return Ok(None);
+        };
+        let hidden = self.forward(token_ids)?;
+        let ids = token_ids.to_dtype(DType::U32)?.to_vec2::<u32>()?;
+
+        let mut rows = Vec::with_capacity(ids.len());
+        for (b, row) in ids.iter().enumerate() {
+            let eos = row
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, &id)| id)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            rows.push(hidden.i(b)?.narrow(0, eos, 1)?);
+        }
+        let pooled = Tensor::cat(&rows, 0)?;
+        Ok(Some(projection.forward(&pooled)?))
     }
 
     /// The embedding sum, before any encoder layer. Step 3 of the forward.

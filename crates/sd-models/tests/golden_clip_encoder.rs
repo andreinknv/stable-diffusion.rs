@@ -71,8 +71,9 @@ fn tiny_config() -> ClipTextConfig {
         intermediate_size: 64,
         num_hidden_layers: 2,
         num_attention_heads: 4,
-        max_position_embeddings: 77,
-        layer_norm_eps: 1e-5,
+        // Everything else stays SD 1.5's, including `quick_gelu`, which is
+        // what this file's numerical test depends on.
+        ..ClipTextConfig::sd15()
     }
 }
 
