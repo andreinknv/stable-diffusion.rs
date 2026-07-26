@@ -54,11 +54,17 @@ architecture is independent and verifiable against its own golden data.
 
 ## Highest-value optimisation available now
 
-**Chunked / flash attention in `sd-tensor`.** Measured, not speculative: our
-naive attention materialises a 4096x4096 score matrix at 512x512, which makes
-Metal *slower than CPU* despite being 4-5x faster at smaller resolutions. Fully
-behind the seam, so it needs no model code changes, and the existing golden
-tests verify it. See [backends.md](backends.md) for the numbers.
+**A fused attention kernel for Metal.** Our attention materialises a 4096x4096
+score matrix at 512x512, which makes Metal *slower than CPU* despite being
+4-5x faster at smaller resolutions.
+
+Chunked attention (`ops::chunked_attention`) is **done** and bounds the memory,
+which is what makes larger latents reachable at all — but it does not close the
+speed gap, and measurement could not distinguish it from unchunked on a noisy
+machine. Closing the gap needs softmax fused into the matmul so the score
+matrix never reaches memory, which candle does not expose for our shapes. That
+is a hand-written kernel, and it is the remaining work. See
+[backends.md](backends.md) for what was measured and what was not.
 
 ## Upstream contributions worth making
 
@@ -72,7 +78,7 @@ tests verify it. See [backends.md](backends.md) for the numbers.
 - BPE tokenizer with a golden test against `transformers`
 - Additional samplers (DDIM, Heun, LMS) against reference trajectories
 - GGUF header parsing (metadata only, before dequantization)
-- Chunked `scaled_dot_product_attention` that doesn't materialize the full
-  score matrix — a self-contained win entirely behind the seam, and currently
-  the biggest one. Benchmark it with
-  `cargo run --release -p sd-cli --features metal --example backend_bench -- 64`
+- A repeatable benchmark harness for `backend_bench`: run each configuration N
+  times and report a median and spread. Single runs on a busy machine vary by
+  ±40%, which is how the chunk-size question ended up unanswerable. Small,
+  self-contained, and it unblocks every performance claim after it.

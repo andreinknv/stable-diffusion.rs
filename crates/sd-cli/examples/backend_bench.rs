@@ -20,7 +20,10 @@
 
 use anyhow::{bail, Result};
 use sd_tensor::nn::{VarBuilder, VarMap};
-use sd_tensor::ops::{check_attention_budget, human_bytes};
+use sd_tensor::ops::{
+    attention_chunk_rows, attention_score_bytes, check_alloc_budget, human_bytes,
+    DEFAULT_ATTENTION_CHUNK_BYTES,
+};
 use sd_tensor::{device, DType, Tensor};
 use stable_diffusion_rs::models::vae::{Decoder, DecoderConfig};
 
@@ -49,19 +52,10 @@ fn latent_edge(arg: Option<&str>) -> Result<usize> {
 }
 
 fn main() -> Result<()> {
-    // Vet the size before allocating anything at all — including before
-    // building the decoder, so a refusal costs nothing.
     let arg = std::env::args().nth(1);
     let n = latent_edge(arg.as_deref())?;
     let seq = n * n;
-    // The VAE attention block is single-head over a batch of one.
-    let score_bytes = check_attention_budget(1, 1, seq, seq, DType::F32)?;
 
-    let dev = device::best()?;
-    println!("device: {dev:?}");
-
-    let varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
     // SD 1.5 geometry, 64x64 latent -> 512x512 image.
     let cfg = DecoderConfig {
         latent_channels: 4,
@@ -71,12 +65,42 @@ fn main() -> Result<()> {
         norm_num_groups: 32,
         norm_eps: 1e-6,
     };
+
+    // Cost the run before building anything, so a refusal is free. The gate is
+    // the peak activation, not the score matrix: chunked attention bounds the
+    // latter, which leaves a full-resolution up block as the biggest single
+    // allocation. `Decoder::forward` checks this too — doing it here as well
+    // only buys a cheaper refusal.
+    check_alloc_budget(
+        cfg.peak_activation_bytes(1, n, n, DType::F32),
+        &format!("VAE decode activation for a {n}x{n} latent"),
+    )?;
+
+    let dev = device::best()?;
+    println!("device: {dev:?}");
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
     let d = Decoder::new(&cfg, vb)?;
+
+    // The VAE attention block is single-head over a batch of one.
+    let unchunked = attention_score_bytes(1, 1, seq, seq, DType::F32);
+    let chunk_rows = attention_chunk_rows(1, 1, seq, DType::F32, DEFAULT_ATTENTION_CHUNK_BYTES);
     println!(
-        "latent {n}x{n} -> image {}x{}  (attention seq = {seq}, score matrix = {})",
+        "latent {n}x{n} -> image {}x{}  (attention seq = {seq}, score matrix = {}{})",
         n * 8,
         n * 8,
-        human_bytes(score_bytes),
+        unchunked.map_or_else(|| "overflow".to_string(), human_bytes),
+        if chunk_rows >= seq {
+            String::new()
+        } else {
+            format!(
+                ", chunked to {} rows = {}",
+                chunk_rows,
+                attention_score_bytes(1, 1, chunk_rows, seq, DType::F32)
+                    .map_or_else(|| "overflow".to_string(), human_bytes)
+            )
+        },
     );
     let z = Tensor::zeros((1, 4, n, n), DType::F32, &dev)?;
 

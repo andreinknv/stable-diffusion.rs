@@ -97,19 +97,24 @@ down. On 2026-07-25 `backend_bench 384` on a 36 GiB Mac ended in a kernel
 watchdog panic and a power-button reset. There was no error to catch and
 nothing in the logs from the benchmark itself.
 
-`sd_tensor::ops::check_attention_budget` now refuses past a 2 GiB projection,
-before anything is allocated, and *every* attention call goes through it — the
-CLI and the models, not just `backend_bench`. **Do not raise
-`SD_ATTENTION_BUDGET_BYTES` to get past a refusal.** It exists for a deliberate
-experiment on a machine you know can take it, not for clearing an obstacle. If
-your task needs a larger latent, stop and say so.
+`ops::chunked_attention` now bounds the score matrix near 64 MiB regardless of
+size, so attention itself no longer allocates the figures above. That moves the
+largest allocation to a full-resolution up block: 9.0 GiB at a 384 latent. Both
+are checked against the same 2 GiB budget before anything is allocated —
+`ops::check_alloc_budget` in the seam, and
+`DecoderConfig::peak_activation_bytes` for the decode as a whole.
 
-Do not assume a fused attention kernel rescues you either. candle 0.11 ships one
-for Metal, but it declines every shape in this workspace (f32 at `head_dim=512`
-is excluded, and it wants a mask materialised to `[batch, heads, seq_q, seq_k]`),
-so what actually runs today is the naive path with the memory profile above.
-`sd_tensor::ops::attention_with_path` reports which path served a call; check it
-rather than assuming.
+**Do not raise `SD_ATTENTION_BUDGET_BYTES` to get past a refusal.** It exists
+for a deliberate experiment on a machine you know can take it, not for clearing
+an obstacle. If your task needs a larger latent, stop and say so.
+
+Two things chunking does *not* do. It does not make large decodes fast — it is
+the same arithmetic in tiles, and the Metal cliff at 512x512 is unchanged. And
+it does not mean a fused kernel is in play: candle 0.11 ships one for Metal but
+it declines every shape in this workspace (f32 at `head_dim=512` is excluded,
+and it wants a mask materialised to `[batch, heads, seq_q, seq_k]`).
+`ops::attention_with_path` reports which path served a call; check it rather
+than assuming.
 
 The general form of this rule: before running anything parameterised by a size,
 work out what that size allocates. Refusing is free; a wedged machine is not.

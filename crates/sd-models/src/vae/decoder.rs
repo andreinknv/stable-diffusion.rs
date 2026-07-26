@@ -22,7 +22,7 @@
 //! cleanly and produce garbage.
 
 use sd_tensor::nn::{conv2d, group_norm, linear, Conv2d, Conv2dConfig, GroupNorm, Linear};
-use sd_tensor::{ops, Module, Result, Tensor, VarBuilder};
+use sd_tensor::{ops, DType, Module, Result, Tensor, VarBuilder};
 
 use super::VaeConfig;
 
@@ -34,6 +34,55 @@ pub struct DecoderConfig {
     pub layers_per_block: usize,
     pub norm_num_groups: usize,
     pub norm_eps: f64,
+}
+
+impl DecoderConfig {
+    /// Bytes in the largest single activation tensor a decode of this latent
+    /// size will allocate.
+    ///
+    /// Attention used to be the allocation that mattered, and refusing an
+    /// oversized one is what kept a too-large decode from wedging the machine.
+    /// `ops::chunked_attention` bounds attention by construction, which moves
+    /// the largest allocation here: an up block at full resolution. At a 384
+    /// latent that is 9.0 GiB in a single tensor — wired on Metal and
+    /// unreclaimable — so it needs the same refusal attention used to provide.
+    ///
+    /// This is on the config rather than the built decoder so a caller can
+    /// cost a decode *before* constructing one. `None` means the count
+    /// overflowed, which is itself a refusal.
+    pub fn peak_activation_bytes(
+        &self,
+        batch: usize,
+        latent_h: usize,
+        latent_w: usize,
+        dtype: DType,
+    ) -> Option<u64> {
+        let (b, h, w) = (batch as u64, latent_h as u64, latent_w as u64);
+        // Up blocks run in reverse order, and every one but the last doubles
+        // the spatial scale.
+        let reversed = self.block_out_channels.iter().rev();
+        let last = self.block_out_channels.len().saturating_sub(1);
+
+        // conv_in and mid_block run at latent resolution, on the widest layer.
+        let mut peak = b
+            .checked_mul(*self.block_out_channels.last()? as u64)?
+            .checked_mul(h)?
+            .checked_mul(w)?;
+
+        let mut scale = 1u64;
+        for (i, &channels) in reversed.enumerate() {
+            if i != last {
+                scale = scale.checked_mul(2)?;
+            }
+            // The post-upsample output is the largest tensor a block holds.
+            let elems = b
+                .checked_mul(channels as u64)?
+                .checked_mul(h.checked_mul(scale)?)?
+                .checked_mul(w.checked_mul(scale)?)?;
+            peak = peak.max(elems);
+        }
+        peak.checked_mul(dtype.size_in_bytes() as u64)
+    }
 }
 
 impl From<&VaeConfig> for DecoderConfig {
@@ -267,6 +316,8 @@ pub struct Decoder {
     up_blocks: Vec<UpDecoderBlock>,
     conv_norm_out: GroupNorm,
     conv_out: Conv2d,
+    /// Kept for `peak_activation_bytes`, which gates oversized decodes.
+    cfg: DecoderConfig,
 }
 
 impl Decoder {
@@ -309,11 +360,18 @@ impl Decoder {
             up_blocks,
             conv_norm_out,
             conv_out,
+            cfg: cfg.clone(),
         })
     }
 
     /// `[b, latent_channels, h, w]` -> `[b, out_channels, h*8, w*8]`.
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let (b, _, lh, lw) = xs.dims4()?;
+        ops::check_alloc_budget(
+            self.cfg.peak_activation_bytes(b, lh, lw, xs.dtype()),
+            &format!("VAE decode activation for a {lh}x{lw} latent"),
+        )?;
+
         let h = self.conv_in.forward(xs)?;
         let mut h = self.mid_block.forward(&h)?;
         for block in &self.up_blocks {

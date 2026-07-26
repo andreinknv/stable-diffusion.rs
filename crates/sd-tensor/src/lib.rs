@@ -77,7 +77,11 @@ pub mod ops {
     pub enum AttentionPath {
         /// candle's fused kernel. The score matrix is never materialised.
         Fused,
-        /// [`naive_attention`], bounded by [`check_attention_budget`].
+        /// [`chunked_attention`]: the score matrix exists one tile at a time.
+        Chunked,
+        /// [`naive_attention`], bounded by [`check_attention_budget`]. Also
+        /// what a chunked call degenerates to when one chunk already covers
+        /// the whole query axis.
         Naive,
     }
 
@@ -165,29 +169,48 @@ pub mod ops {
         seq_k: usize,
         dtype: DType,
     ) -> Result<u64> {
+        let bytes = attention_score_bytes(batch, heads, seq_q, seq_k, dtype);
+        check_alloc_budget(
+            bytes,
+            &format!("attention score matrix [{batch}, {heads}, {seq_q}, {seq_k}] ({dtype:?})"),
+        )?;
+        Ok(bytes.expect("check_alloc_budget rejects the overflow case"))
+    }
+
+    /// Refuse any single allocation over the budget.
+    ///
+    /// `bytes` is `None` when the size computation overflowed, which is itself
+    /// a refusal. `what` describes the allocation and appears in the error.
+    ///
+    /// This is the general form of [`check_attention_budget`]. Attention is no
+    /// longer the only thing large enough to matter: with
+    /// [`chunked_attention`] bounding the score matrix, the biggest allocation
+    /// in a VAE decode becomes the full-resolution activation tensors, so
+    /// those are checked too. See the crash note on
+    /// [`check_attention_budget`] for why this is a hard error.
+    pub fn check_alloc_budget(bytes: Option<u64>, what: &str) -> Result<()> {
         let budget = attention_budget_bytes()?;
-        let Some(bytes) = attention_score_bytes(batch, heads, seq_q, seq_k, dtype) else {
+        let Some(bytes) = bytes else {
             return Err(Error::Msg(format!(
-                "attention score matrix [{batch}, {heads}, {seq_q}, {seq_k}] ({dtype:?}) overflows \
-                 a 64-bit byte count; there is no machine that runs it"
+                "{what} overflows a 64-bit byte count; there is no machine that runs it"
             )));
         };
         if bytes > budget {
             return Err(Error::Msg(format!(
-                "refusing to allocate: attention score matrix [{batch}, {heads}, {seq_q}, \
-                 {seq_k}] ({dtype:?}) = {} for a single call, over the {} budget, and peak use is \
-                 at least double that.\n\n\
-                 For a VAE decode this is O(n^4) in the latent edge, so the next size up costs \
-                 16x. On a Metal build the allocation is wired GPU memory the OS cannot reclaim \
-                 or swap, so overshooting physical RAM panics the machine instead of failing this \
-                 process. See docs/backends.md.\n\n\
+                "refusing to allocate: {what} = {} for a single call, over the {} budget, and \
+                 peak use is at least double that.\n\n\
+                 For a VAE decode, attention is O(n^4) in the latent edge and activations are \
+                 O(n^2), so the next size up costs 16x and 4x respectively. On a Metal build \
+                 these are wired GPU memory the OS cannot reclaim or swap, so overshooting \
+                 physical RAM panics the machine instead of failing this process. See \
+                 docs/backends.md.\n\n\
                  Use a smaller size, or raise the budget deliberately with \
                  {ATTENTION_BUDGET_ENV}=<bytes>.",
                 human_bytes(bytes),
                 human_bytes(budget),
             )));
         }
-        Ok(bytes)
+        Ok(())
     }
 
     /// Format a byte count in units a human can act on.
@@ -238,6 +261,145 @@ pub mod ops {
         weights.matmul(&v.contiguous()?)
     }
 
+    /// Environment override for the per-chunk score budget, in bytes.
+    pub const ATTENTION_CHUNK_ENV: &str = "SD_ATTENTION_CHUNK_BYTES";
+
+    /// Target size for one chunk's score matrix.
+    ///
+    /// 64 MiB is exactly the score matrix for SD 1.5 at 512x512, so that decode
+    /// — the common case — stays on the single-chunk path and pays nothing for
+    /// chunking existing. Anything larger splits and stays bounded near this
+    /// figure instead of growing as `n^4`.
+    ///
+    /// This is reasoned, not measured. Chunking cannot beat not-chunking on
+    /// speed: it performs the same arithmetic with more kernel launches and a
+    /// concatenation at the end, so the only question was how much it costs,
+    /// and that is what sets "don't chunk until you must". An attempt to
+    /// measure the cost at latent 64 on an M4 Max produced 9.1/11.8/9.6 s
+    /// unchunked against 17.3/12.3/8.0 s at 8 MiB chunks — distributions that
+    /// overlap entirely, on a machine too noisy to separate them. If you want a
+    /// tuned value, measure on a quiet box and override with
+    /// [`ATTENTION_CHUNK_ENV`]; do not trust a single run.
+    pub const DEFAULT_ATTENTION_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+
+    fn attention_chunk_bytes() -> Result<u64> {
+        match std::env::var(ATTENTION_CHUNK_ENV) {
+            Ok(raw) => raw.trim().parse().map_err(|_| {
+                Error::Msg(format!(
+                    "{ATTENTION_CHUNK_ENV} must be a byte count, got {raw:?}"
+                ))
+            }),
+            Err(std::env::VarError::NotPresent) => Ok(DEFAULT_ATTENTION_CHUNK_BYTES),
+            Err(std::env::VarError::NotUnicode(_)) => Err(Error::Msg(format!(
+                "{ATTENTION_CHUNK_ENV} is not valid UTF-8"
+            ))),
+        }
+    }
+
+    /// How many query rows fit in one chunk's score budget.
+    ///
+    /// Always at least 1: a single query row is the smallest unit that can be
+    /// computed, so an enormous `seq_k` produces a slow call rather than a
+    /// refused one.
+    pub fn attention_chunk_rows(
+        batch: usize,
+        heads: usize,
+        seq_k: usize,
+        dtype: DType,
+        target_bytes: u64,
+    ) -> usize {
+        let per_row = attention_score_bytes(batch, heads, 1, seq_k, dtype).unwrap_or(u64::MAX);
+        if per_row == 0 {
+            return 1;
+        }
+        (target_bytes / per_row).max(1) as usize
+    }
+
+    /// Attention computed in query chunks, so the full `seq_q x seq_k` score
+    /// matrix is never materialised.
+    ///
+    /// Each chunk sees the entire key axis, so the softmax denominator is the
+    /// same one the unchunked path computes — this is exact, not an
+    /// approximation, and needs no running-maximum bookkeeping. Peak score
+    /// memory drops from `seq_q x seq_k` to `chunk x seq_k`.
+    ///
+    /// What this does *not* do is fuse softmax into the matmul. The score
+    /// matrix for each chunk still round-trips through memory, so this is a
+    /// memory win first and a speed win only insofar as smaller tiles cache
+    /// better. Real flash attention needs a fused kernel, which candle does
+    /// not expose for these shapes — see docs/backends.md.
+    ///
+    /// Degenerates to a single chunk (i.e. exactly [`naive_attention`]) when
+    /// the whole score matrix already fits the target, so small shapes pay
+    /// nothing for this path existing.
+    pub fn chunked_attention(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        chunked_attention_with_path(q, k, v, mask).map(|(t, _)| t)
+    }
+
+    fn chunked_attention_with_path(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, AttentionPath)> {
+        chunked_attention_sized(q, k, v, mask, attention_chunk_bytes()?)
+    }
+
+    /// [`chunked_attention`] with an explicit chunk target.
+    ///
+    /// Separate from the env-reading entry point so tests can force a chunk
+    /// size without mutating global state, which is what makes the
+    /// chunked-vs-naive equivalence check reliable under a parallel test
+    /// runner.
+    pub(crate) fn chunked_attention_sized(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        target_bytes: u64,
+    ) -> Result<(Tensor, AttentionPath)> {
+        let (batch, heads, seq_q, dim) = q.dims4()?;
+        let seq_k = k.dim(D::Minus2)?;
+        let rows = attention_chunk_rows(batch, heads, seq_k, q.dtype(), target_bytes);
+        if rows >= seq_q {
+            // One chunk is the whole thing; take the simple path unchanged.
+            return Ok((naive_attention(q, k, v, mask)?, AttentionPath::Naive));
+        }
+        // Bound what a single chunk allocates. `rows` is derived from the
+        // target, so this only trips if one query row is itself over budget.
+        check_attention_budget(batch, heads, rows, seq_k, q.dtype())?;
+
+        let scale = 1f64 / (dim as f64).sqrt();
+        let kt = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let v = v.contiguous()?;
+        // A mask may be broadcast over the query axis (`causal_mask` is not —
+        // it carries a real row per query, so it has to be sliced alongside).
+        let mask_rows = mask.map(|m| m.dim(D::Minus2)).transpose()?;
+
+        let mut out = Vec::with_capacity(seq_q.div_ceil(rows));
+        let mut start = 0;
+        while start < seq_q {
+            let len = rows.min(seq_q - start);
+            let qc = q.narrow(D::Minus2, start, len)?.contiguous()?;
+            let scores = (qc.matmul(&kt)? * scale)?;
+            let scores = match (mask, mask_rows) {
+                (Some(m), Some(1)) => scores.broadcast_add(m)?,
+                (Some(m), Some(_)) => {
+                    scores.broadcast_add(&m.narrow(D::Minus2, start, len)?.contiguous()?)?
+                }
+                _ => scores,
+            };
+            out.push(softmax_last_dim(&scores)?.matmul(&v)?);
+            start += len;
+        }
+        Ok((Tensor::cat(&out, D::Minus2)?, AttentionPath::Chunked))
+    }
+
     /// Attention, plus which implementation served it.
     ///
     /// candle 0.11 implements SDPA for Metal only — its `cpu_fwd` bails
@@ -248,12 +410,13 @@ pub mod ops {
     /// it declines every shape in this workspace: f32 at `head_dim = 512` (the
     /// VAE attention block) is explicitly excluded, and a mask must be
     /// `[batch, heads, seq_q, seq_k]` while [`causal_mask`] is `[1, 1, s, s]`.
-    /// So this currently reports [`AttentionPath::Naive`] everywhere. Treat a
-    /// fused path as an optimisation that may arrive, not one already banked —
-    /// the memory characteristics you get today are the naive ones.
+    /// So [`AttentionPath::Fused`] is currently unreachable here. Treat it as
+    /// an optimisation that may arrive, not one already banked.
     ///
-    /// A declined shape falls back rather than failing. That is safe because
-    /// the naive path is budget-checked; it cannot quietly turn into the
+    /// Everything else goes to [`chunked_attention`], which reports `Chunked`
+    /// when it actually splits and `Naive` when one chunk already covers the
+    /// query axis. A declined fused shape therefore falls back to a path whose
+    /// allocation is bounded by construction; it cannot quietly turn into the
     /// allocation that wedges the machine.
     pub fn attention_with_path(
         q: &Tensor,
@@ -272,7 +435,7 @@ pub mod ops {
                 return Ok((t, AttentionPath::Fused));
             }
         }
-        Ok((naive_attention(q, k, v, mask)?, AttentionPath::Naive))
+        chunked_attention_with_path(q, k, v, mask)
     }
 
     /// Scaled dot-product attention, unmasked.
@@ -620,22 +783,107 @@ mod attention_budget_tests {
     }
 
     #[test]
-    fn attention_refuses_an_oversized_call_instead_of_allocating_it() -> super::Result<()> {
+    fn the_unchunked_path_still_refuses_an_oversized_call() -> super::Result<()> {
         // The inputs here are ~740 KB each; the score matrix they imply is
-        // 2.0 GiB, just over budget. If the guard were missing or ran too
-        // late, this test would allocate that matrix — so it verifies the
-        // guard fires *before* the matmul, not merely that the numbers are
-        // right in isolation.
+        // 2.0 GiB, just over budget. The dispatcher now *serves* this shape by
+        // splitting it, which is the point of chunking — but `naive_attention`
+        // is the one that would allocate the matrix whole, and it must still
+        // refuse before the matmul rather than after. If the guard were
+        // missing or ran too late, this test would allocate 2.0 GiB.
         let dev = Device::Cpu;
         let seq = 23_200;
         let q = Tensor::zeros((1, 1, seq, 8), DType::F32, &dev)?;
-        let err = scaled_dot_product_attention(&q, &q, &q)
+        let err = naive_attention(&q, &q, &q, None)
             .expect_err("a 2.0 GiB score matrix is over the default budget");
         assert!(
             err.to_string().contains("refusing to allocate"),
             "unexpected error: {err}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn chunking_agrees_with_the_unchunked_reference() -> super::Result<()> {
+        // Each chunk sees the whole key axis, so this should be exact rather
+        // than merely close. The tolerance is for matmul batching differences,
+        // not for an approximation — a running-softmax bug would blow past it.
+        let dev = Device::Cpu;
+        for (b, h, sq, sk, d) in [(1usize, 1, 64usize, 64usize, 8usize), (2, 3, 40, 57, 16)] {
+            let q = Tensor::randn(0f32, 1f32, (b, h, sq, d), &dev)?;
+            let k = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev)?;
+            let v = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev)?;
+
+            // A target of 1 byte forces one query row per chunk — the most
+            // fragmented arrangement, and the one most likely to expose a
+            // slicing or concatenation error.
+            let (got, path) = chunked_attention_sized(&q, &k, &v, None, 1)?;
+            assert_eq!(path, AttentionPath::Chunked);
+            let want = naive_attention(&q, &k, &v, None)?;
+            assert_eq!(got.dims(), want.dims());
+            super::testing::assert_close(&got, &want, 1e-6, "chunked vs naive")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chunking_slices_a_causal_mask_alongside_the_queries() -> super::Result<()> {
+        // The mask carries one row per query, so a chunk covering queries
+        // [i..j] must take mask rows [i..j]. Reusing row 0 for every chunk
+        // would still produce plausible numbers, so compare against the
+        // unchunked result rather than eyeballing shapes.
+        let dev = Device::Cpu;
+        let (b, h, s, d) = (1usize, 2usize, 48usize, 16usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let mask = causal_mask(s, &dev)?;
+
+        let (got, path) = chunked_attention_sized(&q, &k, &v, Some(&mask), 1)?;
+        assert_eq!(path, AttentionPath::Chunked);
+        let want = naive_attention(&q, &k, &v, Some(&mask))?;
+        super::testing::assert_close(&got, &want, 1e-6, "chunked masked vs naive")?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_shape_that_already_fits_is_not_chunked() -> super::Result<()> {
+        // Chunking a small call would add kernel launches and a concat for
+        // nothing. SD 1.5 at 512x512 must stay on the single-chunk path.
+        let dev = Device::Cpu;
+        let q = Tensor::zeros((1, 1, 64, 8), DType::F32, &dev)?;
+        let (_, path) = chunked_attention_sized(&q, &q, &q, None, DEFAULT_ATTENTION_CHUNK_BYTES)?;
+        assert_eq!(path, AttentionPath::Naive);
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_rows_track_the_target_and_never_reach_zero() {
+        // 4096 keys of f32, single head: 16 KiB per query row.
+        assert_eq!(
+            attention_chunk_rows(1, 1, 4096, DType::F32, 8 * 1024 * 1024),
+            512
+        );
+        // Heads and batch divide the row count, because they multiply the row.
+        assert_eq!(
+            attention_chunk_rows(2, 8, 4096, DType::F32, 8 * 1024 * 1024),
+            32
+        );
+        // A row bigger than the whole target still yields one row, so an
+        // enormous key axis produces a slow call rather than a division by
+        // zero or an empty chunk loop.
+        assert_eq!(attention_chunk_rows(1, 1, usize::MAX, DType::F32, 1), 1);
+        assert_eq!(attention_chunk_rows(1, 1, 4096, DType::F32, 0), 1);
+    }
+
+    #[test]
+    fn chunking_makes_a_previously_refused_size_allocatable() {
+        // The whole point. A 384 latent needs an 81 GiB score matrix in one
+        // piece, which is refused; in 8 MiB chunks the peak allocation is the
+        // chunk, which is not.
+        let seq = 384 * 384;
+        assert!(check_attention_budget(1, 1, seq, seq, DType::F32).is_err());
+        let rows = attention_chunk_rows(1, 1, seq, DType::F32, DEFAULT_ATTENTION_CHUNK_BYTES);
+        assert!(check_attention_budget(1, 1, rows, seq, DType::F32).is_ok());
     }
 
     #[test]

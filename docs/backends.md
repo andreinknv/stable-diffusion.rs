@@ -160,17 +160,39 @@ which path actually ran, so this can be re-checked on a candle bump rather than
 re-litigated from memory. Today it reports `Naive` everywhere. Do not record
 "fused attention landed" as a memory win without checking that value.
 
-### What to do about it
+### What was done about it: chunked attention
 
-Chunked or flash attention, computing the score matrix in tiles instead of
-materialising it. This is:
+`ops::chunked_attention` computes the score matrix in query tiles rather than
+materialising it whole. It landed entirely inside `sd-tensor` with no model
+code changes — the case the seam was designed for — and it is verified against
+the `diffusers` golden reference, including at one query row per chunk
+(`max_abs` 3.43e-5 versus 3.678e-5 unchunked, tolerance 1e-4).
 
-- entirely inside `sd-tensor` — **no model code changes**
-- independently verifiable against the existing golden tests
-- the difference between GPU being useless and being 4-5x at real resolutions
+**What it buys: memory and reach, not speed.** Peak score memory is bounded
+near the chunk target instead of growing as `n^4`, so sizes that were
+previously refused now decode — a 160 latent needs a 2.4 GiB score matrix in
+one piece, and runs in 64 MiB tiles.
 
-It is the single highest-value optimisation currently available, and it is the
-exact case the seam was designed for. Tracked in [roadmap.md](roadmap.md).
+**What it does not buy: the cliff.** Chunking performs the same arithmetic with
+more kernel launches and a concatenation, so it cannot be faster than not
+chunking; the honest ceiling was "how much does it cost". Attempting to measure
+that at latent 64 on an M4 Max gave 9.1/11.8/9.6 s unchunked against
+17.3/12.3/8.0 s at 8 MiB chunks — distributions that overlap entirely. The
+run-to-run variance on this machine (±40%, and a competing build swung one
+sweep by 20%) is larger than the effect being measured, so **no speed claim is
+made in either direction.** If you want a tuned chunk size, measure on a quiet
+box, repeat each configuration, and set `SD_ATTENTION_CHUNK_BYTES`.
+
+The default is therefore 64 MiB: exactly the SD 1.5 512x512 score matrix, so
+the common case stays single-chunk and pays nothing, and only larger geometries
+split.
+
+### What is still to do about it
+
+The cliff above is unchanged, because closing it needs softmax *fused* into the
+matmul so the score matrix never reaches memory at all. That is a kernel, not a
+scheduling change — candle does not expose one for these shapes (see above), so
+it means writing Metal. Tracked in [roadmap.md](roadmap.md).
 
 Also note `--features accelerate` on Apple silicon: BLAS-accelerated CPU
 matmul that adds **no native compilation** (it links a system framework). Worth

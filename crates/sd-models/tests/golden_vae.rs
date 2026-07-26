@@ -132,3 +132,48 @@ fn decoder_matches_diffusers_reference() {
     )
     .unwrap();
 }
+
+/// The peak-activation estimate is what refuses an oversized decode now that
+/// chunked attention no longer does. An estimate that is wrong low would let
+/// the refusal through; wrong high would block legitimate work.
+#[test]
+fn peak_activation_matches_the_diffusers_reference_shapes() {
+    let cfg = DecoderConfig::from(&VaeConfig::sd15());
+
+    // From xtask/golden/dump_reference.py at a 32x32 latent, the largest
+    // captured activation is up_block_2 at (1, 256, 256, 256) — 64 MiB of f32.
+    // That is ground truth from diffusers, not a guess at the graph.
+    assert_eq!(
+        cfg.peak_activation_bytes(1, 32, 32, DType::F32),
+        Some(256 * 256 * 256 * 4),
+    );
+
+    // SDXL at 1024x1024 is real work and must stay under the 2 GiB budget.
+    let sdxl = cfg.peak_activation_bytes(1, 128, 128, DType::F32).unwrap();
+    assert!(sdxl < 2 * 1024 * 1024 * 1024, "SDXL 1024 peak was {sdxl}");
+
+    // The latent that panicked the machine: 256 channels at 3072x3072.
+    assert_eq!(
+        cfg.peak_activation_bytes(1, 384, 384, DType::F32),
+        Some(9 * 1024 * 1024 * 1024),
+    );
+}
+
+#[test]
+fn an_oversized_decode_is_refused_before_it_allocates() {
+    let dev = Device::Cpu;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+    let cfg = DecoderConfig::from(&VaeConfig::sd15());
+    let decoder = Decoder::new(&cfg, vb).expect("decoder builds");
+
+    // A 384 latent. The tensor below is 2.4 MB; the decode it implies is not.
+    let z = Tensor::zeros((1, 4, 384, 384), DType::F32, &dev).unwrap();
+    let err = decoder
+        .forward(&z)
+        .expect_err("a 9.0 GiB activation must be refused");
+    assert!(
+        err.to_string().contains("refusing to allocate"),
+        "unexpected error: {err}"
+    );
+}
