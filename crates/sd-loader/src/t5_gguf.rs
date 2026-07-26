@@ -114,6 +114,64 @@ fn candle_content(file: &mut std::fs::File) -> Result<sd_tensor::gguf::Content, 
     Ok(sd_tensor::gguf::Content::read(file)?)
 }
 
+/// Quantised T5 weights, keyed by HuggingFace name.
+///
+/// Unlike [`t5_var_builder_from_gguf`] this does **not** dequantise. The
+/// tensors stay in their GGUF block format and are expanded per matmul by
+/// [`sd_tensor::quantized::QLinear`].
+///
+/// That is not only a memory saving. T5's activations reach tens of thousands
+/// and f16 tops out at 65504, so a dequantise-to-f16 load produces NaN partway
+/// up the stack; keeping the weights quantised means every activation is f32
+/// and the range problem does not arise. bf16 would also solve it, but
+/// candle's CPU backend has no bf16 matmul.
+pub fn t5_qtensors_from_gguf(
+    path: impl AsRef<std::path::Path>,
+    device: &Device,
+) -> Result<std::collections::HashMap<String, std::sync::Arc<sd_tensor::gguf::QTensor>>, LoadError>
+{
+    let info = GgufInfo::open(&path)?;
+
+    // Sized on the *quantised* footprint, which is what is actually held.
+    let bytes: u64 = info
+        .tensors
+        .iter()
+        .filter(|(k, _)| t5_key(k).is_some())
+        .map(|(_, (shape, dtype))| {
+            let n: u64 = shape.iter().map(|&d| d as u64).product();
+            n * dtype.type_size() as u64 / dtype.block_size() as u64
+        })
+        .sum();
+    sd_tensor::sysmem::check_headroom(
+        bytes,
+        &format!("T5 encoder weights from {}", info.path.display()),
+    )?;
+
+    let mut file = std::fs::File::open(&info.path).map_err(|e| LoadError::Unsupported {
+        path: info.path.clone(),
+        reason: format!("cannot open: {e}"),
+    })?;
+    crate::gguf::preflight(&mut file, &info.path)?;
+    let content = candle_content(&mut file)?;
+
+    let mut out = std::collections::HashMap::new();
+    for name in content.tensor_infos.keys() {
+        let Some(mapped) = t5_key(name) else { continue };
+        out.insert(
+            mapped,
+            std::sync::Arc::new(content.tensor(&mut file, name, device)?),
+        );
+    }
+    if out.is_empty() {
+        return Err(LoadError::Unsupported {
+            path: info.path.clone(),
+            reason: "no T5 encoder tensors found".to_string(),
+        });
+    }
+    tracing::debug!(tensors = out.len(), "loaded quantised T5 encoder");
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

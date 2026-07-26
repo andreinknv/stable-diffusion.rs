@@ -19,7 +19,7 @@ pub use gguf::{
     clip_var_builder_from_gguf, gguf_var_builder, unet_var_builder_from_gguf,
     vae_var_builder_from_gguf, GgufInfo, Layout,
 };
-pub use t5_gguf::{t5_key, t5_var_builder_from_gguf};
+pub use t5_gguf::{t5_key, t5_qtensors_from_gguf, t5_var_builder_from_gguf};
 
 use std::path::{Path, PathBuf};
 

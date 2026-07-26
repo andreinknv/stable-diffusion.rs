@@ -17,10 +17,14 @@
 //! No layer carries a bias anywhere.
 
 mod bucket;
+mod tokenizer;
 
 pub use bucket::relative_position_bucket;
+pub use tokenizer::{T5Tokenizer, FLUX_MAX_LENGTH};
 
-use sd_tensor::nn::{embedding, linear_no_bias, Embedding, Linear, VarBuilder};
+use sd_tensor::gguf::QTensor;
+use sd_tensor::nn::{linear_no_bias, Embedding, Linear, VarBuilder};
+use sd_tensor::quantized::QLinear;
 use sd_tensor::{ops, DType, Module, Result, Tensor, D};
 
 /// T5 v1.1 encoder geometry.
@@ -72,6 +76,99 @@ impl T5Config {
     }
 }
 
+/// A T5 projection, dense or quantised.
+///
+/// Quantised weights are not merely smaller here, they are what makes the
+/// model *run*: T5's activations reach tens of thousands and f16 tops out at
+/// 65504, so loading dequantised-to-f16 produces NaN around block 10. Holding
+/// the blocks and expanding per matmul keeps every activation in f32.
+#[derive(Debug)]
+pub enum T5Proj {
+    Dense(Linear),
+    Quantized(QLinear),
+}
+
+impl T5Proj {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(l) => l.forward(xs),
+            Self::Quantized(q) => q.forward(xs),
+        }
+    }
+}
+
+/// Where a block's weights come from.
+#[derive(Clone, Copy)]
+pub enum T5Source<'a> {
+    Dense(&'a VarBuilder<'a>),
+    Quantized(&'a QuantizedWeights),
+}
+
+/// Quantised tensors keyed by HuggingFace name, as produced by
+/// `sd_loader::t5_qtensors_from_gguf`.
+pub type QuantizedWeights = std::collections::HashMap<String, std::sync::Arc<QTensor>>;
+
+impl<'a> T5Source<'a> {
+    fn proj(&self, path: &str, in_dim: usize, out_dim: usize) -> Result<T5Proj> {
+        match self {
+            Self::Dense(vb) => {
+                let mut sub = (*vb).clone();
+                for part in path.split('.') {
+                    sub = sub.pp(part);
+                }
+                Ok(T5Proj::Dense(linear_no_bias(in_dim, out_dim, sub)?))
+            }
+            Self::Quantized(w) => {
+                let key = format!("{path}.weight");
+                let t = w.get(&key).ok_or_else(|| {
+                    sd_tensor::Error::Msg(format!("quantised T5 is missing {key}"))
+                })?;
+                Ok(T5Proj::Quantized(QLinear::new(t.clone(), None)?))
+            }
+        }
+    }
+
+    /// Norm scales and the embedding stay dense: they are stored F32 in the
+    /// file already and are a rounding error next to the projections.
+    fn dense_tensor(&self, path: &str, dim: usize) -> Result<Tensor> {
+        match self {
+            Self::Dense(vb) => {
+                let mut sub = (*vb).clone();
+                for part in path.split('.') {
+                    sub = sub.pp(part);
+                }
+                sub.get(dim, "weight")
+            }
+            Self::Quantized(w) => {
+                let key = format!("{path}.weight");
+                let t = w.get(&key).ok_or_else(|| {
+                    sd_tensor::Error::Msg(format!("quantised T5 is missing {key}"))
+                })?;
+                t.dequantize(&t.device())
+            }
+        }
+    }
+
+    fn dense_2d(&self, path: &str, rows: usize, cols: usize) -> Result<Tensor> {
+        match self {
+            Self::Dense(vb) => {
+                let mut sub = (*vb).clone();
+                for part in path.split('.') {
+                    sub = sub.pp(part);
+                }
+                sub.get((rows, cols), "weight")
+            }
+            Self::Quantized(w) => {
+                let key = format!("{path}.weight");
+                let t = w.get(&key).ok_or_else(|| {
+                    sd_tensor::Error::Msg(format!("quantised T5 is missing {key}"))
+                })?;
+                t.dequantize(&t.device())
+            }
+        }
+    }
+}
+
 /// Root-mean-square normalisation.
 ///
 /// `x * rsqrt(mean(x^2) + eps) * weight`. No mean subtraction and no bias,
@@ -83,9 +180,9 @@ pub struct T5RmsNorm {
 }
 
 impl T5RmsNorm {
-    pub fn new(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+    pub fn new(dim: usize, eps: f64, src: T5Source, path: &str) -> Result<Self> {
         Ok(Self {
-            weight: vb.get(dim, "weight")?,
+            weight: src.dense_tensor(path, dim)?,
             eps,
         })
     }
@@ -107,10 +204,10 @@ impl T5RmsNorm {
 /// T5 self-attention with an additive relative position bias.
 #[derive(Debug)]
 pub struct T5Attention {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: T5Proj,
+    k: T5Proj,
+    v: T5Proj,
+    o: T5Proj,
     /// Present only in the first block; every other block reuses the bias it
     /// computes.
     relative_attention_bias: Option<Embedding>,
@@ -121,19 +218,22 @@ pub struct T5Attention {
 }
 
 impl T5Attention {
-    pub fn new(cfg: &T5Config, has_relative_bias: bool, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &T5Config, has_relative_bias: bool, src: T5Source, path: &str) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            q: linear_no_bias(cfg.d_model, inner, vb.pp("q"))?,
-            k: linear_no_bias(cfg.d_model, inner, vb.pp("k"))?,
-            v: linear_no_bias(cfg.d_model, inner, vb.pp("v"))?,
-            o: linear_no_bias(inner, cfg.d_model, vb.pp("o"))?,
+            q: src.proj(&format!("{path}.q"), cfg.d_model, inner)?,
+            k: src.proj(&format!("{path}.k"), cfg.d_model, inner)?,
+            v: src.proj(&format!("{path}.v"), cfg.d_model, inner)?,
+            o: src.proj(&format!("{path}.o"), inner, cfg.d_model)?,
             relative_attention_bias: if has_relative_bias {
-                Some(embedding(
-                    cfg.relative_attention_num_buckets,
+                Some(Embedding::new(
+                    src.dense_2d(
+                        &format!("{path}.relative_attention_bias"),
+                        cfg.relative_attention_num_buckets,
+                        cfg.num_heads,
+                    )?,
                     cfg.num_heads,
-                    vb.pp("relative_attention_bias"),
-                )?)
+                ))
             } else {
                 None
             },
@@ -202,17 +302,17 @@ impl T5Attention {
 /// Gated GELU feed-forward: `wo(gelu(wi_0(x)) * wi_1(x))`.
 #[derive(Debug)]
 pub struct T5FeedForward {
-    wi_0: Linear,
-    wi_1: Linear,
-    wo: Linear,
+    wi_0: T5Proj,
+    wi_1: T5Proj,
+    wo: T5Proj,
 }
 
 impl T5FeedForward {
-    pub fn new(cfg: &T5Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &T5Config, src: T5Source, path: &str) -> Result<Self> {
         Ok(Self {
-            wi_0: linear_no_bias(cfg.d_model, cfg.d_ff, vb.pp("wi_0"))?,
-            wi_1: linear_no_bias(cfg.d_model, cfg.d_ff, vb.pp("wi_1"))?,
-            wo: linear_no_bias(cfg.d_ff, cfg.d_model, vb.pp("wo"))?,
+            wi_0: src.proj(&format!("{path}.wi_0"), cfg.d_model, cfg.d_ff)?,
+            wi_1: src.proj(&format!("{path}.wi_1"), cfg.d_model, cfg.d_ff)?,
+            wo: src.proj(&format!("{path}.wo"), cfg.d_ff, cfg.d_model)?,
         })
     }
 
@@ -236,18 +336,29 @@ pub struct T5Block {
 }
 
 impl T5Block {
-    pub fn new(cfg: &T5Config, has_relative_bias: bool, vb: VarBuilder) -> Result<Self> {
-        let l0 = vb.pp("layer").pp("0");
-        let l1 = vb.pp("layer").pp("1");
+    pub fn new(cfg: &T5Config, has_relative_bias: bool, src: T5Source, path: &str) -> Result<Self> {
+        let l0 = format!("{path}.layer.0");
+        let l1 = format!("{path}.layer.1");
         Ok(Self {
-            attention: T5Attention::new(cfg, has_relative_bias, l0.pp("SelfAttention"))?,
+            attention: T5Attention::new(
+                cfg,
+                has_relative_bias,
+                src,
+                &format!("{l0}.SelfAttention"),
+            )?,
             attention_norm: T5RmsNorm::new(
                 cfg.d_model,
                 cfg.layer_norm_epsilon,
-                l0.pp("layer_norm"),
+                src,
+                &format!("{l0}.layer_norm"),
             )?,
-            ff: T5FeedForward::new(cfg, l1.pp("DenseReluDense"))?,
-            ff_norm: T5RmsNorm::new(cfg.d_model, cfg.layer_norm_epsilon, l1.pp("layer_norm"))?,
+            ff: T5FeedForward::new(cfg, src, &format!("{l1}.DenseReluDense"))?,
+            ff_norm: T5RmsNorm::new(
+                cfg.d_model,
+                cfg.layer_norm_epsilon,
+                src,
+                &format!("{l1}.layer_norm"),
+            )?,
         })
     }
 
@@ -277,11 +388,28 @@ impl T5EncoderModel {
     /// `vb` should be rooted so that `shared` / `encoder.block.N` resolve
     /// beneath it — i.e. at the model root, not at `encoder`.
     pub fn new(cfg: &T5Config, vb: VarBuilder) -> Result<Self> {
-        let embed_tokens = embedding(cfg.vocab_size, cfg.d_model, vb.pp("shared"))?;
-        let enc = vb.pp("encoder");
+        Self::from_source(cfg, T5Source::Dense(&vb))
+    }
+
+    /// Build with the weights left quantised.
+    ///
+    /// Preferred for T5-XXL: 2.7 GB resident against 18.8 at F32, and every
+    /// activation stays f32, which a dequantise-to-f16 load cannot manage —
+    /// see [`T5Proj`].
+    pub fn from_quantized(cfg: &T5Config, weights: &QuantizedWeights) -> Result<Self> {
+        Self::from_source(cfg, T5Source::Quantized(weights))
+    }
+
+    fn from_source(cfg: &T5Config, src: T5Source) -> Result<Self> {
+        // The embedding is a lookup, not a matmul, so it is dequantised: at
+        // 32128 x 4096 that is 526 MB, against 9 GB for the projections.
+        let embed_tokens = Embedding::new(
+            src.dense_2d("shared", cfg.vocab_size, cfg.d_model)?,
+            cfg.d_model,
+        );
         let blocks = (0..cfg.num_layers)
             // Only block 0 owns a relative attention bias; the rest share it.
-            .map(|i| T5Block::new(cfg, i == 0, enc.pp("block").pp(i.to_string())))
+            .map(|i| T5Block::new(cfg, i == 0, src, &format!("encoder.block.{i}")))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             embed_tokens,
@@ -289,7 +417,8 @@ impl T5EncoderModel {
             final_norm: T5RmsNorm::new(
                 cfg.d_model,
                 cfg.layer_norm_epsilon,
-                enc.pp("final_layer_norm"),
+                src,
+                "encoder.final_layer_norm",
             )?,
         })
     }

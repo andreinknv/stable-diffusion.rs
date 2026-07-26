@@ -350,6 +350,22 @@ impl ClipTextEncoder {
         let Some(projection) = &self.text_projection else {
             return Ok(None);
         };
+        let pooled = self.pooled_hidden(token_ids)?;
+        Ok(Some(projection.forward(&pooled)?))
+    }
+
+    /// The EOS hidden state **without** the text projection.
+    ///
+    /// This is `transformers`' `pooler_output`, and it is what Flux
+    /// conditions on. [`Self::pooled`] additionally applies
+    /// `text_projection`, which is what SDXL's second text encoder wants —
+    /// the two are different vectors of different widths and are not
+    /// interchangeable.
+    ///
+    /// Available regardless of whether the checkpoint carries a projection,
+    /// which matters because CLIP-L as shipped with SD 1.5 (and reused by
+    /// Flux) is a plain `CLIPTextModel` and has none.
+    pub fn pooled_hidden(&self, token_ids: &Tensor) -> Result<Tensor> {
         let hidden = self.forward(token_ids)?;
         let ids = token_ids.to_dtype(DType::U32)?.to_vec2::<u32>()?;
 
@@ -363,8 +379,7 @@ impl ClipTextEncoder {
                 .unwrap_or(0);
             rows.push(hidden.i(b)?.narrow(0, eos, 1)?);
         }
-        let pooled = Tensor::cat(&rows, 0)?;
-        Ok(Some(projection.forward(&pooled)?))
+        Tensor::cat(&rows, 0)
     }
 
     /// The dtype this encoder's weights are in.

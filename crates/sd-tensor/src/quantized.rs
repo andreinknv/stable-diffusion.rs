@@ -67,6 +67,17 @@ impl QLinear {
     }
 }
 
+impl std::fmt::Debug for QLinear {
+    // QMatMul holds opaque block storage and is not Debug. Report what is
+    // actually useful when a model is printed: how much it costs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QLinear")
+            .field("resident_bytes", &self.resident)
+            .field("bias", &self.bias.is_some())
+            .finish()
+    }
+}
+
 /// What the same weight would cost dequantised, for comparison.
 pub fn dequantised_bytes(weight: &QTensor) -> usize {
     weight.shape().elem_count() * std::mem::size_of::<f32>()

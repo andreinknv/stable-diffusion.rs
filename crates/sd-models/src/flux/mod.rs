@@ -586,15 +586,19 @@ impl FluxTransformer {
         let mut img = self.img_in.forward(img)?;
         let txt = self.txt_in.forward(txt)?;
 
-        let mut vec = self.time_in.forward(&timestep_embedding(
-            timesteps,
-            TIME_EMBED_DIM,
-            self.cfg.theta,
-        )?)?;
+        // `timestep_embedding` works in f32 deliberately — its frequencies
+        // span several orders of magnitude and f16 loses the low ones — so it
+        // is cast back to the weights' dtype here rather than being computed
+        // narrow throughout.
+        let dtype = img.dtype();
+        let embed = |t: &Tensor| -> Result<Tensor> {
+            timestep_embedding(t, TIME_EMBED_DIM, self.cfg.theta)?.to_dtype(dtype)
+        };
+
+        let mut vec = self.time_in.forward(&embed(timesteps)?)?;
         match (&self.guidance_in, guidance) {
             (Some(g), Some(scale)) => {
-                vec = (vec
-                    + g.forward(&timestep_embedding(scale, TIME_EMBED_DIM, self.cfg.theta)?)?)?;
+                vec = (vec + g.forward(&embed(scale)?)?)?;
             }
             (Some(_), None) => {
                 return Err(sd_tensor::Error::Msg(
