@@ -373,6 +373,77 @@ def dump_flux_sampling(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {src}")
 
 
+
+def dump_sd3(output: pathlib.Path, model_id: str) -> None:
+    """SD 3.5's MMDiT against diffusers.
+
+    diffusers stores this model under its own renaming while the published
+    checkpoint uses Stability's, so `from_single_file` does the conversion and
+    our Rust side reads the original names — two independent readings of one
+    published file rather than a round trip through either library's
+    conventions.
+
+    Small on purpose: a 32x32 latent and 16 text tokens. The point is
+    numerical agreement, not throughput.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import SD3Transformer2DModel
+    from safetensors.torch import save_file
+
+    out = output / "sd3_transformer"
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Load the *single-file* checkpoint, not the diffusers-converted copy.
+    # The two are published from different sources and their weights differ by
+    # up to 2e-3 — enough, through 24 blocks whose activations reach 97,000,
+    # to swamp the thing being measured. Our Rust side reads this same file.
+    single = output / "sd35" / "sd35-medium.safetensors"
+    if single.exists():
+        print(f"loading {single} (single-file, matching what Rust reads)")
+        model = SD3Transformer2DModel.from_single_file(
+            str(single), config=model_id, subfolder="transformer",
+            torch_dtype=torch.float32,
+        ).eval()
+    else:
+        print(f"loading {model_id} (converted copy; expect ~1e-2 disagreement)")
+        model = SD3Transformer2DModel.from_pretrained(
+            model_id, subfolder="transformer", torch_dtype=torch.float32
+        ).eval()
+    cfg = model.config
+    print(
+        f"  hidden={cfg.num_attention_heads * cfg.attention_head_dim} "
+        f"layers={cfg.num_layers} dual={getattr(cfg, 'dual_attention_layers', None)}"
+    )
+
+    gen = torch.Generator().manual_seed(SEED)
+    latents = torch.randn(1, 16, 32, 32, generator=gen)
+    context = torch.randn(1, 16, 4096, generator=gen)
+    pooled = torch.randn(1, 2048, generator=gen)
+    timestep = torch.tensor([700.0])
+
+    with torch.no_grad():
+        result = model(
+            hidden_states=latents,
+            encoder_hidden_states=context,
+            pooled_projections=pooled,
+            timestep=timestep,
+            return_dict=False,
+        )[0]
+
+    save_file(
+        {
+            "latents": latents.contiguous(),
+            "context": context.contiguous(),
+            "pooled": pooled.contiguous(),
+            "timestep": timestep.contiguous(),
+            "output": result.detach().contiguous().clone(),
+        },
+        str(out / "reference.safetensors"),
+    )
+    print(f"wrote {out}/reference.safetensors, output {tuple(result.shape)}")
+
+
 def dump_vae(output: pathlib.Path, model_id: str) -> None:
     torch = _require("torch")
     _require("diffusers")
@@ -1141,6 +1212,10 @@ def main() -> None:
     fs.add_argument("--model-id", default="TencentARC/flux-mini")
     fs.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    sd3 = sub.add_parser("sd3", help="dump SD 3.5 MMDiT references")
+    sd3.add_argument("--model-id", default="adamo1139/stable-diffusion-3.5-medium-ungated")
+    sd3.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     clip = sub.add_parser("clip_tokenizer", help="dump CLIP tokenizer references")
     clip.add_argument(
         "--model-id",
@@ -1226,6 +1301,8 @@ def main() -> None:
         dump_flux_transformer(args.output, args.model_id)
     elif args.component == "flux_sampling":
         dump_flux_sampling(args.output, args.model_id)
+    elif args.component == "sd3":
+        dump_sd3(args.output, args.model_id)
     elif args.component == "vae":
         dump_vae(args.output, args.model_id)
     elif args.component == "clip_tokenizer":

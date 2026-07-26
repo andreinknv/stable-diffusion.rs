@@ -15,6 +15,7 @@
 
 pub mod clip;
 pub mod flux;
+pub mod sd3;
 pub mod t5;
 pub mod unet;
 pub mod vae;

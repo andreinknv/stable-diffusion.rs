@@ -159,6 +159,8 @@ architecture is independent and verifiable against its own golden data.
 | Flux MMDiT | `diffusers` | relative drift 2.1e-6 |
 | 20-step sampling loop | `diffusers` | `max_abs` 6.5e-5 |
 | Flux schnell (12B) | — | loads quantised, 4.87 GB, renders |
+| SD 3.5 VAE | `diffusers` | `max_abs` 1.2e-5 |
+| SD 3.5 MMDiT | `diffusers` | `max_abs` 5.5e-6 |
 
 Three things worth carrying to SD 3, which shares most of this:
 
@@ -215,8 +217,36 @@ already concluded — that band belongs to flux-mini.
 Still open here: **dev**, which is gated on HuggingFace and needs an account,
 and **Metal**, since all Flux work so far is CPU-only.
 
-**SD 3 is blocked on much less than Flux was**, since the sampler, T5, and the
-MMDiT pattern are now all in place. Conveniently, k-quants suit these models far better than they suit SD 1.5 —
+**SD 3.5's MMDiT is ported and verified** — `max_abs` 5.5e-6 against
+diffusers, relative drift 8.3e-7. Its VAE and sampler were config only; the
+transformer was the work.
+
+Four ways it differs from Flux, each of which fails quietly if assumed:
+learned positional embeddings cropped from the **centre** of a 384x384 table
+rather than RoPE; every block joint, with no single-stream half; the last
+block's context half `pre_only`, contributing keys and values and then
+discarding its own output; and SD 3.5's second image self-attention in the
+first 13 blocks, which modulate nine ways instead of six.
+
+The bug worth recording: **patchify and unpatchify are not inverses here.**
+The patch embedding is a convolution, so its flattened kernel runs
+`(channel, ph, pw)` — the order Flux packs in. The final linear instead emits
+`(ph, pw, channel)`. Reusing Flux's inverse gave an image of the right shape
+with every 2x2 patch transposed internally: coherent colour, destroyed
+detail, no error. It cost `max_abs` 4.42 on an output whose scale is 2.73,
+and fixing it alone took that to 9.3e-3.
+
+The remaining 9.3e-3 was not ours either. The *same weights* are published
+twice — a single fp16 file and a converted fp32 copy — and they differ by up
+to 2e-3, which 24 blocks with activations reaching 97,000 amplify. Generating
+the reference from the file Rust actually reads took it to 5.5e-6. Worth
+remembering generally: when two copies of a checkpoint exist, verify against
+the one you load.
+
+Still to do for a working SD 3.5 pipeline: the three text encoders need
+wiring together (CLIP-L and CLIP-G pooled and concatenated to 2048, T5 for
+the sequence) — all three encoders already exist and are verified, so this is
+assembly rather than new models. Conveniently, k-quants suit these models far better than they suit SD 1.5 —
 their hidden sizes are multiples of 256, so nothing falls back to F16, which
 is why city96 can publish `Q4_K` for SD 3.5 and nobody can for SD 1.5.
 
