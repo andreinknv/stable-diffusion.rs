@@ -230,6 +230,78 @@ def dump_t5(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out}/reference.safetensors ({len(tensors)} tensors) and t5.safetensors")
 
 
+
+def dump_flux_transformer(output: pathlib.Path, model_id: str) -> None:
+    """Flux's MMDiT against diffusers.
+
+    The checkpoint ships in black-forest-labs layout (`double_blocks.0.
+    img_attn.qkv`) while diffusers uses its own renaming, so diffusers is
+    loaded through `from_single_file`, which applies the conversion. Our Rust
+    model reads the original names directly. That means this compares two
+    independent readings of the *same published file* rather than a
+    round trip through one library's conventions — the lesson the legacy VAE
+    attention names taught earlier in this project.
+
+    Kept deliberately small: 16x16 latent, 8 text tokens. The transformer is
+    3.2B parameters and the reference has to fit next to it in memory.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import FluxTransformer2DModel
+    from safetensors.torch import save_file
+
+    out = output / "flux_transformer"
+    out.mkdir(parents=True, exist_ok=True)
+
+    src = output / "flux" / "flux-mini.safetensors"
+    print(f"loading {src} with the {model_id} config")
+    model = FluxTransformer2DModel.from_single_file(
+        str(src), config=model_id, torch_dtype=torch.float32
+    ).eval()
+
+    gen = torch.Generator().manual_seed(SEED)
+    lat_h, lat_w = 16, 16          # patch grid, so a 32x32 latent
+    img_len = lat_h * lat_w
+    txt_len = 8
+
+    hidden = torch.randn(1, img_len, 64, generator=gen)
+    encoder_hidden = torch.randn(1, txt_len, 4096, generator=gen)
+    pooled = torch.randn(1, 768, generator=gen)
+    timestep = torch.tensor([0.7])
+    guidance = torch.tensor([3.5])
+
+    # diffusers expects ids as [seq, 3] and builds the image grid itself.
+    img_ids = torch.zeros(img_len, 3)
+    img_ids[:, 1] = torch.arange(lat_h).repeat_interleave(lat_w).float()
+    img_ids[:, 2] = torch.arange(lat_w).repeat(lat_h).float()
+    txt_ids = torch.zeros(txt_len, 3)
+
+    with torch.no_grad():
+        result = model(
+            hidden_states=hidden,
+            encoder_hidden_states=encoder_hidden,
+            pooled_projections=pooled,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+            guidance=guidance,
+            return_dict=False,
+        )[0]
+
+    tensors = {
+        "hidden_states": hidden.contiguous(),
+        "encoder_hidden_states": encoder_hidden.contiguous(),
+        "pooled_projections": pooled.contiguous(),
+        "timestep": timestep.contiguous(),
+        "guidance": guidance.contiguous(),
+        "latent_h": torch.tensor([lat_h], dtype=torch.float32),
+        "latent_w": torch.tensor([lat_w], dtype=torch.float32),
+        "output": result.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    print(f"wrote {out}/reference.safetensors, output {tuple(result.shape)}")
+
+
 def dump_vae(output: pathlib.Path, model_id: str) -> None:
     torch = _require("torch")
     _require("diffusers")
@@ -990,6 +1062,10 @@ def main() -> None:
     t5.add_argument("--model-id", default="google/t5-v1_1-small")
     t5.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    fluxt = sub.add_parser("flux_transformer", help="dump Flux MMDiT references")
+    fluxt.add_argument("--model-id", default="TencentARC/flux-mini")
+    fluxt.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     clip = sub.add_parser("clip_tokenizer", help="dump CLIP tokenizer references")
     clip.add_argument(
         "--model-id",
@@ -1071,6 +1147,8 @@ def main() -> None:
         dump_flow(args.output, args.model_id)
     elif args.component == "t5":
         dump_t5(args.output, args.model_id)
+    elif args.component == "flux_transformer":
+        dump_flux_transformer(args.output, args.model_id)
     elif args.component == "vae":
         dump_vae(args.output, args.model_id)
     elif args.component == "clip_tokenizer":

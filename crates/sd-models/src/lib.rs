@@ -14,6 +14,7 @@
 //! 3. [`unet`] — the large one. Verify block by block, never whole-model.
 
 pub mod clip;
+pub mod flux;
 pub mod t5;
 pub mod unet;
 pub mod vae;
