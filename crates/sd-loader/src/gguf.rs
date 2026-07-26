@@ -288,6 +288,31 @@ pub fn vae_var_builder_from_gguf<'a>(
     })
 }
 
+/// Load just the text encoder from an LDM-layout GGUF.
+///
+/// The simplest of the three: LDM leaves CLIP exactly as `transformers`
+/// writes it and only adds a prefix, so this is a strip rather than a
+/// translation. See [`vae_var_builder_from_gguf`].
+pub fn clip_var_builder_from_gguf<'a>(
+    path: impl AsRef<Path>,
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'a>> {
+    ldm_tower(
+        path,
+        dtype,
+        device,
+        "text encoder",
+        "cond_stage_model.transformer.",
+        |k| {
+            GgufInfo::ldm_to_diffusers(k).map(|name| crate::ldm::Mapped {
+                name,
+                squeeze_to_2d: false,
+            })
+        },
+    )
+}
+
 /// Load just the UNet from an LDM-layout GGUF, translated to `diffusers`
 /// names. See [`vae_var_builder_from_gguf`].
 pub fn unet_var_builder_from_gguf<'a>(

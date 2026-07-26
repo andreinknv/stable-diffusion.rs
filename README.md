@@ -10,8 +10,8 @@ have a binary.
 > **Status: it renders.** Text-to-image and image-to-image work for
 > Stable Diffusion 1.5 and SDXL, on CPU and Apple GPU. Every model component is
 > verified tensor-by-tensor against `diffusers`/`transformers` — not eyeballed.
-> GGUF reads, dequantises and name-maps — VAE, UNet and text encoder all load
-> from a real quantised checkpoint — but is not yet wired into the pipelines. CUDA compiles but
+> GGUF works end to end (`sdrs txt2img --gguf`), though Q4_0 output is
+> noticeably softer than f32 — see the roadmap for why and what to try next. CUDA compiles but
 > is untested. See the [roadmap](docs/roadmap.md).
 
 <p align="center">
@@ -111,6 +111,11 @@ sdrs txt2img --sdxl --model ./models/sdxl \
 
 sdrs img2img --model ./models/sd15 --init-image out.png \
   --prompt "a watercolour painting of a crab" --strength 0.75 -o painted.png
+
+# A single quantised checkpoint, as stable-diffusion.cpp writes them. These
+# carry no tokenizer, so one has to be supplied.
+sdrs txt2img --gguf sd15-q4_0.gguf --tokenizer tokenizer.json \
+  --prompt "a rusty crab on a beach" -o out.png
 ```
 
 The same seed on the same device and build reproduces a file byte for byte.

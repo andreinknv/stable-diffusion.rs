@@ -59,8 +59,20 @@ enum Command {
     #[command(name = "txt2img")]
     Txt2Img {
         /// Model directory in the standard diffusers layout.
+        #[arg(long, conflicts_with = "gguf")]
+        model: Option<String>,
+
+        /// A single LDM-layout `.gguf` checkpoint instead of a directory.
+        ///
+        /// These carry no tokenizer — stable-diffusion.cpp writes no GGUF
+        /// metadata at all — so `--tokenizer` is required with it.
+        #[arg(long, requires = "tokenizer")]
+        gguf: Option<String>,
+
+        /// `tokenizer.json`, for `--gguf`. Copy it from
+        /// `openai/clip-vit-large-patch14`.
         #[arg(long)]
-        model: String,
+        tokenizer: Option<String>,
 
         #[arg(long)]
         prompt: String,
@@ -274,6 +286,8 @@ fn main() -> Result<()> {
 
         Command::Txt2Img {
             model,
+            gguf,
+            tokenizer,
             prompt,
             negative_prompt,
             width,
@@ -296,25 +310,42 @@ fn main() -> Result<()> {
                 sampler: parse_sampler(&sampler)?,
             };
 
-            tracing::info!(model = %model, sdxl, "loading pipeline");
+            let source = gguf.clone().or_else(|| model.clone()).unwrap_or_default();
+            tracing::info!(model = %source, sdxl, gguf = gguf.is_some(), "loading pipeline");
             let started = std::time::Instant::now();
             let mut report = |step, total, sigma: f64| {
                 tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
             };
             // A 20-step CPU run takes minutes; without per-step output it
             // looks hung.
-            let img = if sdxl {
-                let pipeline = sd::pipeline::SdxlPipeline::load(Path::new(&model), &dev)
-                    .with_context(|| format!("loading SDXL pipeline from {model}"))?;
-                pipeline
-                    .run_with_progress(&cfg, &mut report)
-                    .context("running SDXL txt2img")?
-            } else {
-                let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                    .with_context(|| format!("loading pipeline from {model}"))?;
-                pipeline
-                    .run_with_progress(&cfg, &mut report)
-                    .context("running txt2img")?
+            let img = match (gguf.as_deref(), sdxl) {
+                (Some(_), true) => {
+                    anyhow::bail!("--gguf is SD 1.5 only; SDXL GGUF checkpoints are not supported")
+                }
+                (Some(g), false) => {
+                    let tok = tokenizer.as_deref().expect("clap requires it with --gguf");
+                    let pipeline = Txt2ImgPipeline::load_gguf(Path::new(g), Path::new(tok), &dev)
+                        .with_context(|| format!("loading pipeline from {g}"))?;
+                    pipeline
+                        .run_with_progress(&cfg, &mut report)
+                        .context("running txt2img from gguf")?
+                }
+                (None, true) => {
+                    let m = model.as_deref().context("--model or --gguf is required")?;
+                    let pipeline = sd::pipeline::SdxlPipeline::load(Path::new(m), &dev)
+                        .with_context(|| format!("loading SDXL pipeline from {m}"))?;
+                    pipeline
+                        .run_with_progress(&cfg, &mut report)
+                        .context("running SDXL txt2img")?
+                }
+                (None, false) => {
+                    let m = model.as_deref().context("--model or --gguf is required")?;
+                    let pipeline = Txt2ImgPipeline::load(Path::new(m), &dev)
+                        .with_context(|| format!("loading pipeline from {m}"))?;
+                    pipeline
+                        .run_with_progress(&cfg, &mut report)
+                        .context("running txt2img")?
+                }
             };
 
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;

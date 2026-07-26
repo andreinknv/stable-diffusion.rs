@@ -207,3 +207,49 @@ fn matches_transformers_reference() {
     )
     .unwrap();
 }
+
+/// The text encoder loaded from a quantised LDM checkpoint.
+///
+/// The one tower whose GGUF mapping was argued rather than measured: LDM only
+/// prefixes CLIP, so the translation "is obviously" a strip. This checks it,
+/// because obviously-correct is how the other two would have looked too.
+#[test]
+fn a_quantised_ldm_text_encoder_matches_the_reference() {
+    let refs_path = golden_dir().join("reference.safetensors");
+    let gguf =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/gguf/sd15-q4_0.gguf");
+    if !refs_path.exists() || !gguf.exists() {
+        eprintln!("SKIP: needs the clip reference and sd15-q4_0.gguf");
+        return;
+    }
+
+    let dev = Device::Cpu;
+    let refs = sd_tensor::safetensors::load(&refs_path, &dev).expect("reference");
+    let vb = sd_loader::clip_var_builder_from_gguf(&gguf, DType::F32, &dev)
+        .expect("loading CLIP from a GGUF checkpoint");
+    let encoder = ClipTextEncoder::new(&ClipTextConfig::sd15(), vb)
+        .expect("every mapped name must be one the encoder asks for");
+
+    let token_ids = refs.get("token_ids").expect("token_ids");
+    let got = encoder.forward(token_ids).expect("forward");
+    let want = refs.get("last_hidden_state").expect("last_hidden_state");
+
+    let c = testing::closeness(&got, want).expect("comparing");
+    // Correlation, for the same reason as the UNet: an absolute bound on
+    // 4-bit weights is arbitrary, and a wrong mapping lands near zero
+    // regardless of magnitude.
+    let a = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let n = a.len() as f32;
+    let (ma, mb) = (a.iter().sum::<f32>() / n, b.iter().sum::<f32>() / n);
+    let cov: f32 = a.iter().zip(&b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+    let va: f32 = a.iter().map(|x| (x - ma).powi(2)).sum();
+    let vb2: f32 = b.iter().map(|y| (y - mb).powi(2)).sum();
+    let corr = cov / (va.sqrt() * vb2.sqrt());
+    eprintln!("gguf clip vs f32 reference: {c}, correlation {corr:.4}");
+
+    assert!(
+        corr > 0.97,
+        "the conditioning is not the reference's: correlation {corr:.4} ({c})"
+    );
+}

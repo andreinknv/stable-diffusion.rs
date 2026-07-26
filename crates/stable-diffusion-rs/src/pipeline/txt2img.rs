@@ -244,6 +244,63 @@ impl Txt2ImgPipeline {
         })
     }
 
+    /// Load every tower from a single LDM-layout GGUF checkpoint.
+    ///
+    /// `tokenizer` is a separate path because **the checkpoint does not carry
+    /// one**. `stable-diffusion.cpp` writes no GGUF metadata at all — not the
+    /// vocabulary, not even `general.architecture` — so unlike a language
+    /// model in this format, an SD checkpoint cannot supply its own
+    /// tokenizer. Copy `tokenizer.json` from `openai/clip-vit-large-patch14`.
+    ///
+    /// Weights are dequantised on load: a 4-bit checkpoint costs what its
+    /// expanded weights cost, not what the file does. The memory guard sizes
+    /// each tower against that.
+    pub fn load_gguf(
+        gguf: &Path,
+        tokenizer: &Path,
+        device: &Device,
+    ) -> Result<Self, PipelineError> {
+        if !gguf.exists() {
+            return Err(PipelineError::MissingFile(gguf.to_path_buf()));
+        }
+        if !tokenizer.exists() {
+            return Err(PipelineError::MissingTokenizerJson(tokenizer.to_path_buf()));
+        }
+
+        let tokenizer = ClipTokenizer::from_file(tokenizer)?;
+
+        let vb = sd_loader::clip_var_builder_from_gguf(gguf, DType::F32, device)?;
+        let text_encoder = ClipTextEncoder::new(&ClipTextConfig::sd15(), vb)?;
+
+        let vb = sd_loader::unet_var_builder_from_gguf(gguf, DType::F32, device)?;
+        let unet = UNet2DConditionModel::new(&UNetConfig::sd15(), vb)?;
+
+        let vb = sd_loader::vae_var_builder_from_gguf(gguf, DType::F32, device)?;
+        let vae = AutoencoderKlDecoder::new(&VaeConfig::sd15(), vb).map_err(|source| {
+            PipelineError::VaeWeights {
+                path: gguf.to_path_buf(),
+                source,
+            }
+        })?;
+        let vb = sd_loader::vae_var_builder_from_gguf(gguf, DType::F32, device)?;
+        let vae_encoder = AutoencoderKlEncoder::new(&VaeConfig::sd15(), vb).map_err(|source| {
+            PipelineError::VaeWeights {
+                path: gguf.to_path_buf(),
+                source,
+            }
+        })?;
+
+        Ok(Self {
+            tokenizer,
+            text_encoder,
+            unet,
+            vae,
+            vae_encoder,
+            schedule: Schedule::sd15(),
+            device: device.clone(),
+        })
+    }
+
     /// Encode a prompt to `[1, 77, 768]`.
     fn encode(&self, text: &str) -> Result<Tensor, PipelineError> {
         let ids = self.tokenizer.encode(text)?;

@@ -68,7 +68,7 @@ leave the order-1 range; `testing::assert_close` is absolute-only.
 | ✅ | SDXL — text encoder 2 | verified vs `transformers` |
 | ✅ | SDXL — UNet | verified vs `diffusers`, max_abs 1.4e-5 |
 | ✅ | SDXL — end to end | 1024 on Metal in 89 s, f16 weights + tiled decode |
-| ✅ | GGUF | VAE and UNet both load from a real Q4_0 checkpoint |
+| ✅ | GGUF | `--gguf` generates images; Q4_0 quality is poor, see below |
 | ⬜ | Metal and CUDA paths through the seam | Metal verified end to end |
 
 The VAE encoder's downsampler pads **asymmetrically** (bottom and right only).
@@ -79,13 +79,28 @@ any other downsampling path.
 Remaining milestone 2 work:
 
 - SDXL (same geometry, second text encoder, different latent scaling)
-- **Wire the GGUF loaders into the pipelines.** All three towers translate
-  and load from a real `stable-diffusion.cpp` checkpoint — VAE, UNet, and the
-  text encoder — each verified against the same golden references the
-  safetensors path uses. What is left is plumbing: a `--gguf` path through
-  `Txt2ImgPipeline` that reads one file instead of a directory, and a
-  tokenizer, since GGUF carries the vocabulary as metadata rather than as
-  `tokenizer.json`.
+- **Better quantisations than Q4_0.** `sdrs txt2img --gguf` works end to end,
+  but the image from a Q4_0 checkpoint is markedly worse than the f32 one —
+  soft, low-contrast, short on detail. The mapping is not the cause; all three
+  towers are verified against the same golden references as the safetensors
+  path:
+
+  | tower | vs. f32 reference |
+  |---|---|
+  | VAE decode | `mean_abs` 8.9e-3 |
+  | UNet | correlation 0.9848 |
+  | text encoder | correlation 0.9746 |
+
+  The text encoder is the weakest, which is consistent with what is already
+  known about it: CLIP carries activations of magnitude 851, and 4-bit blocks
+  represent those badly. Conditioning error at the start of the loop compounds
+  through every step.
+
+  So the useful next step is Q8_0 and the k-quants (`Q4_K`/`Q5_K`), which keep
+  outliers at higher precision — candle already dequantises all of them, so
+  this is fixture work and measurement, not new code. Worth checking whether
+  keeping the text encoder at F16 while the UNet stays quantised recovers most
+  of the quality for little memory.
 - CUDA through the seam. Metal is verified end to end at 512; CUDA is untested.
 - **SD 1.5 in f16 too**, if it is ever worth it. SDXL needed it to fit; SD 1.5
   does not, and switching would mean re-verifying every golden test against f16
