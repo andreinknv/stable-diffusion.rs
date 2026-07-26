@@ -10,7 +10,7 @@ Ordered by **ops validated per unit of effort**, with visible output early.
 | ✅ | safetensors loading | done |
 | ✅ | VAE decoder — structural tests | done |
 | ✅ | VAE decoder — numerical vs `diffusers` | verified, max_abs 3.7e-5 |
-| ⬜ | CLIP tokenizer (BPE) | |
+| ✅ | CLIP tokenizer (BPE) | verified id-for-id vs HuggingFace |
 | ⬜ | CLIP text encoder | |
 | ⬜ | UNet | |
 | ⬜ | Euler ancestral, DPM++ 2M | |
@@ -25,8 +25,9 @@ Reproduce with `python3 xtask/golden/dump_reference.py vae --output tests/golden
 followed by `cargo test --release -p sd-models --test golden_vae`. The
 references are ~460 MB and stay out of git, so this remains a local step.
 
-Next concrete task: the CLIP tokenizer and text encoder, which is the last
-piece before a UNet has anything to condition on.
+The CLIP tokenizer is done and matches HuggingFace id for id. Next concrete
+task: the CLIP **text encoder** (docs/agent-tasks/02), which turns those 77 ids
+into the embedding a UNet conditions on.
 
 ## Milestone 2 — usable
 
