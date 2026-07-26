@@ -13,8 +13,8 @@ Ordered by **ops validated per unit of effort**, with visible output early.
 | ✅ | CLIP tokenizer (BPE) | verified id-for-id vs HuggingFace |
 | ✅ | CLIP text encoder | verified layer by layer vs `transformers` |
 | ✅ | UNet | verified: 12 skips, mid block, output vs `diffusers` |
-| ⬜ | Euler ancestral, DPM++ 2M | |
-| ⬜ | `sdrs txt2img` | |
+| ✅ | Euler ancestral, DPM++ 2M | verified vs numpy reference |
+| 🔴 | `sdrs txt2img` | works; stock VAE needs a key rename in sd-loader |
 
 The VAE decoder is **numerically verified** against `diffusers` as of
 2026-07-25: `max_abs = 3.678e-5`, `mean_abs = 4.408e-7` on the full 256x256
@@ -34,8 +34,23 @@ checked against `diffusers` at `atol = 1e-4` — including all twelve skip
 tensors individually, which is what makes a failure localizable across 25
 blocks.
 
-Next concrete task: the **samplers** (docs/agent-tasks/06), then `txt2img`
-(07), which is the point at which an image comes out of the end.
+Milestone 1 is functionally complete: `sdrs txt2img` produces a real image —
+see `assets/crab-512-dpmpp2m-seed42.png`, 512x512, 20 steps, DPM++ 2M, seed 42,
+113 s on CPU. The same seed twice gives byte-identical PNGs.
+
+One thing stands between that and "done", and it is small:
+
+**Stock SD 1.5 VAE weights will not load.** They use the legacy diffusers
+attention names (`query`/`key`/`value`/`proj_attn`) where the decoder expects
+`to_q`/`to_k`/`to_v`/`to_out.0`. The golden VAE test does not catch it because
+its reference is exported through `vae.state_dict()`, which diffusers renames
+on load. The fix is a key-conversion map in **sd-loader** — conversion belongs
+there, not in the model code — plus a golden test that loads a *raw* checkpoint
+rather than a re-exported one. Until then `txt2img` needs a re-exported VAE.
+
+A stock download also has no `tokenizer/tokenizer.json`; the repository ships
+vocab.json + merges.txt. Copy it from `openai/clip-vit-large-patch14`. The
+pipeline's error message says so.
 
 A note for whoever verifies it. CLIP's activations peak at 851 and f32 cannot
 hold 1e-4 absolute at that magnitude, so `golden_clip_encoder.rs` compares with
@@ -89,7 +104,10 @@ is a hand-written kernel, and it is the remaining work. See
 
 ## Good first issues
 
-- BPE tokenizer with a golden test against `transformers`
+- **Legacy VAE key conversion in sd-loader** (see milestone 1). Small, and it
+  is the last thing between `sdrs txt2img` and working on an unmodified
+  download. Pair it with a golden test that loads a raw checkpoint rather than
+  a `state_dict()` re-export, since that is precisely what hid the problem.
 - Additional samplers (DDIM, Heun, LMS) against reference trajectories
 - GGUF header parsing (metadata only, before dequantization)
 - A repeatable benchmark harness for `backend_bench`: run each configuration N
