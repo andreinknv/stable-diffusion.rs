@@ -114,6 +114,15 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f64,
 
+        /// Make the image tile seamlessly, by padding every convolution
+        /// circularly so the model never sees an edge.
+        ///
+        /// `x`, `y` or `xy`. Per-axis because a scrolling parallax layer wants
+        /// horizontal wrapping only — forcing vertical wrap makes its sky
+        /// bleed into its floor.
+        #[arg(long, value_name = "AXES")]
+        seamless: Option<String>,
+
         /// Write a preview image every N steps, beside --output.
         ///
         /// Costs a full decode each time, so this is worth having with
@@ -653,6 +662,7 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
+            seamless,
             preview_every,
             taesd,
         } => {
@@ -665,6 +675,20 @@ fn main() -> Result<()> {
                 cfg_scale,
                 seed,
                 sampler: parse_sampler(&sampler)?,
+            };
+
+            // Held for the whole generation: the mode is read by every
+            // convolution and reverts when this drops.
+            let _tiling = match seamless.as_deref() {
+                None => None,
+                Some(axes) => {
+                    let (x, y) = (axes.contains('x'), axes.contains('y'));
+                    if !x && !y {
+                        anyhow::bail!("--seamless takes x, y or xy, got `{axes}`");
+                    }
+                    tracing::info!(wrap_x = x, wrap_y = y, "seamless");
+                    Some(sd_tensor::conv::seamless(x, y))
+                }
             };
 
             let source = gguf.clone().or_else(|| model.clone()).unwrap_or_default();

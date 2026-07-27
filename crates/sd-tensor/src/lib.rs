@@ -48,10 +48,16 @@ pub fn tensor_shape(path: &std::path::Path, name: &str) -> Result<Option<Vec<usi
 /// Layers we build models out of. Re-exported so model crates never name candle.
 pub mod nn {
     pub use candle_nn::{
-        conv2d, conv2d_no_bias, embedding, group_norm, layer_norm, linear, linear_no_bias, Conv2d,
-        Conv2dConfig, Embedding, GroupNorm, LayerNorm, LayerNormConfig, Linear, VarBuilder, VarMap,
+        embedding, group_norm, layer_norm, linear, linear_no_bias, Conv2dConfig, Embedding,
+        GroupNorm, LayerNorm, LayerNormConfig, Linear, VarBuilder, VarMap,
     };
+    // Shadowing candle's, so every model picks up circular padding without
+    // changing. See `crate::conv`.
+    pub use crate::conv::{conv2d, conv2d_no_bias, Conv2d};
 }
+
+/// Convolution with optional circular padding, for seamless tiling.
+pub mod conv;
 
 /// Elementwise and reduction ops.
 ///
