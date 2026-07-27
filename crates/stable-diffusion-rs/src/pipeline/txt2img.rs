@@ -104,12 +104,38 @@ pub enum PipelineError {
     Tensor(#[from] sd_tensor::Error),
 }
 
-/// Called after each denoising step: `(step, total, sigma)`.
+/// What a progress callback is told after each denoising step.
+///
+/// A struct rather than positional arguments because the interesting field is
+/// `latent`, and a fourth positional `&Tensor` would be easy to ignore — which
+/// is the opposite of what it is for.
+pub struct Progress<'a> {
+    /// 1-based; equal to `total` on the last step.
+    pub step: usize,
+    pub total: usize,
+    pub sigma: f64,
+    /// The model's current estimate of the finished image, as a latent.
+    ///
+    /// **Not the sampler's latent**, and the difference is the whole value of
+    /// this field. The latent at step 5 of 20 is `x0 + sigma*noise` with sigma
+    /// still around 4, so decoding it shows noise; this is the `x0` the model
+    /// predicts, which decodes to a blurry version of the final image and
+    /// sharpens as the run proceeds. That is what a preview is for, and it is
+    /// what every diffusion UI shows.
+    ///
+    /// Borrowed, and decoding it is the caller's choice: a full VAE decode per
+    /// step costs more than the denoising does, which is exactly why
+    /// [`Txt2ImgPipeline::with_taesd`] exists. `Txt2ImgPipeline::preview`
+    /// decodes it with whichever decoder is attached.
+    pub denoised: &'a Tensor,
+}
+
+/// Called after each denoising step.
 ///
 /// A callback rather than a log line because this crate has no logging
 /// dependency and adding one is out of scope. The CLI owns the reporting, and
-/// a 20-step CPU run needs it — it takes minutes and otherwise looks hung.
-pub type ProgressFn<'a> = &'a mut dyn FnMut(usize, usize, f64);
+/// a library caller can render progress however it likes.
+pub type ProgressFn<'a> = &'a mut dyn FnMut(Progress<'_>);
 
 /// How much of the schedule an img2img run replaces.
 ///
@@ -498,6 +524,15 @@ impl Txt2ImgPipeline {
         }
     }
 
+    /// Decode a latent for previewing, with whichever decoder is attached.
+    ///
+    /// The same decode the final image gets — there is no reduced-quality
+    /// preview path, because a preview that does not look like the result is
+    /// worse than none. Attach TAESD first if this is called every step.
+    pub fn preview(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
+        self.decode(latent)
+    }
+
     /// Whether a ControlNet is attached.
     pub fn has_controlnet(&self) -> bool {
         self.controlnet.is_some()
@@ -505,7 +540,7 @@ impl Txt2ImgPipeline {
 
     /// Generate under spatial control. Returns `[1, 3, height, width]`.
     pub fn run_control(&self, cfg: &ControlConfig) -> Result<Tensor, PipelineError> {
-        self.run_control_with_progress(cfg, &mut |_, _, _| {})
+        self.run_control_with_progress(cfg, &mut |_| {})
     }
 
     /// [`Self::run_control`], reporting progress after each step.
@@ -579,7 +614,7 @@ impl Txt2ImgPipeline {
 
     /// Generate. Returns `[1, 3, height, width]` in `[-1, 1]`.
     pub fn run(&self, cfg: &Txt2ImgConfig) -> Result<Tensor, PipelineError> {
-        self.run_with_progress(cfg, &mut |_, _, _| {})
+        self.run_with_progress(cfg, &mut |_| {})
     }
 
     /// [`Self::run`], reporting progress after each step.
@@ -637,7 +672,7 @@ impl Txt2ImgPipeline {
     /// through a VAE round trip, which is not lossless, so the result is
     /// composited against the original in pixel space at the end.
     pub fn run_inpaint(&self, cfg: &InpaintConfig) -> Result<Tensor, PipelineError> {
-        self.run_inpaint_with_progress(cfg, &mut |_, _, _| {})
+        self.run_inpaint_with_progress(cfg, &mut |_| {})
     }
 
     /// [`Self::run_inpaint`], reporting progress after each step.
@@ -827,14 +862,19 @@ impl Txt2ImgPipeline {
                     (latent.broadcast_mul(k.mask)? + restored.broadcast_mul(&(1.0 - k.mask)?)?)?;
             }
 
-            progress(i + 1, steps, sigma);
+            progress(Progress {
+                step: i + 1,
+                total: steps,
+                sigma,
+                denoised: &denoised,
+            });
         }
         Ok(latent)
     }
 
     /// Generate from an existing image. Returns `[1, 3, height, width]`.
     pub fn run_img2img(&self, cfg: &Img2ImgConfig) -> Result<Tensor, PipelineError> {
-        self.run_img2img_with_progress(cfg, &mut |_, _, _| {})
+        self.run_img2img_with_progress(cfg, &mut |_| {})
     }
 
     /// [`Self::run_img2img`], reporting progress after each step.

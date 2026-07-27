@@ -23,7 +23,7 @@ use sd_sample::{
 use sd_tensor::rng::SeededRng;
 use sd_tensor::{DType, Device, Tensor};
 
-use super::{Img2ImgConfig, PipelineError, ProgressFn, SamplerKind, Txt2ImgConfig};
+use super::{Img2ImgConfig, PipelineError, Progress, ProgressFn, SamplerKind, Txt2ImgConfig};
 
 /// SDXL's second tokenizer pads with `!`, not `<|endoftext|>`.
 const TOKENIZER_2_PAD: &str = "!";
@@ -212,7 +212,7 @@ impl SdxlPipeline {
 
     /// Generate. Returns `[1, 3, height, width]` in `[-1, 1]`.
     pub fn run(&self, cfg: &Txt2ImgConfig) -> Result<Tensor, PipelineError> {
-        self.run_with_progress(cfg, &mut |_, _, _| {})
+        self.run_with_progress(cfg, &mut |_| {})
     }
 
     /// [`Self::run`], reporting progress after each step.
@@ -313,7 +313,12 @@ impl SdxlPipeline {
                 }
             };
 
-            progress(i + 1, steps, sigma);
+            progress(Progress {
+                step: i + 1,
+                total: steps,
+                sigma,
+                denoised: &denoised,
+            });
         }
         Ok(latent)
     }
@@ -343,7 +348,7 @@ impl SdxlPipeline {
 
     /// Generate from an existing image. Returns `[1, 3, height, width]`.
     pub fn run_img2img(&self, cfg: &Img2ImgConfig) -> Result<Tensor, PipelineError> {
-        self.run_img2img_with_progress(cfg, &mut |_, _, _| {})
+        self.run_img2img_with_progress(cfg, &mut |_| {})
     }
 
     /// [`Self::run_img2img`], reporting progress after each step.

@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 275 tests, all gates green
+table is in [roadmap.md](roadmap.md). 277 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,21 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**Step previews work**, `--preview-every N`, which is what the tiny decoder
+was for: a 20-step run no longer sits blank for two minutes.
+
+**The preview is the `x0` estimate, not the sampler's latent**, and that is
+the whole design. The latent at step 5 of 20 is `x0 + sigma*noise` with sigma
+still near 4, so decoding it shows a field of coloured noise — the first
+version did exactly that and looked broken. The model's `x0` prediction is
+already computed every step; decoded, it is a blurry crab at step 5 that
+sharpens as the run proceeds (`assets/preview-step05-of-20.png`). Every
+diffusion UI shows this and now so does this one.
+
+`ProgressFn` therefore carries a `Progress` struct rather than three
+positional arguments. A fourth positional `&Tensor` would have been easy to
+ignore, which is the opposite of the point.
 
 **TAESD decodes**, `sdrs txt2img --taesd <ckpt>`. About 5 MB of 3x3
 convolutions against the VAE's 330 — no attention, no GroupNorm, no sampling
@@ -280,19 +295,18 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### ~~1. TAESD — the tiny decoder~~ — done; previews are the part still open
+### ~~1. TAESD and step previews~~ — both done
 
-The port is in and verified (see above). What it was *for* is still missing:
+Ported, verified and wired up (see above). Two ends left loose, neither large:
 
-- **Step previews.** The reason to want a cheap decoder is decoding every step,
-  and that needs `ProgressFn` to carry the latent. It is
-  `&mut dyn FnMut(usize, usize, f64)` today; carrying a `&Tensor` means a
-  struct-shaped callback, which touches Flux, SD 3, SDXL and txt2img. Worth
-  designing once rather than bolting a second callback alongside.
-- **Never building the VAE decoder.** The 5 MB-against-330 win needs the field
-  to be optional, not merely unused.
-- **SDXL.** Same architecture, different weights (`taesdxl`); `--taesd` refuses
-  it rather than loading weights that would silently mismatch.
+- **Never building the VAE decoder.** The 5 MB-against-330 win needs
+  `Txt2ImgPipeline::vae` to be optional, not merely unused — `with_taesd`
+  currently adds the tiny decoder on top of a VAE that is still resident, so
+  the memory saving is zero today. The speed saving is real (8-11 s at 512).
+- **SDXL.** Same architecture, different weights (`taesdxl`); `--taesd`
+  refuses it rather than loading weights that would silently mismatch. Flux and
+  SD 3 have their own progress callbacks and no previews yet — `Progress` is
+  the shape to converge them on.
 
 ### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
 

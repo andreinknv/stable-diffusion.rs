@@ -114,6 +114,13 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f64,
 
+        /// Write a preview image every N steps, beside --output.
+        ///
+        /// Costs a full decode each time, so this is worth having with
+        /// --taesd and expensive without it.
+        #[arg(long)]
+        preview_every: Option<usize>,
+
         /// Decode with TAESD instead of the VAE (a ~5 MB .safetensors).
         ///
         /// Much faster and much smaller; lossier, so fine detail softens.
@@ -293,6 +300,52 @@ enum Command {
     Info,
 }
 
+/// A progress callback that logs and, every `every` steps, writes a preview.
+///
+/// A preview failure is reported and swallowed: a run that has spent two
+/// minutes denoising should not die because a directory is read-only.
+fn previewing<'a>(
+    pipeline: &'a Txt2ImgPipeline,
+    every: Option<usize>,
+    output: &'a str,
+) -> impl FnMut(sd::pipeline::Progress) + 'a {
+    move |p: sd::pipeline::Progress| {
+        tracing::info!(
+            step = p.step,
+            total = p.total,
+            sigma = format!("{:.3}", p.sigma),
+            "denoise"
+        );
+        let Some(n) = every.filter(|n| *n > 0) else {
+            return;
+        };
+        if p.step % n != 0 && p.step != p.total {
+            return;
+        }
+        let path = preview_path(output, p.step);
+        let wrote = pipeline
+            .preview(p.denoised)
+            .map_err(anyhow::Error::from)
+            .and_then(|img| Ok(sd::image_io::save_png(&img, &path)?));
+        match wrote {
+            Ok(()) => tracing::info!(step = p.step, path = %path, "preview"),
+            Err(e) => tracing::warn!(step = p.step, error = %e, "preview failed"),
+        }
+    }
+}
+
+/// Where a step preview is written: `out.png` -> `out-preview-005.png`.
+fn preview_path(output: &str, step: usize) -> String {
+    let p = Path::new(output);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("preview");
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("png");
+    let name = format!("{stem}-preview-{step:03}.{ext}");
+    match p.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name).to_string_lossy().into_owned(),
+        _ => name,
+    }
+}
+
 /// Attach TAESD if asked, so the three txt2img branches share one line.
 fn with_taesd(pipeline: Txt2ImgPipeline, path: Option<&str>) -> anyhow::Result<Txt2ImgPipeline> {
     match path {
@@ -442,6 +495,7 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
+            preview_every,
             taesd,
         } => {
             let cfg = Txt2ImgConfig {
@@ -458,8 +512,13 @@ fn main() -> Result<()> {
             let source = gguf.clone().or_else(|| model.clone()).unwrap_or_default();
             tracing::info!(model = %source, sdxl, gguf = gguf.is_some(), "loading pipeline");
             let started = std::time::Instant::now();
-            let mut report = |step, total, sigma: f64| {
-                tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
+            let mut report = |p: sd::pipeline::Progress| {
+                tracing::info!(
+                    step = p.step,
+                    total = p.total,
+                    sigma = format!("{:.3}", p.sigma),
+                    "denoise"
+                );
             };
             // A 20-step CPU run takes minutes; without per-step output it
             // looks hung.
@@ -472,6 +531,7 @@ fn main() -> Result<()> {
                     let pipeline = Txt2ImgPipeline::load_gguf(Path::new(g), Path::new(tok), &dev)
                         .with_context(|| format!("loading pipeline from {g}"))?;
                     let pipeline = with_taesd(pipeline, taesd.as_deref())?;
+                    let mut report = previewing(&pipeline, preview_every, &output);
                     pipeline
                         .run_with_progress(&cfg, &mut report)
                         .context("running txt2img from gguf")?
@@ -506,6 +566,7 @@ fn main() -> Result<()> {
                             .with_context(|| format!("loading pipeline from {m}"))?,
                     };
                     let pipeline = with_taesd(pipeline, taesd.as_deref())?;
+                    let mut report = previewing(&pipeline, preview_every, &output);
                     pipeline
                         .run_with_progress(&cfg, &mut report)
                         .context("running txt2img")?
@@ -578,8 +639,13 @@ fn main() -> Result<()> {
             };
             tracing::info!(model = %model, controlnet = %controlnet, scale = control_scale, "controlnet");
             let started = std::time::Instant::now();
-            let mut report = |step, total, sigma: f64| {
-                tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
+            let mut report = |p: sd::pipeline::Progress| {
+                tracing::info!(
+                    step = p.step,
+                    total = p.total,
+                    sigma = format!("{:.3}", p.sigma),
+                    "denoise"
+                );
             };
             let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
                 .with_context(|| format!("loading pipeline from {model}"))?
@@ -626,8 +692,13 @@ fn main() -> Result<()> {
             };
             tracing::info!(model = %model, init = %init_image, mask = %mask, "inpainting");
             let started = std::time::Instant::now();
-            let mut report = |step, total, sigma: f64| {
-                tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
+            let mut report = |p: sd::pipeline::Progress| {
+                tracing::info!(
+                    step = p.step,
+                    total = p.total,
+                    sigma = format!("{:.3}", p.sigma),
+                    "denoise"
+                );
             };
             let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
                 .with_context(|| format!("loading pipeline from {model}"))?;
@@ -676,8 +747,13 @@ fn main() -> Result<()> {
                 "generating"
             );
             let started = std::time::Instant::now();
-            let mut report = |step, total, sigma: f64| {
-                tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
+            let mut report = |p: sd::pipeline::Progress| {
+                tracing::info!(
+                    step = p.step,
+                    total = p.total,
+                    sigma = format!("{:.3}", p.sigma),
+                    "denoise"
+                );
             };
             let img = if sdxl {
                 let pipeline = sd::pipeline::SdxlPipeline::load(Path::new(&model), &dev)
@@ -699,4 +775,28 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_path;
+
+    #[test]
+    fn previews_land_beside_the_output_not_in_the_working_directory() {
+        // A run writing to /tmp/out.png should not scatter previews into
+        // wherever the shell happens to be.
+        assert_eq!(
+            preview_path("/tmp/run/out.png", 5),
+            "/tmp/run/out-preview-005.png"
+        );
+        assert_eq!(preview_path("out.png", 20), "out-preview-020.png");
+        // Zero-padded so `ls` sorts them in run order rather than 1, 10, 2.
+        assert_eq!(preview_path("a.png", 1), "a-preview-001.png");
+        assert_eq!(preview_path("a.png", 100), "a-preview-100.png");
+    }
+
+    #[test]
+    fn an_output_with_no_extension_still_gets_one() {
+        assert_eq!(preview_path("out", 3), "out-preview-003.png");
+    }
 }
