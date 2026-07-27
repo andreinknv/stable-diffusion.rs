@@ -25,6 +25,11 @@ python3 xtask/golden/dump_reference.py vae --output tests/golden
 This downloads the SD 1.5 VAE (~330 MB) once and writes
 `tests/golden/vae_decoder/reference.safetensors`.
 
+Every component has its own subcommand — `unet_full`, `sd3`, `flux_transformer`,
+`controlnet`, and the rest; `--help` lists them. Each writes a
+`reference.safetensors` and symlinks the checkpoint it used next to it, so the
+Rust test has one fixed path to open and no knowledge of the HuggingFace cache.
+
 ## Running the tests
 
 ```bash
@@ -71,6 +76,12 @@ result, checked by perturbing the reference: passes at 0.1% (that is `rtol`),
 fails at 0.2% and above, against a measured noise floor of 0.0007%. Real
 porting bugs are far past that — the VAE's asymmetric-padding bug showed
 17.32.
+
+ControlNet is compared correction by correction — twelve for the skips plus
+one for the mid block — rather than as a single tensor. It has no image of its
+own to look at, so those thirteen tensors *are* its whole observable behaviour,
+and the index of the first bad one localises the fault the way the UNet's skip
+index does. A correct port lands at 1.45e-5 worst-case against a 1e-3 bound.
 
 ## Reading a failure
 

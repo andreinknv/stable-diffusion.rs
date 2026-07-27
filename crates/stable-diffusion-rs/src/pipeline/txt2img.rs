@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use sd_models::clip::{ClipTextConfig, ClipTextEncoder, ClipTokenizer};
+use sd_models::controlnet::ControlNet;
 use sd_models::unet::{UNet2DConditionModel, UNetConfig};
 use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, VaeConfig};
 use sd_sample::{
@@ -92,6 +93,13 @@ pub enum PipelineError {
          which nothing downstream can detect, so it is refused here instead."
     )]
     LoraMismatch { unmatched: usize, first: String },
+    #[error(
+        "this pipeline has no ControlNet.\n\n\
+         Attach one with `Txt2ImgPipeline::with_controlnet(path)` before calling \
+         `run_control`. Running the control config without one would silently ignore \
+         the control image and return an ordinary generation."
+    )]
+    NoControlNet,
     #[error("tensor: {0}")]
     Tensor(#[from] sd_tensor::Error),
 }
@@ -166,6 +174,29 @@ pub struct Img2ImgConfig {
     pub strength: Strength,
 }
 
+/// A generation steered by a ControlNet.
+#[derive(Debug, Clone)]
+pub struct ControlConfig {
+    pub base: Txt2ImgConfig,
+    /// The control map as `[1, 3, height, width]` in `[0, 1]` at **pixel**
+    /// resolution — a Canny edge map, a depth map, a pose skeleton.
+    ///
+    /// A prepared tensor rather than a path, because what counts as a control
+    /// map depends on which ControlNet is loaded and this crate cannot check
+    /// the two agree. [`crate::canny`] makes one for the canny models.
+    pub hint: Tensor,
+    /// How strongly the control applies. 1.0 is the published strength; 0.0 is
+    /// exactly an uncontrolled run.
+    pub scale: f64,
+}
+
+/// A control map and its strength, for one run.
+struct Hint<'a> {
+    /// `[2, 3, h, w]`, already doubled for the guidance batch.
+    hint: &'a Tensor,
+    scale: f64,
+}
+
 /// A loaded SD 1.5 pipeline.
 pub struct Txt2ImgPipeline {
     tokenizer: ClipTokenizer,
@@ -175,6 +206,8 @@ pub struct Txt2ImgPipeline {
     vae_encoder: AutoencoderKlEncoder,
     schedule: Schedule,
     device: Device,
+    /// Optional spatial conditioning, attached by [`Txt2ImgPipeline::with_controlnet`].
+    controlnet: Option<ControlNet>,
 }
 
 impl std::fmt::Debug for Txt2ImgPipeline {
@@ -348,6 +381,7 @@ impl Txt2ImgPipeline {
             vae_encoder,
             schedule: Schedule::sd15(),
             device: device.clone(),
+            controlnet: None,
         })
     }
 
@@ -405,7 +439,99 @@ impl Txt2ImgPipeline {
             vae_encoder,
             schedule: Schedule::sd15(),
             device: device.clone(),
+            controlnet: None,
         })
+    }
+
+    /// Attach a ControlNet.
+    ///
+    /// Takes the pipeline by value and returns it, so a pipeline either has a
+    /// ControlNet from the moment it is built or never does — there is no
+    /// window in which a caller holds one it believes is controlled and is not.
+    ///
+    /// The ControlNet is built from `UNetConfig::sd15()`, the same config the
+    /// UNet is, which is what guarantees a correction per skip at the right
+    /// width. An SDXL ControlNet here will fail to load rather than run wrong.
+    pub fn with_controlnet(mut self, path: impl AsRef<Path>) -> Result<Self, PipelineError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(PipelineError::MissingFile(path.to_path_buf()));
+        }
+        let vb = sd_loader::safetensors_var_builder(&[path], DType::F32, &self.device)?;
+        self.controlnet = Some(ControlNet::new(&UNetConfig::sd15(), vb)?);
+        Ok(self)
+    }
+
+    /// Whether a ControlNet is attached.
+    pub fn has_controlnet(&self) -> bool {
+        self.controlnet.is_some()
+    }
+
+    /// Generate under spatial control. Returns `[1, 3, height, width]`.
+    pub fn run_control(&self, cfg: &ControlConfig) -> Result<Tensor, PipelineError> {
+        self.run_control_with_progress(cfg, &mut |_, _, _| {})
+    }
+
+    /// [`Self::run_control`], reporting progress after each step.
+    pub fn run_control_with_progress(
+        &self,
+        cfg: &ControlConfig,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        if self.controlnet.is_none() {
+            return Err(PipelineError::NoControlNet);
+        }
+        let base = &cfg.base;
+        if base.width % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("width", base.width));
+        }
+        if base.height % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("height", base.height));
+        }
+        if base.steps == 0 {
+            return Err(PipelineError::NoSteps);
+        }
+        let (hh, hw) = {
+            let d = cfg.hint.dims4()?;
+            (d.2, d.3)
+        };
+        if hh != base.height || hw != base.width {
+            return Err(PipelineError::Tensor(sd_tensor::Error::Msg(format!(
+                "control map is {hh}x{hw}, expected {}x{} — it is at pixel resolution, \
+                 not latent",
+                base.height, base.width
+            ))));
+        }
+
+        let cond = self.encode(&base.prompt)?;
+        let uncond = self.encode(&base.negative_prompt)?;
+        let context = Tensor::cat(&[&uncond, &cond], 0)?;
+
+        // The hint is doubled to match the guidance batch. Both halves get the
+        // same control: guidance contrasts the *prompts*, and giving the
+        // unconditional half no control would make the contrast partly about
+        // the control map instead.
+        let hint = Tensor::cat(&[&cfg.hint, &cfg.hint], 0)?.to_dtype(self.unet.dtype())?;
+
+        let mut rng = SeededRng::new(base.seed);
+        let (lh, lw) = (base.height / 8, base.width / 8);
+        let sigmas = self.sigmas_for(base.sampler, base.steps);
+        let latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+
+        let latent = self.denoise_controlled(
+            base,
+            latent,
+            &sigmas,
+            &context,
+            &mut rng,
+            None,
+            Some(Hint {
+                hint: &hint,
+                scale: cfg.scale,
+            }),
+            progress,
+        )?;
+        Ok(self.vae.decode_tiled(&latent)?)
     }
 
     /// Encode a prompt to `[1, 77, 768]`.
@@ -576,11 +702,27 @@ impl Txt2ImgPipeline {
     fn denoise_keeping(
         &self,
         cfg: &Txt2ImgConfig,
+        latent: Tensor,
+        sigmas: &[f64],
+        context: &Tensor,
+        rng: &mut SeededRng,
+        keep: Option<Keep<'_>>,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        self.denoise_controlled(cfg, latent, sigmas, context, rng, keep, None, progress)
+    }
+
+    /// [`Self::denoise_keeping`], optionally under a ControlNet.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_controlled(
+        &self,
+        cfg: &Txt2ImgConfig,
         mut latent: Tensor,
         sigmas: &[f64],
         context: &Tensor,
         rng: &mut SeededRng,
         keep: Option<Keep<'_>>,
+        control: Option<Hint<'_>>,
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
@@ -600,7 +742,18 @@ impl Txt2ImgPipeline {
             let t = sigma_to_timestep(&self.schedule, sigma);
             let timestep = Tensor::new(&[t as f32, t as f32], &self.device)?;
 
-            let out = self.unet.forward(&latent_in, &timestep, context)?;
+            let out = match (&self.controlnet, &control) {
+                (Some(net), Some(h)) => {
+                    // The ControlNet sees the same scaled latent and timestep
+                    // the UNet does. Feeding it the unscaled latent is a
+                    // natural mistake that produces corrections of plausible
+                    // magnitude for the wrong noise level.
+                    let c = net.forward(&latent_in, &timestep, context, h.hint, h.scale)?;
+                    self.unet
+                        .forward_controlled(&latent_in, &timestep, context, &c.down, &c.mid)?
+                }
+                _ => self.unet.forward(&latent_in, &timestep, context)?,
+            };
             let out_uncond = out.narrow(0, 0, 1)?;
             let out_cond = out.narrow(0, 1, 1)?;
             let noise_pred = (&out_uncond + ((out_cond - &out_uncond)? * cfg.cfg_scale)?)?;

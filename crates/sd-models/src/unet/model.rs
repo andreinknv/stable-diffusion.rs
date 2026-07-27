@@ -97,7 +97,10 @@ impl UNetConfig {
     }
 
     /// Attention spec for block `i`, or `None` when that block has none.
-    fn attention_spec(&self, i: usize) -> Option<AttentionSpec> {
+    ///
+    /// Public because a ControlNet is a copy of this down stack and must be
+    /// built from the same answer; deriving it twice is how the two drift.
+    pub fn attention_spec(&self, i: usize) -> Option<AttentionSpec> {
         if !*self.down_block_has_attention.get(i)? {
             return None;
         }
@@ -305,6 +308,25 @@ impl UNet2DConditionModel {
             .map(|(out, _, _)| out)
     }
 
+    /// [`Self::forward`], with a ControlNet's corrections applied.
+    ///
+    /// `down` is one correction per skip, in push order, and `mid` corrects the
+    /// mid block. Deliberately typed as plain tensors rather than a ControlNet
+    /// type: the UNet does not need to know what produced them, and keeping it
+    /// ignorant is what lets a ControlNet be added without touching this
+    /// model's definition.
+    pub fn forward_controlled(
+        &self,
+        sample: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        down: &[Tensor],
+        mid: &Tensor,
+    ) -> Result<Tensor> {
+        self.run(sample, timestep, context, None, Some((down, mid)))
+            .map(|(out, _, _)| out)
+    }
+
     /// SDXL's forward: the same, plus micro-conditioning.
     ///
     /// `pooled` is the second text encoder's projected embedding `[b, 1280]`,
@@ -335,6 +357,17 @@ impl UNet2DConditionModel {
         timestep: &Tensor,
         context: &Tensor,
         added: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Vec<Tensor>, Tensor)> {
+        self.run(sample, timestep, context, added, None)
+    }
+
+    fn run(
+        &self,
+        sample: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        added: Option<(&Tensor, &Tensor)>,
+        control: Option<(&[Tensor], &Tensor)>,
     ) -> Result<(Tensor, Vec<Tensor>, Tensor)> {
         // `timestep` is [b], not a scalar: a scalar yields [1, 1280] where
         // [b, 1280] is needed, and that only surfaces deep inside a resnet.
@@ -382,6 +415,28 @@ impl UNet2DConditionModel {
         }
 
         let mid = self.mid_block.forward(&h, &temb, context)?;
+
+        // ControlNet corrects what the up pass consumes, not what the down
+        // pass computes: the down blocks have already run above, unchanged.
+        let (skips, mid) = match control {
+            Some((down, mid_res)) => {
+                if down.len() != skips.len() {
+                    return Err(sd_tensor::Error::Msg(format!(
+                        "ControlNet gave {} corrections for {} skips",
+                        down.len(),
+                        skips.len()
+                    )));
+                }
+                let corrected = skips
+                    .iter()
+                    .zip(down)
+                    .map(|(s, c)| s + c)
+                    .collect::<Result<Vec<_>>>()?;
+                (corrected, (mid + mid_res)?)
+            }
+            None => (skips, mid),
+        };
+        let mut skips = skips;
 
         let captured = skips.clone();
         let mut h = mid.clone();

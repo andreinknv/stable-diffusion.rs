@@ -914,6 +914,76 @@ def dump_unet_full(output: pathlib.Path, model_id: str) -> None:
     print(f"linked {link} -> {weights}")
 
 
+def dump_controlnet(output: pathlib.Path, model_id: str) -> None:
+    """ControlNet's corrections for one step, against a fixed hint.
+
+    Thirteen tensors, not one: a ControlNet emits a correction per skip plus
+    one for the mid block, and a single summary number could not say which of
+    the thirteen is wrong. They are also the only outputs -- a ControlNet has
+    no image of its own to look at -- so this is the whole of its behaviour.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import ControlNetModel
+    from safetensors.torch import save_file
+
+    out = output / "controlnet"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id}")
+    net = ControlNetModel.from_pretrained(model_id, torch_dtype=torch.float32)
+    net.eval()
+
+    gen = torch.Generator().manual_seed(SEED)
+    sample = torch.randn(1, 4, 32, 32, generator=gen)
+    timestep = torch.tensor([500.0])
+    context = torch.randn(1, 77, 768, generator=gen)
+    # The hint is at *pixel* resolution -- 8x the latent -- and in [0, 1],
+    # unlike every other image in this project, which is [-1, 1]. Getting
+    # either wrong still runs.
+    hint = torch.rand(1, 3, 256, 256, generator=gen)
+
+    with torch.no_grad():
+        result = net(
+            sample,
+            timestep,
+            encoder_hidden_states=context,
+            controlnet_cond=hint,
+            conditioning_scale=1.0,
+            return_dict=True,
+        )
+
+    downs = list(result.down_block_res_samples)
+    if len(downs) != 12:
+        sys.exit(f"error: expected 12 corrections, got {len(downs)}")
+
+    tensors = {
+        "sample": sample.contiguous(),
+        "timestep": timestep.contiguous(),
+        "context": context.contiguous(),
+        "hint": hint.contiguous(),
+        "mid": result.mid_block_res_sample.detach().contiguous().clone(),
+        **{f"down_{i:02d}": t.detach().contiguous().clone() for i, t in enumerate(downs)},
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    weights = hf_hub_download(
+        repo_id=model_id, filename="diffusion_pytorch_model.safetensors"
+    )
+    link = out / "controlnet.safetensors"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(weights)
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<12} {tuple(v.shape)}")
+    print(f"linked {link} -> {weights}")
+
+
 SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
 
 
@@ -1256,6 +1326,10 @@ def main() -> None:
     )
     unet_full.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    cnet = sub.add_parser("controlnet", help="dump ControlNet correction references")
+    cnet.add_argument("--model-id", default="lllyasviel/sd-controlnet-canny")
+    cnet.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     samplers = sub.add_parser("samplers", help="dump sampler step references")
     samplers.add_argument("--model-id", default="", help="unused; samplers need no weights")
     samplers.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -1277,7 +1351,9 @@ def main() -> None:
     gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
     args = ap.parse_args()
-    if args.component == "gguf":
+    if args.component == "controlnet":
+        dump_controlnet(args.output, args.model_id)
+    elif args.component == "gguf":
         dump_gguf(args.output, args.model_id)
     elif args.component == "sdxl_unet":
         dump_sdxl_unet(args.output, args.model_id)

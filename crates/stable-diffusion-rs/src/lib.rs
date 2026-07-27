@@ -17,6 +17,7 @@ pub use sd_models as models;
 pub use sd_sample as sample;
 pub use sd_tensor as tensor;
 
+pub mod canny;
 pub mod image_io;
 pub mod pipeline;
 

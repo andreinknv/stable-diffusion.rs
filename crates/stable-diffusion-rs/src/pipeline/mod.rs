@@ -11,6 +11,6 @@ pub use placement::{Placement, Residency, StageBytes};
 pub use sd3::{sd3_paths_in, Sd3Paths, Sd3Pipeline, Sd3RunConfig};
 pub use sdxl::SdxlPipeline;
 pub use txt2img::{
-    sigma_to_timestep, Img2ImgConfig, InpaintConfig, PipelineError, ProgressFn, SamplerKind,
-    Strength, Txt2ImgConfig, Txt2ImgPipeline,
+    sigma_to_timestep, ControlConfig, Img2ImgConfig, InpaintConfig, PipelineError, ProgressFn,
+    SamplerKind, Strength, Txt2ImgConfig, Txt2ImgPipeline,
 };

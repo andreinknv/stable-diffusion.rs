@@ -115,6 +115,70 @@ enum Command {
         lora_scale: f64,
     },
 
+    /// Generate steered by a ControlNet, from an image's Canny edges.
+    #[command(name = "controlnet")]
+    ControlNet {
+        #[arg(long)]
+        model: String,
+
+        /// The ControlNet checkpoint (a single .safetensors).
+        #[arg(long)]
+        controlnet: String,
+
+        #[arg(long)]
+        prompt: String,
+
+        /// Image whose edges steer the generation. Resized to --width x --height.
+        ///
+        /// Its *shape* is used, not its content: the model sees only the edge
+        /// map. Pass --control-image instead to supply a control map directly.
+        #[arg(long)]
+        init_image: Option<String>,
+
+        /// A ready-made control map (edges, depth, pose), used as-is.
+        #[arg(long, conflicts_with = "init_image")]
+        control_image: Option<String>,
+
+        /// Control strength. 0 is exactly an uncontrolled generation.
+        #[arg(long, default_value_t = 1.0)]
+        control_scale: f64,
+
+        /// Canny hysteresis thresholds on normalised gradient magnitude.
+        #[arg(long, default_value_t = 0.1)]
+        canny_low: f32,
+
+        #[arg(long, default_value_t = 0.2)]
+        canny_high: f32,
+
+        /// Also write the control map here, to see what the model was given.
+        #[arg(long)]
+        save_hint: Option<String>,
+
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        #[arg(long, default_value_t = 7.5)]
+        cfg_scale: f64,
+
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        #[arg(long, default_value = "euler_a")]
+        sampler: String,
+
+        #[arg(long, short, default_value = "control.png")]
+        output: String,
+    },
+
     /// Repaint the masked region of an image, leaving the rest untouched.
     #[command(name = "inpaint")]
     Inpaint {
@@ -422,6 +486,82 @@ fn main() -> Result<()> {
 
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             println!("wrote {output} in {:.1?}", started.elapsed());
+        }
+
+        Command::ControlNet {
+            model,
+            controlnet,
+            prompt,
+            init_image,
+            control_image,
+            control_scale,
+            canny_low,
+            canny_high,
+            save_hint,
+            negative_prompt,
+            width,
+            height,
+            steps,
+            cfg_scale,
+            seed,
+            sampler,
+            output,
+        } => {
+            let hint = match (&init_image, &control_image) {
+                (Some(src), None) => sd::canny::hint_from_image(
+                    src,
+                    width as u32,
+                    height as u32,
+                    canny_low,
+                    canny_high,
+                    &dev,
+                )
+                .with_context(|| format!("detecting edges in {src}"))?,
+                (None, Some(src)) => {
+                    // A prepared map arrives in [0, 1] as an image; load_image
+                    // gives [-1, 1], so rescale rather than re-deriving it.
+                    let img = sd::image_io::load_image(src, width as u32, height as u32, &dev)
+                        .with_context(|| format!("reading {src}"))?;
+                    ((img + 1.0)? * 0.5)?
+                }
+                _ => anyhow::bail!("pass exactly one of --init-image or --control-image"),
+            };
+            if let Some(path) = &save_hint {
+                // Written through the [-1, 1] convention save_png expects.
+                let visible = ((&hint * 2.0)? - 1.0)?;
+                sd::image_io::save_png(&visible, path)
+                    .with_context(|| format!("writing {path}"))?;
+                tracing::info!(path = %path, "wrote control map");
+            }
+
+            let cfg = sd::pipeline::ControlConfig {
+                base: Txt2ImgConfig {
+                    prompt,
+                    negative_prompt,
+                    width,
+                    height,
+                    steps,
+                    cfg_scale,
+                    seed,
+                    sampler: parse_sampler(&sampler)?,
+                },
+                hint,
+                scale: control_scale,
+            };
+            tracing::info!(model = %model, controlnet = %controlnet, scale = control_scale, "controlnet");
+            let started = std::time::Instant::now();
+            let mut report = |step, total, sigma: f64| {
+                tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
+            };
+            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
+                .with_context(|| format!("loading pipeline from {model}"))?
+                .with_controlnet(Path::new(&controlnet))
+                .with_context(|| format!("loading ControlNet from {controlnet}"))?;
+            let img = pipeline
+                .run_control_with_progress(&cfg, &mut report)
+                .context("running controlnet")?;
+            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
+            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
         }
 
         Command::Inpaint {

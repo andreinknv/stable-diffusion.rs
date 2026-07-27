@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 253 tests, all gates green
+table is in [roadmap.md](roadmap.md). 268 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,39 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**ControlNet works**, `sdrs controlnet --controlnet <ckpt> --init-image X`, for
+SD 1.5. A ControlNet is a copy of the UNet's down and mid stack that reads a
+control map and emits one correction per skip connection; the UNet adds them
+before the up pass consumes them and is otherwise untouched. So the module is
+short — `DownBlock2D`, `MidBlock2DCrossAttn` and `TimestepEmbedding` are the
+UNet's own, reused verbatim — and the only new parts are the hint encoder and
+the zero convolutions.
+
+Verified against `lllyasviel/sd-controlnet-canny` **correction by correction**,
+all thirteen: worst excess **1.45e-5** against a 1e-3 bound. Comparing them
+individually rather than as one tensor is the point — a ControlNet has no image
+of its own, so those thirteen are its entire observable behaviour, and the
+index of the first bad one localises the fault.
+
+The A/B that makes it a demonstration rather than a hope: same prompt, same
+seed, `--control-scale 0` gives a centred crab on a marble pedestal — exactly
+what the prompt asks for. At scale 1 the crab takes the source photo's sprawled
+pose and no pedestal appears at all, because the edge map says "sand". Both in
+`assets/`, with the edge map beside them.
+
+**Canny edge detection is built in** (`crate::canny`), so no second tool is
+needed. Full four stages, and the last two are what matter: non-maximum
+suppression, which makes edges one pixel wide instead of thick bands, and
+hysteresis, which is a flood from the strong pixels rather than a raster sweep —
+a sweep misses any chain running backwards.
+
+**The thresholds matter more than they look.** The defaults (0.1 / 0.2) are
+right for clean subjects and far too sensitive for a textured photograph: on a
+crab on sand they turn the sand into a field of speckle, which the model then
+faithfully renders as background hatching. 0.25 / 0.45 gives the clean result
+in `assets/`. That the speckle *did* come through is itself evidence the
+control is being followed.
 
 **Inpainting works**, `sdrs inpaint --init-image X --mask M`, on any SD 1.5
 checkpoint — no 9-channel inpaint UNet required. The mask follows the universal
