@@ -1306,9 +1306,39 @@ def dump_motion(output: pathlib.Path, model_id: str) -> None:
     if isinstance(result, tuple):
         result = result[0]
 
+    # And the whole UNet with the adapter attached, which is what catches a
+    # wrong *insertion* order — the module comparison above cannot.
+    from diffusers import UNet2DConditionModel, UNetMotionModel
+
+    base = UNet2DConditionModel.from_pretrained(
+        "stable-diffusion-v1-5/stable-diffusion-v1-5", subfolder="unet",
+        torch_dtype=torch.float32,
+    )
+    motion_unet = UNetMotionModel.from_unet2d(base, adapter).eval()
+
+    gen2 = torch.Generator().manual_seed(SEED + 1)
+    nframes = 2
+    # UNetMotionModel takes [b, c, f, h, w]; this port carries frames on the
+    # batch as [b*f, c, h, w]. Both views are dumped, derived from one tensor,
+    # so the comparison cannot drift on the layout alone.
+    sample5 = torch.randn(1, 4, nframes, 32, 32, generator=gen2)
+    sample_flat = sample5.permute(0, 2, 1, 3, 4).reshape(nframes, 4, 32, 32).contiguous()
+    timestep = torch.tensor([500.0])
+    text = torch.randn(1, 77, 768, generator=gen2)
+    with torch.no_grad():
+        out5 = motion_unet(sample5, timestep, encoder_hidden_states=text).sample
+    unet_out = out5.permute(0, 2, 1, 3, 4).reshape(nframes, 4, 32, 32).contiguous()
+    # The text is repeated per frame internally; this port passes it already
+    # repeated, so dump the repeated form.
+    text_flat = text.repeat_interleave(nframes, dim=0).contiguous()
+
     tensors = {
         "hidden": hidden.contiguous(),
         "output": result.detach().contiguous().clone(),
+        "unet_sample": sample_flat,
+        "unet_timestep": timestep.contiguous(),
+        "unet_text": text_flat,
+        "unet_output": unet_out.detach().contiguous().clone(),
     }
     save_file(tensors, str(out / "reference.safetensors"))
 

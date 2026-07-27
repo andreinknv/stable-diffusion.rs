@@ -215,6 +215,31 @@ impl UNet2DConditionModel {
         Ok(model)
     }
 
+    /// Build with an AnimateDiff motion adapter attached.
+    ///
+    /// `motion_vb` is rooted at the adapter's top level. The modules are
+    /// installed for the duration of this call and each block pulls its own —
+    /// see [`crate::unet::motion`]. Refuses unless all 21 are consumed.
+    ///
+    /// The frame count is *not* set here: it belongs to a generation, not to a
+    /// model. Wrap the run in [`crate::unet::motion::with_frames`].
+    pub fn new_with_motion(
+        cfg: &UNetConfig,
+        vb: VarBuilder,
+        motion_vb: VarBuilder,
+    ) -> Result<Self> {
+        let source =
+            super::motion::MotionSource::new(motion_vb, super::motion::MotionSource::sd15_names());
+        // Safety: the guard drops before `motion_vb`'s borrow ends.
+        let guard = unsafe { super::motion::install(source) };
+        let built = Self::new(cfg, vb);
+        let complete = super::motion::fully_consumed();
+        drop(guard);
+        let model = built?;
+        complete?;
+        Ok(model)
+    }
+
     pub fn new(cfg: &UNetConfig, vb: VarBuilder) -> Result<Self> {
         let channels = &cfg.block_out_channels;
         let first = channels[0];

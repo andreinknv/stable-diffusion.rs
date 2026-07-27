@@ -78,6 +78,9 @@ pub struct DownBlock2D {
     resnets: Vec<ResnetBlock2D>,
     attentions: Vec<Transformer2DModel>,
     downsampler: Option<Downsample2D>,
+    /// One per resnet when a motion adapter is installed. Empty otherwise, so
+    /// a still-image UNet carries nothing.
+    motion: Vec<super::motion::MotionModule>,
 }
 
 /// Cross-attention settings for a block that has it.
@@ -161,10 +164,20 @@ impl DownBlock2D {
             None
         };
 
+        // One per resnet, pulled in construction order. Built after the
+        // resnets so the flat counter across blocks stays in step.
+        let motion = (0..cfg.num_layers)
+            .map(|_| super::motion::next_module(cfg.out_channels))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
         Ok(Self {
             resnets,
             attentions,
             downsampler,
+            motion,
         })
     }
 
@@ -187,6 +200,12 @@ impl DownBlock2D {
             if let Some(attn) = self.attentions.get(i) {
                 h = attn.forward(&h, context)?;
             }
+            // The motion module runs *before* the skip is pushed, so the up
+            // pass receives temporally-mixed features rather than per-frame
+            // ones.
+            if let Some(m) = self.motion.get(i) {
+                h = m.forward(&h, super::motion::frames())?;
+            }
             skips.push(h.clone());
         }
         if let Some(down) = &self.downsampler {
@@ -203,6 +222,7 @@ pub struct UpBlock2D {
     resnets: Vec<ResnetBlock2D>,
     attentions: Vec<Transformer2DModel>,
     upsampler: Option<Upsample2D>,
+    motion: Vec<super::motion::MotionModule>,
 }
 
 impl UpBlock2D {
@@ -244,10 +264,18 @@ impl UpBlock2D {
             None
         };
 
+        let motion = (0..cfg.num_layers)
+            .map(|_| super::motion::next_module(cfg.out_channels))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
         Ok(Self {
             resnets,
             attentions,
             upsampler,
+            motion,
         })
     }
 
@@ -270,6 +298,9 @@ impl UpBlock2D {
             if let Some(attn) = self.attentions.get(i) {
                 h = attn.forward(&h, context)?;
             }
+            if let Some(m) = self.motion.get(i) {
+                h = m.forward(&h, super::motion::frames())?;
+            }
         }
         if let Some(up) = &self.upsampler {
             h = up.forward(&h)?;
@@ -284,6 +315,9 @@ pub struct MidBlock2DCrossAttn {
     resnet_0: ResnetBlock2D,
     attention: Transformer2DModel,
     resnet_1: ResnetBlock2D,
+    /// The mid block has exactly one, after its *first* resnet — matching the
+    /// single `mid_block.motion_modules.0` the checkpoint carries.
+    motion: Option<super::motion::MotionModule>,
 }
 
 impl MidBlock2DCrossAttn {
@@ -314,12 +348,19 @@ impl MidBlock2DCrossAttn {
                 eps,
                 vb_resnets.pp("1"),
             )?,
+            motion: super::motion::next_module(channels)?,
         })
     }
 
     pub fn forward(&self, xs: &Tensor, temb: &Tensor, context: &Tensor) -> Result<Tensor> {
         let h = self.resnet_0.forward(xs, temb)?;
         let h = self.attention.forward(&h, context)?;
+        // After the attention and before the second resnet, matching where the
+        // reference inserts the mid block's single module.
+        let h = match &self.motion {
+            Some(m) => m.forward(&h, super::motion::frames())?,
+            None => h,
+        };
         self.resnet_1.forward(&h, temb)
     }
 }

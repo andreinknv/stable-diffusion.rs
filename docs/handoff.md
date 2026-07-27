@@ -136,9 +136,9 @@ guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
 
-**AnimateDiff motion modules are ported and verified** at **2.662e-7**. The
-temporal transformer is done; what remains is inserting the 21 of them into
-the UNet's blocks (see [Next](#next)).
+**AnimateDiff motion modules are ported and verified** at **2.662e-7**, and
+**wired into the UNet** — though the wiring itself is not yet verified at UNet
+level, so treat it as untrusted until it is. See [Next](#next).
 
 A motion module is a small transformer whose attention runs across *frames*
 rather than pixels, and our own `Attention` and `FeedForward` are reused
@@ -640,25 +640,37 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. Insert the motion modules into the UNet
+### 1. Verify the wired motion modules, then batch the pipeline
 
-The module itself is done and verified at 2.662e-7 (above). What remains is
-wiring, and the shape of it is known:
+**The module is verified at 2.662e-7 and the wiring is written**, but the
+wiring is **not yet verified at UNet level** — which by this project's own
+standard means it is not done. Treat it as untrusted until the reference below
+passes.
 
-- **21 modules, one after each resnet** — `down_blocks.{0..3}.motion_modules.{0,1}`,
-  `mid_block.motion_modules.0`, `up_blocks.{0..3}.motion_modules.{0,1,2}`. Not
-  after each *attention*: `down_blocks.3` has motion modules and no attentions.
-- Install them the way `unet::ip` installs IP weights — a construction-scoped
-  thread-local, pulled as each block is built. That mechanism exists and works.
-- The UNet needs a frame count at forward time; `motion::with_frames` already
-  carries it.
-- **The batch is the frames.** A 16-frame clip is a batch of 16, so the whole
-  pipeline needs to stop assuming batch 1 — that is the largest single piece of
-  this, and it is the same change a batched still-image path would need.
+The wiring: `UNet2DConditionModel::new_with_motion` installs 21 modules — one
+after each resnet, via the same construction-scoped thread-local `unet::ip`
+uses — and refuses unless all 21 are consumed. Down blocks and up blocks run
+theirs after the attention and before pushing the skip; the mid block runs its
+single one between attention and second resnet. With no adapter installed the
+`motion` vectors are empty, so a still-image UNet carries and costs nothing —
+which is why this could land without risk to anything else.
 
-Verify end to end against `diffusers`' `UNetMotionModel`, not per module: the
-insertion order is exactly the kind of thing that is silent when wrong, as the
-IP-Adapter index mapping was.
+**What is left, in order:**
+
+1. **Get the reference dump working.** `dump_reference.py motion` builds the
+   whole-UNet half via `UNetMotionModel.from_unet2d`, and it currently fails
+   with a 2048-vs-1024 mismatch inside the time embedding at
+   `unet_motion_model.py:501`. Probably the timestep needs one entry per batch
+   entry, or `from_unet2d` needs different arguments. The module-level half of
+   that dump works and is what produced 2.662e-7.
+2. **Compare the UNet end to end.** Insertion order is exactly the kind of
+   thing that is silent when wrong — as the IP-Adapter index mapping was, and
+   as three separate details of the motion module itself were.
+3. **Batch the pipeline.** A 16-frame clip is a batch of 16, and the pipeline
+   assumes batch 1 throughout: the latent draw, the CFG concatenation, the
+   timestep tensor, the decode. This is the largest single piece and it is the
+   same change a batched still-image path needs, so it is worth doing
+   deliberately rather than as an animation special case.
 
 ### ~~2. TAESD and step previews~~ — both done
 

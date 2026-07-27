@@ -197,3 +197,104 @@ impl MotionModule {
         h + residual
     }
 }
+
+// -- installation ---------------------------------------------------------
+//
+// Same shape as `super::ip`: a construction-scoped thread-local, pulled as
+// each block is built. See that module for why this beats threading a
+// parameter through every block type.
+
+use std::cell::RefCell;
+
+/// Motion-module weights, consumed one resnet at a time.
+pub struct MotionSource<'a> {
+    vb: VarBuilder<'a>,
+    /// Checkpoint paths, in the order this UNet builds resnets.
+    names: Vec<String>,
+    next: usize,
+}
+
+impl<'a> MotionSource<'a> {
+    pub fn new(vb: VarBuilder<'a>, names: Vec<String>) -> Self {
+        Self { vb, names, next: 0 }
+    }
+
+    /// The 21 paths for SD 1.5, in this UNet's construction order.
+    ///
+    /// Down, then **mid**, then up — which happens to match the order they
+    /// are built here, unlike the IP-Adapter's index list. Generated rather
+    /// than typed out, because the counts differ per stage: two per down
+    /// block, one for mid, three per up block.
+    ///
+    /// One per **resnet**, not per attention. `down_blocks.3` has two motion
+    /// modules and no attentions at all, which is the tell.
+    pub fn sd15_names() -> Vec<String> {
+        let mut names = Vec::with_capacity(21);
+        for block in 0..4 {
+            for i in 0..2 {
+                names.push(format!("down_blocks.{block}.motion_modules.{i}"));
+            }
+        }
+        names.push("mid_block.motion_modules.0".to_string());
+        for block in 0..4 {
+            for i in 0..3 {
+                names.push(format!("up_blocks.{block}.motion_modules.{i}"));
+            }
+        }
+        names
+    }
+}
+
+thread_local! {
+    static INSTALLED: RefCell<Option<MotionSource<'static>>> = const { RefCell::new(None) };
+}
+
+#[must_use = "the source is removed when this guard is dropped"]
+pub struct SourceGuard;
+
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        INSTALLED.with(|s| *s.borrow_mut() = None);
+    }
+}
+
+/// Install motion weights for the duration of a UNet construction.
+///
+/// # Safety
+///
+/// The lifetime is erased so the source can live in thread-local storage. The
+/// guard removes it on drop and must not outlive `vb`, which is why the only
+/// caller keeps both in one scope.
+pub unsafe fn install(source: MotionSource<'_>) -> SourceGuard {
+    let erased: MotionSource<'static> = unsafe { std::mem::transmute(source) };
+    INSTALLED.with(|s| *s.borrow_mut() = Some(erased));
+    SourceGuard
+}
+
+/// Build the next resnet's motion module, if a source is installed.
+pub(super) fn next_module(channels: usize) -> Result<Option<MotionModule>> {
+    let slot = INSTALLED.with(|s| {
+        let mut slot = s.borrow_mut();
+        let source = slot.as_mut()?;
+        let name = source.names.get(source.next)?.clone();
+        source.next += 1;
+        Some(source.vb.pp(name))
+    });
+    match slot {
+        // Depth 1: every published adapter has one transformer block.
+        Some(vb) => Ok(Some(MotionModule::new(channels, 1, vb)?)),
+        None => Ok(None),
+    }
+}
+
+/// Whether every module was attached.
+pub fn fully_consumed() -> Result<()> {
+    INSTALLED.with(|s| match s.borrow().as_ref() {
+        Some(src) if src.next != src.names.len() => Err(sd_tensor::Error::Msg(format!(
+            "motion adapter: {} of {} modules were attached",
+            src.next,
+            src.names.len()
+        ))),
+        _ => Ok(()),
+    })
+}
