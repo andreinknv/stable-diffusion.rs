@@ -1,6 +1,6 @@
 //! Generate one image with SD 3.5. Fixtures under `tests/golden/sd35`.
 use stable_diffusion_rs::models::sd3::Sd3Config;
-use stable_diffusion_rs::pipeline::{sd3_paths_in, Sd3Pipeline, Sd3RunConfig};
+use stable_diffusion_rs::pipeline::{sd3_paths_in, Placement, Sd3Pipeline, Sd3RunConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<String> = std::env::args().collect();
@@ -16,8 +16,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("device: {dev:?}; loading five models…");
     let t0 = std::time::Instant::now();
     let paths = sd3_paths_in(std::path::Path::new("tests/golden/sd35"));
-    let pipe = Sd3Pipeline::load(&paths, &Sd3Config::medium_35(), &dev)?;
+    // SD_TEXT_ENCODERS_ON=cpu keeps the three encoders off the accelerator.
+    // They run once and then hold more memory than the transformer does.
+    let placement = match std::env::var("SD_TEXT_ENCODERS_ON").as_deref() {
+        Ok("cpu") => Placement::on(&dev).with_text_encoders_on(&sd_tensor::Device::Cpu),
+        Ok("auto") => Placement::auto(&dev, Sd3Pipeline::stage_bytes(&paths)?)?,
+        _ => Placement::on(&dev),
+    };
+    eprintln!(
+        "placement: compute {:?}, text encoders {:?}, vae {:?}",
+        placement.compute(),
+        placement.text_encoders(),
+        placement.vae()
+    );
+    let pipe = Sd3Pipeline::load_with_placement(&paths, &Sd3Config::medium_35(), &placement)?;
     eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
+    if let Some(b) = sd_tensor::sysmem::available_bytes() {
+        eprintln!("available after load: {:.2} GB", b as f64 / 1e9);
+    }
 
     let cfg = Sd3RunConfig {
         prompt,

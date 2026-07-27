@@ -51,6 +51,25 @@ so a decode that would not fit degrades to a seamed-but-correct image instead
 of dying. `SD_VAE_TILE_LATENT` still overrides it outright. Where 64 already
 fits, nothing changes — SD 1.5 on Metal is bit-identical before and after.
 
+**Each pipeline stage can run on its own device.** `pipeline::Placement` is
+caller-supplied policy — `Placement::on(&gpu).with_text_encoders_on(&Device::Cpu)`
+— passed to `load_with_placement` on Flux and SD 3. `Placement::auto` picks
+one from projected residency against free memory. The default is unchanged
+(everything on one device), so nothing moves unless asked.
+
+Measured on SD 3.5 at 512, encoders moved to the CPU: **4.4 GB freed on the
+accelerator** (9.84 GB available after load against 14.24), for about 8 s of
+one-time CPU text encoding. The images agree at mean 4.1/255, which is f32
+reduction order in the encoders, not a defect.
+
+**That trade is much better on a discrete GPU than it looks here**, and that
+is the reason it exists: on unified memory the bytes come from one pool either
+way, while on an 8-12 GB card 4.4 GB is often the difference between running
+and not — and the weights never cross PCIe at all. The mechanism is the same;
+this machine measures its weakest case. `stable-diffusion.cpp` reached the
+same design: `backend`, `params_backend`, `max_vram` and `split_mode` are
+fields of its public `sd_ctx_params_t`, not CLI flags.
+
 **One-shot runs release before decoding.** `FluxPipeline::run_releasing` and
 `Sd3Pipeline::run_releasing` consume the pipeline, drop everything the decode
 does not need, and then synchronise — on Metal a drop alone frees *nothing*,
@@ -60,7 +79,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 235 tests, all gates green
+table is in [roadmap.md](roadmap.md). 240 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -77,23 +96,28 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. Model offloading — the general form of every memory problem here
+### 1. Dynamic parameter offload, on top of `Placement`
 
-Every pipeline loads all five models onto the device and holds them there for
-the whole run. That is why SD 3.5's load leaves ~1.1 GB free of 36 GB dense,
-and why `run_releasing` — which drops what the decode does not need — buys
-only ~0.7 GB: by then almost everything has already been paid for.
+`Placement` (below) does **static** per-stage assignment, which is
+`stable-diffusion.cpp`'s `--backend te=cpu`. What it does not do is their
+`--offload-to-cpu`: keep weights in host RAM and move them to the accelerator
+per use. That is the case that matters for a GPU too small to hold the
+diffusion model *at all* — a 12 GB card and Flux dev, say — where no static
+assignment helps because the one module that must be on the GPU does not fit.
 
-diffusers solves this with `enable_model_cpu_offload` (move each module to the
-GPU as it is needed, back to the CPU after) and `enable_sequential_cpu_offload`
-(the same at submodule granularity, slower and smaller). ComfyUI does its own
-aggressive model management. **This is settled practice we simply do not
-implement**, and it would help every model rather than one — text encoders in
-particular are used once, at the start, and then held for the entire denoise.
+The shape to aim for is `sd_ctx_params_t`: a `max_vram` budget, and a residency
+policy the caller sets rather than an environment variable. `Placement` is
+already that struct in miniature, so this extends it rather than replacing it.
 
-Worth reading how diffusers structures it before designing anything: the hard
-part is not the moving, it is deciding the granularity and keeping the device
-placement out of every model's forward.
+The hard part is not moving tensors, it is that our models bake their weights
+in at construction — `ClipTextEncoder::new(cfg, vb)` reads them immediately —
+so there is no `to_device` on a built model and no per-block residency handle.
+Either models grow one, or construction becomes lazy from a retained weight
+source. Decide that before writing anything; it is the whole design.
+
+Measure on a discrete GPU if one is ever available. Everything below was
+verified on unified memory, where the mechanism is right but the payoff is
+smallest.
 
 ### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
 

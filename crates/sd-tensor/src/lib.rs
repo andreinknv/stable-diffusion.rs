@@ -805,6 +805,30 @@ pub mod device {
     pub fn cpu() -> Device {
         Device::Cpu
     }
+
+    /// Whether two handles name the same physical device.
+    ///
+    /// Lives here because deciding it means matching on candle's `Device`
+    /// variants and reading the backend's own identifiers, which is exactly
+    /// what the seam exists to keep out of the model and pipeline crates.
+    /// candle's `Device` is not `PartialEq` and its own `same_device` is
+    /// private, so without this every caller invents its own — and the
+    /// plausible-looking version, comparing `is_cpu()`/`is_metal()`, calls two
+    /// different CUDA cards equal.
+    pub fn same(a: &Device, b: &Device) -> bool {
+        // `same_device` comes from candle's `BackendDevice`, which is only in
+        // scope here — another reason this belongs in the seam.
+        #[allow(unused_imports)]
+        use candle_core::backend::BackendDevice;
+        match (a, b) {
+            (Device::Cpu, Device::Cpu) => true,
+            #[cfg(feature = "metal")]
+            (Device::Metal(x), Device::Metal(y)) => x.same_device(y),
+            #[cfg(feature = "cuda")]
+            (Device::Cuda(x), Device::Cuda(y)) => x.same_device(y),
+            _ => false,
+        }
+    }
 }
 
 /// Deterministic, device-independent random noise.

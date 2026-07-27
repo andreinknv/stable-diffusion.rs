@@ -120,7 +120,12 @@ fn meminfo_kb(key: &str) -> Option<u64> {
         .and_then(|n| n.parse().ok())
 }
 
-fn headroom() -> f64 {
+/// The fraction of free memory a job is allowed to project against.
+///
+/// Public so that callers making their own placement decisions agree with
+/// `check_headroom` about what "fits" means; two different answers to that
+/// question is how a load passes one check and fails the next.
+pub fn headroom() -> f64 {
     std::env::var(HEADROOM_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())

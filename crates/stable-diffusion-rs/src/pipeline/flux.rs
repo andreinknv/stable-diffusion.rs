@@ -34,6 +34,7 @@ use sd_models::vae::{AutoencoderKlDecoder, VaeConfig};
 use sd_sample::flow::{flow_euler_step, flow_sigmas, flow_timesteps, FlowMatchConfig};
 use sd_tensor::{DType, Device, Tensor};
 
+use super::placement::{self, file_bytes, Placement, StageBytes};
 use super::PipelineError;
 
 /// F32. Not a default — F16 produces NaN in both big models. See the module
@@ -96,15 +97,43 @@ pub struct FluxPipeline {
     transformer: FluxTransformer,
     vae: AutoencoderKlDecoder,
     flow: FlowMatchConfig,
-    device: Device,
+    placement: Placement,
 }
 
 impl FluxPipeline {
+    /// Load with every stage on one device.
     pub fn load(
         paths: &FluxPaths,
         cfg: &FluxConfig,
         device: &Device,
     ) -> Result<Self, PipelineError> {
+        Self::load_with_placement(paths, cfg, &Placement::on(device))
+    }
+
+    /// What each stage costs resident, for [`Placement::auto`].
+    pub fn stage_bytes(paths: &FluxPaths) -> Result<StageBytes, PipelineError> {
+        let quantised = paths.transformer.extension().is_some_and(|e| e == "gguf");
+        Ok(StageBytes {
+            text_encoders: placement::resident_bytes(&[&paths.clip], MODEL_DTYPE)?
+                .saturating_add(file_bytes(&paths.t5_gguf)),
+            diffusion: if quantised {
+                file_bytes(&paths.transformer)
+            } else {
+                placement::resident_bytes(&[&paths.transformer], MODEL_DTYPE)?
+            },
+            vae: placement::resident_bytes(&[&paths.vae], VAE_DTYPE)?,
+        })
+    }
+
+    /// Load with each stage on the device [`Placement`] assigns it.
+    pub fn load_with_placement(
+        paths: &FluxPaths,
+        cfg: &FluxConfig,
+        placement: &Placement,
+    ) -> Result<Self, PipelineError> {
+        let device = placement.compute();
+        let text_device = placement.text_encoders();
+        let vae_device = placement.vae();
         for p in [&paths.transformer, &paths.t5_gguf, &paths.clip, &paths.vae] {
             if !p.exists() {
                 return Err(PipelineError::MissingFile(p.clone()));
@@ -119,7 +148,7 @@ impl FluxPipeline {
         let clip_tokenizer = ClipTokenizer::from_file(&paths.clip_tokenizer)?;
         let t5_tokenizer = T5Tokenizer::from_file(&paths.t5_tokenizer, FLUX_MAX_LENGTH)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&paths.clip], MODEL_DTYPE, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&paths.clip], MODEL_DTYPE, text_device)?;
         let clip = ClipTextEncoder::new(&ClipTextConfig::sd15(), vb)?;
 
         // T5's weights stay quantised: 2.7 GB against 18.8 at F32. That is
@@ -129,7 +158,7 @@ impl FluxPipeline {
         // Holding the blocks and expanding per matmul keeps every activation
         // in f32. bf16 would also work; candle's CPU backend has no bf16
         // matmul.
-        let weights = sd_loader::t5_qtensors_from_gguf(&paths.t5_gguf, device)?;
+        let weights = sd_loader::t5_qtensors_from_gguf(&paths.t5_gguf, text_device)?;
         let t5 = T5EncoderModel::from_quantized(&T5Config::xxl(), &weights)?;
 
         // A GGUF transformer keeps its weights quantised, which is what makes
@@ -145,7 +174,7 @@ impl FluxPipeline {
             FluxTransformer::new(cfg, vb)?
         };
 
-        let vb = sd_loader::safetensors_var_builder(&[&paths.vae], VAE_DTYPE, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&paths.vae], VAE_DTYPE, vae_device)?;
         let vae = AutoencoderKlDecoder::new(&VaeConfig::flux(), vb)?;
 
         Ok(Self {
@@ -156,21 +185,29 @@ impl FluxPipeline {
             transformer,
             vae,
             flow: FlowMatchConfig::flux(),
-            device: device.clone(),
+            placement: placement.clone(),
         })
     }
 
     /// Encode the prompt into T5's sequence and CLIP's pooled vector.
     fn conditioning(&self, prompt: &str) -> Result<(Tensor, Tensor), PipelineError> {
         let ids = self.t5_tokenizer.encode(prompt)?;
-        let ids = Tensor::from_vec(ids, (1, self.t5_tokenizer.max_length()), &self.device)?;
+        let ids = Tensor::from_vec(
+            ids,
+            (1, self.t5_tokenizer.max_length()),
+            self.placement.text_encoders(),
+        )?;
         // f32 out of the quantised stack; the transformer runs narrower. The
         // *output* is order 10 and casts safely — it is the intermediates
         // that overflow, and those never leave T5.
         let txt = self.t5.forward(&ids)?.to_dtype(MODEL_DTYPE)?;
 
         let ids = self.clip_tokenizer.encode(prompt)?;
-        let ids = Tensor::from_vec(ids, (1, self.clip_tokenizer.max_length()), &self.device)?;
+        let ids = Tensor::from_vec(
+            ids,
+            (1, self.clip_tokenizer.max_length()),
+            self.placement.text_encoders(),
+        )?;
         // The *pooled* output only. Flux never sees CLIP's sequence — that
         // job belongs to T5 — so a pipeline that fed the sequence here would
         // be conditioning the model on something it was never trained with.
@@ -180,7 +217,13 @@ impl FluxPipeline {
         // second encoder. CLIP-L has no projection to apply anyway.
         let pooled = self.clip.pooled_hidden(&ids)?.to_dtype(MODEL_DTYPE)?;
 
-        Ok((txt, pooled))
+        // Cross to the compute device — the entire cost of a split placement:
+        // two tensors, once per prompt.
+        let compute = self.placement.compute();
+        Ok((
+            placement::to(&txt, compute)?,
+            placement::to(&pooled, compute)?,
+        ))
     }
 
     pub fn run(&self, cfg: &FluxConfigRun) -> Result<Tensor, PipelineError> {
@@ -193,6 +236,7 @@ impl FluxPipeline {
         progress: impl FnMut(usize, usize),
     ) -> Result<Tensor, PipelineError> {
         let latents = self.denoise(cfg, progress)?;
+        let latents = placement::to(&latents, self.placement.vae())?;
         Ok(self.vae.decode_tiled(&latents)?)
     }
 
@@ -205,7 +249,9 @@ impl FluxPipeline {
         progress: impl FnMut(usize, usize),
     ) -> Result<Tensor, PipelineError> {
         let latents = self.denoise(cfg, progress)?;
-        let Self { vae, device, .. } = self;
+        let latents = placement::to(&latents, self.placement.vae())?;
+        let device = self.placement.compute().clone();
+        let Self { vae, .. } = self;
         device.synchronize()?;
         Ok(vae.decode_tiled(&latents)?)
     }
@@ -235,22 +281,22 @@ impl FluxPipeline {
 
         let mut rng = sd_tensor::rng::SeededRng::new(cfg.seed);
         let noise = rng.normals(16 * lat_h * lat_w);
-        let latents =
-            Tensor::from_vec(noise, (1, 16, lat_h, lat_w), &self.device)?.to_dtype(MODEL_DTYPE)?;
+        let latents = Tensor::from_vec(noise, (1, 16, lat_h, lat_w), self.placement.compute())?
+            .to_dtype(MODEL_DTYPE)?;
         let mut xs = pack_latents(&latents)?;
 
         // The schedule depends on how many tokens the transformer will see.
         let sigmas = flow_sigmas(&self.flow, cfg.steps, img_len);
         let timesteps = flow_timesteps(&self.flow, &sigmas);
 
-        let img_ids = rope::image_ids(1, patch_h, patch_w, &self.device)?;
-        let txt_ids = rope::text_ids(1, txt.dim(1)?, &self.device)?;
+        let img_ids = rope::image_ids(1, patch_h, patch_w, self.placement.compute())?;
+        let txt_ids = rope::text_ids(1, txt.dim(1)?, self.placement.compute())?;
         // schnell is not distilled on a guidance scale and rejects one; dev
         // and flux-mini require it. Driven by the model rather than by the
         // caller, so a `guidance` setting cannot be silently discarded.
         let guidance = if self.transformer.config().guidance_embed {
             Some(
-                Tensor::from_vec(vec![cfg.guidance as f32], 1, &self.device)?
+                Tensor::from_vec(vec![cfg.guidance as f32], 1, self.placement.compute())?
                     .to_dtype(MODEL_DTYPE)?,
             )
         } else {
@@ -259,7 +305,7 @@ impl FluxPipeline {
 
         for (i, &t) in timesteps.iter().enumerate() {
             // Flux's timestep is the sigma itself, in [0, 1], not an index.
-            let t = Tensor::from_vec(vec![(t / 1000.0) as f32], 1, &self.device)?
+            let t = Tensor::from_vec(vec![(t / 1000.0) as f32], 1, self.placement.compute())?
                 .to_dtype(MODEL_DTYPE)?;
 
             // One pass, not two: guidance is distilled in rather than applied
@@ -305,8 +351,8 @@ impl FluxPipeline {
         let (lat_h, lat_w) = (cfg.height / 8, cfg.width / 8);
         let mut rng = sd_tensor::rng::SeededRng::new(cfg.seed);
         let noise = rng.normals(16 * lat_h * lat_w);
-        let latents =
-            Tensor::from_vec(noise, (1, 16, lat_h, lat_w), &self.device)?.to_dtype(MODEL_DTYPE)?;
+        let latents = Tensor::from_vec(noise, (1, 16, lat_h, lat_w), self.placement.compute())?
+            .to_dtype(MODEL_DTYPE)?;
         Ok((txt, pooled, pack_latents(&latents)?))
     }
 
@@ -319,7 +365,9 @@ impl FluxPipeline {
         cfg: &FluxConfigRun,
     ) -> Result<(Tensor, Tensor), PipelineError> {
         let latents = self.denoise(cfg, |_, _| {})?;
-        let image = self.vae.decode_tiled(&latents)?;
+        let image = self
+            .vae
+            .decode_tiled(&placement::to(&latents, self.placement.vae())?)?;
         Ok((latents, image))
     }
 }

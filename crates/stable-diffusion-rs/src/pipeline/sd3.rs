@@ -29,6 +29,7 @@ use sd_models::vae::{AutoencoderKlDecoder, VaeConfig};
 use sd_sample::flow::{flow_euler_step, flow_sigmas, flow_timesteps, FlowMatchConfig};
 use sd_tensor::{DType, Device, Tensor, D};
 
+use super::placement::{self, file_bytes, Placement, StageBytes};
 use super::PipelineError;
 
 /// F32 throughout. As with Flux, F16 is not a safe halving here: T5's
@@ -113,11 +114,43 @@ pub struct Sd3Pipeline {
     transformer: Sd3Transformer,
     vae: AutoencoderKlDecoder,
     flow: FlowMatchConfig,
-    device: Device,
+    placement: Placement,
 }
 
 impl Sd3Pipeline {
+    /// Load with every stage on one device.
     pub fn load(paths: &Sd3Paths, cfg: &Sd3Config, device: &Device) -> Result<Self, PipelineError> {
+        Self::load_with_placement(paths, cfg, &Placement::on(device))
+    }
+
+    /// What each stage of this pipeline costs resident, for [`Placement::auto`].
+    ///
+    /// The transformer is read from whichever form `paths` points at, so a
+    /// quantised checkpoint is counted at its quantised size rather than at
+    /// what it would cost dequantised.
+    pub fn stage_bytes(paths: &Sd3Paths) -> Result<StageBytes, PipelineError> {
+        let quantised = paths.transformer.extension().is_some_and(|e| e == "gguf");
+        Ok(StageBytes {
+            text_encoders: placement::resident_bytes(&[&paths.clip_l, &paths.clip_g], DTYPE)?
+                .saturating_add(file_bytes(&paths.t5_gguf)),
+            diffusion: if quantised {
+                file_bytes(&paths.transformer)
+            } else {
+                placement::resident_bytes(&[&paths.transformer], DTYPE)?
+            },
+            vae: placement::resident_bytes(&[&paths.vae], DTYPE)?,
+        })
+    }
+
+    /// Load with each stage on the device [`Placement`] assigns it.
+    pub fn load_with_placement(
+        paths: &Sd3Paths,
+        cfg: &Sd3Config,
+        placement: &Placement,
+    ) -> Result<Self, PipelineError> {
+        let device = placement.compute();
+        let text_device = placement.text_encoders();
+        let vae_device = placement.vae();
         for p in [
             &paths.transformer,
             &paths.clip_l,
@@ -133,12 +166,12 @@ impl Sd3Pipeline {
         let clip_tokenizer = ClipTokenizer::from_file(&paths.clip_tokenizer)?;
         let t5_tokenizer = T5Tokenizer::from_file(&paths.t5_tokenizer, T5_LENGTH)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&paths.clip_l], DTYPE, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&paths.clip_l], DTYPE, text_device)?;
         let clip_l = ClipTextEncoder::new(&ClipTextConfig::sd3_l(), vb)?;
-        let vb = sd_loader::safetensors_var_builder(&[&paths.clip_g], DTYPE, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&paths.clip_g], DTYPE, text_device)?;
         let clip_g = ClipTextEncoder::new(&ClipTextConfig::sdxl_2(), vb)?;
 
-        let weights = sd_loader::t5_qtensors_from_gguf(&paths.t5_gguf, device)?;
+        let weights = sd_loader::t5_qtensors_from_gguf(&paths.t5_gguf, text_device)?;
         let t5 = T5EncoderModel::from_quantized(&T5Config::xxl(), &weights)?;
 
         let transformer = if paths.transformer.extension().is_some_and(|e| e == "gguf") {
@@ -151,7 +184,7 @@ impl Sd3Pipeline {
             Sd3Transformer::new(cfg, vb.pp("model").pp("diffusion_model"))?
         };
 
-        let vb = sd_loader::safetensors_var_builder(&[&paths.vae], DTYPE, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&paths.vae], DTYPE, vae_device)?;
         let vae = AutoencoderKlDecoder::new(&VaeConfig::sd35(), vb)?;
 
         Ok(Self {
@@ -163,14 +196,15 @@ impl Sd3Pipeline {
             transformer,
             vae,
             flow: FlowMatchConfig::sd3(),
-            device: device.clone(),
+            placement: placement.clone(),
         })
     }
 
     /// Build `(context, pooled)` for one prompt.
     fn conditioning(&self, prompt: &str) -> Result<(Tensor, Tensor), PipelineError> {
         let ids = self.clip_tokenizer.encode(prompt)?;
-        let ids = Tensor::from_vec(ids, (1, self.clip_tokenizer.max_length()), &self.device)?;
+        let text_device = self.placement.text_encoders();
+        let ids = Tensor::from_vec(ids, (1, self.clip_tokenizer.max_length()), text_device)?;
 
         // Penultimate layer for the sequences, projection head for the pooled
         // vectors — the two come from different depths of the same forward.
@@ -193,17 +227,23 @@ impl Sd3Pipeline {
         // occupies the first half of each of its tokens.
         let clip_seq = Tensor::cat(&[&seq_l, &seq_g], D::Minus1)?;
         let (b, n, w) = clip_seq.dims3()?;
-        let pad = Tensor::zeros((b, n, 4096 - w), clip_seq.dtype(), &self.device)?;
+        let pad = Tensor::zeros((b, n, 4096 - w), clip_seq.dtype(), text_device)?;
         let clip_seq = Tensor::cat(&[&clip_seq, &pad], D::Minus1)?;
 
         let t5_ids = self.t5_tokenizer.encode(prompt)?;
-        let t5_ids = Tensor::from_vec(t5_ids, (1, T5_LENGTH), &self.device)?;
+        let t5_ids = Tensor::from_vec(t5_ids, (1, T5_LENGTH), text_device)?;
         let t5_seq = self.t5.forward(&t5_ids)?.to_dtype(DTYPE)?;
 
         // CLIP tokens first, then T5's, along the token axis.
         let context = Tensor::cat(&[&clip_seq, &t5_seq], 1)?;
         let pooled = Tensor::cat(&[&pooled_l, &pooled_g], D::Minus1)?;
-        Ok((context, pooled))
+        // Cross to the compute device. This is the whole cost of a split
+        // placement: two tensors, once per prompt, a few hundred KB.
+        let compute = self.placement.compute();
+        Ok((
+            placement::to(&context, compute)?,
+            placement::to(&pooled, compute)?,
+        ))
     }
 
     pub fn run(&self, cfg: &Sd3RunConfig) -> Result<Tensor, PipelineError> {
@@ -216,6 +256,7 @@ impl Sd3Pipeline {
         progress: impl FnMut(usize, usize),
     ) -> Result<Tensor, PipelineError> {
         let latents = self.denoise(cfg, progress)?;
+        let latents = placement::to(&latents, self.placement.vae())?;
         Ok(self.vae.decode_tiled(&latents)?)
     }
 
@@ -238,9 +279,11 @@ impl Sd3Pipeline {
         progress: impl FnMut(usize, usize),
     ) -> Result<Tensor, PipelineError> {
         let latents = self.denoise(cfg, progress)?;
+        let latents = placement::to(&latents, self.placement.vae())?;
         // Keep the VAE and the device, drop everything else. `latents` is
         // already computed and holds no borrow of `self`.
-        let Self { vae, device, .. } = self;
+        let device = self.placement.compute().clone();
+        let Self { vae, .. } = self;
         // Dropping is not enough on Metal: candle pools its buffers and hands
         // them back only when something synchronises, because that is where
         // it runs `drop_unused_buffers`. Without this the drop above frees
@@ -270,8 +313,11 @@ impl Sd3Pipeline {
 
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
         let mut rng = sd_tensor::rng::SeededRng::new(cfg.seed);
-        let mut latents =
-            Tensor::from_vec(rng.normals(16 * lh * lw), (1, 16, lh, lw), &self.device)?;
+        let mut latents = Tensor::from_vec(
+            rng.normals(16 * lh * lw),
+            (1, 16, lh, lw),
+            self.placement.compute(),
+        )?;
 
         // Static shift, so the schedule does not depend on resolution the way
         // Flux's does; the token count is passed but unused.
@@ -281,7 +327,7 @@ impl Sd3Pipeline {
         for (i, &t) in timesteps.iter().enumerate() {
             // SD 3 takes the timestep already in the training range, unlike
             // Flux which takes a sigma in [0, 1].
-            let t = Tensor::from_vec(vec![t as f32], 1, &self.device)?;
+            let t = Tensor::from_vec(vec![t as f32], 1, self.placement.compute())?;
 
             let cond = self.transformer.forward(&latents, &context, &pooled, &t)?;
             let uncond = self
