@@ -138,6 +138,25 @@ impl Default for Strength {
     }
 }
 
+/// Everything an inpaint needs: an img2img plus the mask that bounds it.
+#[derive(Debug, Clone)]
+pub struct InpaintConfig {
+    pub base: Img2ImgConfig,
+    /// Greyscale mask, resized to the run's dimensions. **White repaints.**
+    pub mask: std::path::PathBuf,
+}
+
+/// What the sampler must leave alone, and what it is restoring.
+///
+/// Held together because they are only meaningful together: the mask says
+/// where the original applies and `init` is the original to apply.
+struct Keep<'a> {
+    /// Latent-resolution mask, 1 where the model may write.
+    mask: &'a Tensor,
+    /// The encoded original, restored outside the mask at every step.
+    init: &'a Tensor,
+}
+
 /// Everything an img2img generation needs.
 #[derive(Debug, Clone)]
 pub struct Img2ImgConfig {
@@ -172,6 +191,30 @@ fn require(path: PathBuf) -> Result<PathBuf, PipelineError> {
     } else {
         Err(PipelineError::MissingFile(path))
     }
+}
+
+/// Reduce a pixel-resolution mask to latent resolution by 8x8 **maximum**.
+///
+/// Maximum, not average. A latent cell covers 64 pixels, and if any of them is
+/// to be repainted the cell has to be free to change — averaging would leave
+/// edge cells partly frozen and produce a visible seam of half-old, half-new
+/// content exactly where the join needs to be cleanest. Erring toward
+/// repainting dilates the mask by up to one latent cell, which the composite
+/// in pixel space then trims back to the user's actual boundary.
+fn latent_mask(mask_px: &Tensor, lh: usize, lw: usize) -> Result<Tensor, PipelineError> {
+    let (_, _, h, w) = mask_px.dims4()?;
+    if h != lh * 8 || w != lw * 8 {
+        return Err(PipelineError::Tensor(sd_tensor::Error::Msg(format!(
+            "mask is {h}x{w}, expected {}x{}",
+            lh * 8,
+            lw * 8
+        ))));
+    }
+    Ok(mask_px
+        .reshape((1, 1, lh, 8, lw, 8))?
+        .max(5)?
+        .max(3)?
+        .contiguous()?)
 }
 
 /// Nearest index in the training sigmas to `sigma`, as a timestep.
@@ -420,6 +463,77 @@ impl Txt2ImgPipeline {
         Ok(self.vae.decode_tiled(&latent)?)
     }
 
+    /// Generate inside a mask, leaving everything else alone.
+    ///
+    /// Latent blending rather than a dedicated inpainting checkpoint: at every
+    /// step the region outside the mask is restored to the original, so any
+    /// ordinary model can inpaint and no 9-channel UNet is required. The trade
+    /// is that the model never *sees* a mask, so it infers the boundary from
+    /// context alone — a dedicated checkpoint does better on large holes.
+    ///
+    /// The untouched region is exact: latent blending alone would return it
+    /// through a VAE round trip, which is not lossless, so the result is
+    /// composited against the original in pixel space at the end.
+    pub fn run_inpaint(&self, cfg: &InpaintConfig) -> Result<Tensor, PipelineError> {
+        self.run_inpaint_with_progress(cfg, &mut |_, _, _| {})
+    }
+
+    /// [`Self::run_inpaint`], reporting progress after each step.
+    pub fn run_inpaint_with_progress(
+        &self,
+        cfg: &InpaintConfig,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let base = &cfg.base.base;
+        if base.width % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("width", base.width));
+        }
+        if base.height % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("height", base.height));
+        }
+        if base.steps == 0 {
+            return Err(PipelineError::NoSteps);
+        }
+
+        let cond = self.encode(&base.prompt)?;
+        let uncond = self.encode(&base.negative_prompt)?;
+        let context = Tensor::cat(&[&uncond, &cond], 0)?;
+
+        let (w, h) = (base.width as u32, base.height as u32);
+        let image = crate::image_io::load_image(&cfg.base.init_image, w, h, &self.device)?;
+        let mask_px = crate::image_io::load_mask(&cfg.mask, w, h, &self.device)?;
+        let init = self.vae_encoder.encode(&image)?;
+        let mask = latent_mask(&mask_px, base.height / 8, base.width / 8)?;
+
+        let sigmas = self.sigmas_for(base.sampler, base.steps);
+        let start = cfg.base.strength.start_index(base.steps);
+        if start >= base.steps {
+            // Strength 0 repaints nothing, so the original is the answer —
+            // and returning it directly avoids a pointless VAE round trip.
+            return Ok(image);
+        }
+
+        let mut rng = SeededRng::new(base.seed);
+        let (lh, lw) = (base.height / 8, base.width / 8);
+        let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+        let latent = (&init + (noise * sigmas[start])?)?;
+
+        let latent = self.denoise_keeping(
+            base,
+            latent,
+            &sigmas[start..],
+            &context,
+            &mut rng,
+            Some(Keep {
+                mask: &mask,
+                init: &init,
+            }),
+            progress,
+        )?;
+        let decoded = self.vae.decode_tiled(&latent)?;
+        Ok(crate::image_io::composite(&decoded, &image, &mask_px)?)
+    }
+
     /// The sigma ladder a sampler wants.
     ///
     /// LCM does not take an even spread: it visits the subset of timesteps its
@@ -448,10 +562,25 @@ impl Txt2ImgPipeline {
     fn denoise(
         &self,
         cfg: &Txt2ImgConfig,
+        latent: Tensor,
+        sigmas: &[f64],
+        context: &Tensor,
+        rng: &mut SeededRng,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        self.denoise_keeping(cfg, latent, sigmas, context, rng, None, progress)
+    }
+
+    /// [`Self::denoise`], optionally holding a region at the original.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_keeping(
+        &self,
+        cfg: &Txt2ImgConfig,
         mut latent: Tensor,
         sigmas: &[f64],
         context: &Tensor,
         rng: &mut SeededRng,
+        keep: Option<Keep<'_>>,
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
@@ -492,6 +621,22 @@ impl Txt2ImgPipeline {
                     lcm_step(&latent, &denoised, sigma, sigma_next, t, &noise)?
                 }
             };
+
+            // Restore everything outside the mask to the original, noised to
+            // the level the next step expects. Doing this *inside* the loop
+            // rather than once at the end is what keeps the model's context
+            // honest: it sees the true surroundings at every step, so what it
+            // paints actually joins up with them.
+            if let Some(k) = &keep {
+                let restored = if sigma_next > 0.0 {
+                    let n = rng.randn((1, 4, lh, lw), &self.device)?;
+                    (k.init + (n * sigma_next)?)?
+                } else {
+                    k.init.clone()
+                };
+                latent =
+                    (latent.broadcast_mul(k.mask)? + restored.broadcast_mul(&(1.0 - k.mask)?)?)?;
+            }
 
             progress(i + 1, steps, sigma);
         }
@@ -551,5 +696,37 @@ impl Txt2ImgPipeline {
 
         let latent = self.denoise(base, latent, &sigmas[start..], &context, &mut rng, progress)?;
         Ok(self.vae.decode_tiled(&latent)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_single_masked_pixel_frees_its_whole_latent_cell() {
+        // Max, not mean, and this is the case that distinguishes them. One
+        // white pixel in an 8x8 block means that block's latent cell must be
+        // free to change: a latent cell is not a pixel, and averaging would
+        // give 1/64 — an almost-frozen cell, producing a hard seam exactly at
+        // the mask edge, where it is most visible.
+        let dev = sd_tensor::Device::Cpu;
+        let mut px = vec![0f32; 16 * 16];
+        px[0] = 1.0; // top-left pixel only
+        let m = sd_tensor::Tensor::from_vec(px, (1, 1, 16, 16), &dev).unwrap();
+
+        let lm = latent_mask(&m, 2, 2).unwrap();
+        assert_eq!(lm.dims(), &[1, 1, 2, 2]);
+        let v = lm.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(v, vec![1.0, 0.0, 0.0, 0.0], "only the covering cell frees");
+    }
+
+    #[test]
+    fn a_mask_that_is_not_a_multiple_of_eight_is_refused() {
+        // Silently truncating would shift the mask relative to the image,
+        // repainting the wrong region and still returning a plausible picture.
+        let dev = sd_tensor::Device::Cpu;
+        let m = sd_tensor::Tensor::zeros((1, 1, 12, 16), sd_tensor::DType::F32, &dev).unwrap();
+        assert!(latent_mask(&m, 2, 2).is_err());
     }
 }

@@ -115,6 +115,52 @@ enum Command {
         lora_scale: f64,
     },
 
+    /// Repaint the masked region of an image, leaving the rest untouched.
+    #[command(name = "inpaint")]
+    Inpaint {
+        #[arg(long)]
+        model: String,
+
+        #[arg(long)]
+        prompt: String,
+
+        /// Source image. Resized to --width x --height.
+        #[arg(long)]
+        init_image: String,
+
+        /// Greyscale mask. **White repaints**, black is kept.
+        #[arg(long)]
+        mask: String,
+
+        /// How much of the schedule to replace inside the mask.
+        #[arg(long, default_value_t = 0.75)]
+        strength: f64,
+
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        #[arg(long, default_value_t = 7.5)]
+        cfg_scale: f64,
+
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        #[arg(long, default_value = "euler-a")]
+        sampler: String,
+
+        #[arg(short, long, default_value = "out.png")]
+        output: String,
+    },
+
     /// Generate an image from a text prompt and an existing image.
     #[command(name = "img2img")]
     Img2Img {
@@ -376,6 +422,52 @@ fn main() -> Result<()> {
 
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             println!("wrote {output} in {:.1?}", started.elapsed());
+        }
+
+        Command::Inpaint {
+            model,
+            prompt,
+            init_image,
+            mask,
+            strength,
+            negative_prompt,
+            width,
+            height,
+            steps,
+            cfg_scale,
+            seed,
+            sampler,
+            output,
+        } => {
+            let cfg = sd::pipeline::InpaintConfig {
+                base: Img2ImgConfig {
+                    base: Txt2ImgConfig {
+                        prompt,
+                        negative_prompt,
+                        width,
+                        height,
+                        steps,
+                        cfg_scale,
+                        seed,
+                        sampler: parse_sampler(&sampler)?,
+                    },
+                    init_image: std::path::PathBuf::from(&init_image),
+                    strength: Strength::new(strength),
+                },
+                mask: std::path::PathBuf::from(&mask),
+            };
+            tracing::info!(model = %model, init = %init_image, mask = %mask, "inpainting");
+            let started = std::time::Instant::now();
+            let mut report = |step, total, sigma: f64| {
+                tracing::info!(step, total, sigma = format!("{sigma:.3}"), "denoise");
+            };
+            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
+                .with_context(|| format!("loading pipeline from {model}"))?;
+            let img = pipeline
+                .run_inpaint_with_progress(&cfg, &mut report)
+                .context("running inpaint")?;
+            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
+            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
         }
 
         Command::Img2Img {

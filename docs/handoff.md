@@ -136,6 +136,38 @@ guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
 
+**Inpainting works**, `sdrs inpaint --init-image X --mask M`, on any SD 1.5
+checkpoint — no 9-channel inpaint UNet required. The mask follows the universal
+convention: **white repaints**.
+
+Two properties hold exactly, and both are tested:
+
+- **The untouched region is bit-identical to the input.** Latent blending alone
+  cannot give that, because it preserves the *encoded* original and a VAE round
+  trip is lossy; the result is composited against the original in pixel space
+  at the end.
+- **A mask of all black returns the input unchanged**, max diff 0 over the
+  whole image.
+
+The latent mask is 8x8 **max**-pooled, not averaged. A latent cell is not a
+pixel: if any pixel under it is free, the whole cell must be free, or the cells
+straddling the mask edge end up nearly frozen and leave a hard seam exactly
+where it shows most.
+
+A visible seam remains on *large* holes — a half-image mask is the worst case,
+and the one in `assets/` shows it. That is the honest limit of blending
+without a dedicated inpaint checkpoint: the model never sees the mask, so it
+has no way to compose across the boundary. Fixing it means the 9-channel UNet,
+which is a checkpoint change, not a code change.
+
+**A rounding bug in every image this project has saved was found by that
+exactness check** and is fixed. `tensor_to_rgb8` used `v as u8`, which
+truncates; `b/127.5 - 1` followed by `(x+1)*127.5` lands just below the
+integer often enough that a load-and-save darkened most pixels by one level.
+It now rounds, matching diffusers. This is why the inpaint invariant was worth
+asserting as *exact* rather than *close*: at max-diff 1 it reads as noise, and
+a tolerance would have hidden a real defect in the output path.
+
 **LoRA adapters load and merge**, for SD 1.5's dense path:
 `sdrs txt2img --lora <file> --lora-scale <f>`, or
 `Txt2ImgPipeline::load_with_lora`. Verified against a published adapter
