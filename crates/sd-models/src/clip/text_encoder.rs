@@ -214,7 +214,7 @@ impl ClipMlp {
 
 /// One transformer layer. Pre-layernorm.
 #[derive(Debug)]
-struct ClipEncoderLayer {
+pub(super) struct ClipEncoderLayer {
     layer_norm1: LayerNorm,
     self_attn: ClipAttention,
     layer_norm2: LayerNorm,
@@ -222,7 +222,7 @@ struct ClipEncoderLayer {
 }
 
 impl ClipEncoderLayer {
-    fn new(cfg: &ClipTextConfig, vb: VarBuilder) -> Result<Self> {
+    pub(super) fn new(cfg: &ClipTextConfig, vb: VarBuilder) -> Result<Self> {
         let norm_cfg = LayerNormConfig {
             eps: cfg.layer_norm_eps,
             ..Default::default()
@@ -235,7 +235,7 @@ impl ClipEncoderLayer {
         })
     }
 
-    fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
         // Norm before the sublayer, residual added after. Reversing this still
         // runs and still emits [b, 77, 768].
         let residual = xs;

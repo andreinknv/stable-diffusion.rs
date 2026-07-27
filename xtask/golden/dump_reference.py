@@ -1150,6 +1150,58 @@ def dump_esrgan(output: pathlib.Path, model_id: str) -> None:
     print(f"converted {len(state)} tensors -> {out / 'esrgan_x4.safetensors'}")
 
 
+def dump_clip_vision(output: pathlib.Path, model_id: str) -> None:
+    """CLIP's vision tower, as IP-Adapter ships it for SD 1.5."""
+    torch = _require("torch")
+    _require("transformers")
+    from safetensors.torch import save_file
+    from transformers import CLIPVisionModelWithProjection
+
+    out = output / "clip_vision"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id}")
+    net = CLIPVisionModelWithProjection.from_pretrained(
+        model_id, subfolder="models/image_encoder", torch_dtype=torch.float32
+    )
+    net.eval()
+    cfg = net.config
+    print(
+        f"  hidden {cfg.hidden_size} layers {cfg.num_hidden_layers} "
+        f"heads {cfg.num_attention_heads} patch {cfg.patch_size} image {cfg.image_size}"
+    )
+
+    gen = torch.Generator().manual_seed(SEED)
+    # Already normalised: the Rust side is handed the same tensor, so the
+    # preprocessing is compared separately rather than folded in here.
+    pixels = torch.randn(1, 3, cfg.image_size, cfg.image_size, generator=gen)
+
+    with torch.no_grad():
+        outputs = net.vision_model(pixels, output_hidden_states=False)
+        hidden = outputs.last_hidden_state
+        pooled = outputs.pooler_output
+
+    tensors = {
+        "pixels": pixels.contiguous(),
+        "hidden": hidden.detach().contiguous().clone(),
+        "pooled": pooled.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    weights = hf_hub_download(repo_id=model_id, filename="models/image_encoder/model.safetensors")
+    link = out / "image_encoder.safetensors"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(weights)
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<8} {tuple(v.shape)}")
+
+
 SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
 
 
@@ -1492,6 +1544,10 @@ def main() -> None:
     )
     unet_full.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    cv = sub.add_parser("clip_vision", help="dump CLIP vision tower references")
+    cv.add_argument("--model-id", default="h94/IP-Adapter")
+    cv.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     esr = sub.add_parser("esrgan", help="dump Real-ESRGAN x4 references")
     esr.add_argument("--model-id", default="ai-forever/Real-ESRGAN")
     esr.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -1525,7 +1581,9 @@ def main() -> None:
     gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
     args = ap.parse_args()
-    if args.component == "esrgan":
+    if args.component == "clip_vision":
+        dump_clip_vision(args.output, args.model_id)
+    elif args.component == "esrgan":
         dump_esrgan(args.output, args.model_id)
     elif args.component == "taesd":
         dump_taesd(args.output, args.model_id)

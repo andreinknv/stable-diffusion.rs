@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 298 tests, all gates green
+table is in [roadmap.md](roadmap.md). 302 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,39 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**CLIP's vision tower is ported and verified** — 1.270e-4 on the sequence,
+3.485e-6 on the pooled vector, against `transformers`. This is IP-Adapter's
+foundation, and it is the part that was missing; the adapter itself is next
+(see [Next](#next)).
+
+Structurally it is the text tower with a different front end, and
+`ClipEncoderLayer` is reused literally. Three things differ and each is a
+silent-wrongness bug if missed:
+
+- **No causal mask.** An image has no order to respect. The layer takes a mask
+  either way, so this passes zeros — the additive identity for attention
+  logits. Reusing the text mask would let each patch see only those before it
+  in raster order and still emit the right shape.
+- **The class token is prepended**, because the pooled output reads position 0.
+- **`pre_layrnorm`** is spelled that way in the checkpoint. A typo upstream,
+  now load-bearing.
+
+**IP-Adapter consumes the *projected* embedding, not the pooled one.** The
+tower is 1280 wide and `visual_projection` narrows it to 1024, which is what
+`image_proj` expects — `image_embeds` is a separate method from `pooled` for
+that reason. The widths differ, so the mistake fails to load rather than
+running wrong.
+
+The adapter's own layout is confirmed: 4 image tokens from
+`Linear(1024 -> 4*768)` plus a LayerNorm, and 16 `to_k_ip`/`to_v_ip` pairs at
+**odd** indices 1..31 — odd because the flat processor list alternates self-
+and cross-attention and only cross-attention gets them. Their order is
+**down blocks, then up blocks, then mid**, read off the shapes
+(320,320,640,640,1280,1280 | 1280x3, 640x3, 320x3 | 1280). That ordering is
+worth having written down: it is not the order the UNet runs in, and guessing
+it wrong would put every correction on the wrong layer while every shape stayed
+valid.
 
 **Cancellation, a per-step conditioning hook, and prompt-budget queries** —
 the remaining asks from the integration issue.
@@ -494,7 +527,24 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### ~~1. TAESD and step previews~~ — both done
+### 1. Finish IP-Adapter
+
+The vision tower is done and verified (above). What remains is the adapter:
+
+- `ImageProjModel` — `Linear(1024 -> 4*768)` then LayerNorm, giving 4 image
+  tokens. Small.
+- **Decoupled cross-attention**, which is the real work. Each of the 16 cross-
+  attention layers gains `to_k_ip`/`to_v_ip`, and the output becomes
+  `attn(text) + scale * attn(image)`. Not a concatenation — attention is not
+  linear in K and V, so appending the image tokens to the text ones is a
+  different function, and a plausible-looking one.
+- Threading the image tokens to those layers. The cheap route is to carry them
+  on the end of the `context` tensor and have `Attention` split off the last
+  `n` tokens, which needs no signature changes anywhere in the block tree.
+- The index mapping above must be verified against a reference rather than
+  trusted, since a wrong order is silent.
+
+### ~~2. TAESD and step previews~~ — both done
 
 Ported, verified and wired up (see above). Two ends left loose, neither large:
 
