@@ -123,8 +123,10 @@ enum Command {
 
         /// Decode with TAESD instead of the VAE (a ~5 MB .safetensors).
         ///
-        /// Much faster and much smaller; lossier, so fine detail softens.
-        /// SD 1.5 only — SDXL needs `taesdxl`, which is not wired up.
+        /// Much smaller and much lighter — a 512 decode drops from 3.4 GB to
+        /// 0.5 — and lossier, so fine detail softens. **SDXL needs `taesdxl`
+        /// and SD 1.5 needs `taesd`**; the two share an architecture, so the
+        /// wrong one loads happily and decodes in visibly wrong colours.
         #[arg(long)]
         taesd: Option<String>,
     },
@@ -309,6 +311,27 @@ fn previewing<'a>(
     every: Option<usize>,
     output: &'a str,
 ) -> impl FnMut(sd::pipeline::Progress) + 'a {
+    previewing_with(move |t| pipeline.preview(t), every, output)
+}
+
+/// The SDXL twin. The two pipelines share no trait, and inventing one for a
+/// single method would be more machinery than the duplication it removes.
+fn previewing_sdxl<'a>(
+    pipeline: &'a sd::pipeline::SdxlPipeline,
+    every: Option<usize>,
+    output: &'a str,
+) -> impl FnMut(sd::pipeline::Progress) + 'a {
+    previewing_with(move |t| pipeline.preview(t), every, output)
+}
+
+fn previewing_with<'a, F>(
+    decode: F,
+    every: Option<usize>,
+    output: &'a str,
+) -> impl FnMut(sd::pipeline::Progress) + 'a
+where
+    F: Fn(&sd_tensor::Tensor) -> Result<sd_tensor::Tensor, sd::pipeline::PipelineError> + 'a,
+{
     move |p: sd::pipeline::Progress| {
         tracing::info!(
             step = p.step,
@@ -323,8 +346,7 @@ fn previewing<'a>(
             return;
         }
         let path = preview_path(output, p.step);
-        let wrote = pipeline
-            .preview(p.denoised)
+        let wrote = decode(p.denoised)
             .map_err(anyhow::Error::from)
             .and_then(|img| Ok(sd::image_io::save_png(&img, &path)?));
         match wrote {
@@ -512,16 +534,9 @@ fn main() -> Result<()> {
             let source = gguf.clone().or_else(|| model.clone()).unwrap_or_default();
             tracing::info!(model = %source, sdxl, gguf = gguf.is_some(), "loading pipeline");
             let started = std::time::Instant::now();
-            let mut report = |p: sd::pipeline::Progress| {
-                tracing::info!(
-                    step = p.step,
-                    total = p.total,
-                    sigma = format!("{:.3}", p.sigma),
-                    "denoise"
-                );
-            };
-            // A 20-step CPU run takes minutes; without per-step output it
-            // looks hung.
+            // Each branch builds its own callback: it borrows that branch's
+            // pipeline, so it can decode a preview. A 20-step CPU run takes
+            // minutes, and without per-step output it looks hung.
             let img = match (gguf.as_deref(), sdxl) {
                 (Some(_), true) => {
                     anyhow::bail!("--gguf is SD 1.5 only; SDXL GGUF checkpoints are not supported")
@@ -537,14 +552,19 @@ fn main() -> Result<()> {
                         .context("running txt2img from gguf")?
                 }
                 (None, true) => {
-                    if taesd.is_some() {
-                        anyhow::bail!(
-                            "--taesd is SD 1.5 only; SDXL needs the separate `taesdxl` weights"
-                        );
-                    }
                     let m = model.as_deref().context("--model or --gguf is required")?;
                     let pipeline = sd::pipeline::SdxlPipeline::load(Path::new(m), &dev)
                         .with_context(|| format!("loading SDXL pipeline from {m}"))?;
+                    let pipeline = match taesd.as_deref() {
+                        Some(p) => {
+                            tracing::info!(taesd = %p, "decoding with TAESD");
+                            pipeline
+                                .with_taesd(Path::new(p))
+                                .with_context(|| format!("loading TAESD from {p}"))?
+                        }
+                        None => pipeline,
+                    };
+                    let mut report = previewing_sdxl(&pipeline, preview_every, &output);
                     pipeline
                         .run_with_progress(&cfg, &mut report)
                         .context("running SDXL txt2img")?

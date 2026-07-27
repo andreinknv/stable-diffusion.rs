@@ -6,6 +6,8 @@ use sd_models::clip::{ClipTextConfig, ClipTextEncoder, ClipTokenizer};
 use sd_models::controlnet::ControlNet;
 use sd_models::unet::{UNet2DConditionModel, UNetConfig};
 use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, TinyDecoder, VaeConfig};
+
+use super::Decoder;
 use sd_sample::{
     euler_ancestral_step, lcm_sigmas, lcm_step, lcm_timesteps, sigmas_for_steps,
     DpmSolverPlusPlus2M, Schedule,
@@ -214,18 +216,6 @@ pub struct ControlConfig {
     /// How strongly the control applies. 1.0 is the published strength; 0.0 is
     /// exactly an uncontrolled run.
     pub scale: f64,
-}
-
-/// Whichever decoder the pipeline is using.
-///
-/// An enum rather than two `Option` fields so that "exactly one decoder" is a
-/// property of the type. With two options the compiler demands a branch for
-/// "neither", which cannot happen and would have to be an error nobody can
-/// trigger.
-#[derive(Debug)]
-enum Decoder {
-    Vae(Box<AutoencoderKlDecoder>),
-    Tiny(Box<TinyDecoder>),
 }
 
 /// A control map and its strength, for one run.
@@ -533,10 +523,7 @@ impl Txt2ImgPipeline {
     /// is a single branch here rather than a scaling the caller has to get
     /// right.
     fn decode(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
-        match &self.decoder {
-            Decoder::Tiny(tiny) => Ok(tiny.decode(latent)?),
-            Decoder::Vae(vae) => Ok(vae.decode_tiled(latent)?),
-        }
+        self.decoder.decode(latent)
     }
 
     /// Decode a latent for previewing, with whichever decoder is attached.

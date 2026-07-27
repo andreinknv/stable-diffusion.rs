@@ -998,7 +998,8 @@ def dump_taesd(output: pathlib.Path, model_id: str) -> None:
     from diffusers import AutoencoderTiny
     from safetensors.torch import save_file
 
-    out = output / "taesd"
+    # Named for the checkpoint, so taesd and taesdxl can both be present.
+    out = output / model_id.rsplit("/", 1)[-1]
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"loading {model_id}")
@@ -1032,7 +1033,7 @@ def dump_taesd(output: pathlib.Path, model_id: str) -> None:
     weights = hf_hub_download(
         repo_id=model_id, filename="diffusion_pytorch_model.safetensors"
     )
-    link = out / "taesd.safetensors"
+    link = out / "weights.safetensors"
     if link.is_symlink() or link.exists():
         link.unlink()
     link.symlink_to(weights)

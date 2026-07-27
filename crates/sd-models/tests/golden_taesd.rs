@@ -20,31 +20,47 @@ use sd_tensor::{testing, DType, Device, Tensor};
 /// not for the UNet's mid-block activations.
 const TOL: f64 = 1e-4;
 
-fn golden_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/taesd")
+/// The two published checkpoints. Same architecture, different weights — SDXL
+/// needs its own, and loading `taesd` for an SDXL run produces a plausible
+/// image in the wrong colours rather than an error, so both are verified here.
+const CHECKPOINTS: [&str; 2] = ["taesd", "taesdxl"];
+
+fn golden_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden")
+        .join(name)
 }
 
-fn refs() -> Option<HashMap<String, Tensor>> {
-    let path = golden_dir().join("reference.safetensors");
+fn refs_for(name: &str) -> Option<HashMap<String, Tensor>> {
+    let path = golden_dir(name).join("reference.safetensors");
     if !path.exists() {
         eprintln!(
             "SKIP: no reference data.\n\
              Generate it with:\n\
-             \n    python3 xtask/golden/dump_reference.py taesd --output tests/golden\n"
+             \n    python3 xtask/golden/dump_reference.py taesd --model-id madebyollin/{name} \
+             --output tests/golden\n"
         );
         return None;
     }
     Some(sd_tensor::safetensors::load(&path, &Device::Cpu).expect("loading reference"))
 }
 
-fn real_taesd(dev: &Device) -> Option<TinyAutoencoder> {
-    let path = golden_dir().join("taesd.safetensors");
+fn refs() -> Option<HashMap<String, Tensor>> {
+    refs_for("taesd")
+}
+
+fn real_for(dev: &Device, name: &str) -> Option<TinyAutoencoder> {
+    let path = golden_dir(name).join("weights.safetensors");
     if !path.exists() {
-        eprintln!("SKIP: no taesd.safetensors");
+        eprintln!("SKIP: no {name} weights");
         return None;
     }
     let vb = sd_loader::safetensors_var_builder(&[&path], DType::F32, dev).expect("loading TAESD");
     Some(TinyAutoencoder::new(vb).expect("building TAESD"))
+}
+
+fn real_taesd(dev: &Device) -> Option<TinyAutoencoder> {
+    real_for(dev, "taesd")
 }
 
 // -- structural -----------------------------------------------------------
@@ -103,29 +119,59 @@ fn an_extreme_latent_is_soft_clamped_rather_than_blowing_up() {
 #[test]
 fn decode_matches_autoencoder_tiny() {
     let dev = Device::Cpu;
-    let Some(refs) = refs() else { return };
-    let Some(tae) = real_taesd(&dev) else { return };
+    for name in CHECKPOINTS {
+        let Some(refs) = refs_for(name) else { continue };
+        let Some(tae) = real_for(&dev, name) else {
+            continue;
+        };
 
-    let got = tae.decoder.decode(&refs["latent"]).expect("decode");
-    let want = &refs["decoded"];
-    assert_eq!(got.dims(), want.dims());
-    let excess = testing::allclose_excess(&got, want, 0.0).expect("compare");
-    assert!(excess <= TOL, "decode: max diff {excess:.3e}");
-    println!("decode max diff {excess:.3e}");
+        let got = tae.decoder.decode(&refs["latent"]).expect("decode");
+        let want = &refs["decoded"];
+        assert_eq!(got.dims(), want.dims());
+        let excess = testing::allclose_excess(&got, want, 0.0).expect("compare");
+        assert!(excess <= TOL, "{name} decode: max diff {excess:.3e}");
+        println!("{name} decode max diff {excess:.3e}");
+    }
 }
 
 #[test]
 fn encode_matches_autoencoder_tiny() {
     let dev = Device::Cpu;
-    let Some(refs) = refs() else { return };
-    let Some(tae) = real_taesd(&dev) else { return };
+    for name in CHECKPOINTS {
+        let Some(refs) = refs_for(name) else { continue };
+        let Some(tae) = real_for(&dev, name) else {
+            continue;
+        };
 
-    let got = tae.encoder.encode(&refs["image"]).expect("encode");
-    let want = &refs["encoded"];
-    assert_eq!(got.dims(), want.dims());
-    let excess = testing::allclose_excess(&got, want, 0.0).expect("compare");
-    assert!(excess <= TOL, "encode: max diff {excess:.3e}");
-    println!("encode max diff {excess:.3e}");
+        let got = tae.encoder.encode(&refs["image"]).expect("encode");
+        let want = &refs["encoded"];
+        assert_eq!(got.dims(), want.dims());
+        let excess = testing::allclose_excess(&got, want, 0.0).expect("compare");
+        assert!(excess <= TOL, "{name} encode: max diff {excess:.3e}");
+        println!("{name} encode max diff {excess:.3e}");
+    }
+}
+
+#[test]
+fn the_two_checkpoints_are_genuinely_different_weights() {
+    // They share an architecture, so `taesd` loads happily for an SDXL run and
+    // produces a plausible image in the wrong colours. This pins that they are
+    // not interchangeable, which is why `--taesd` has to be told which is which.
+    let dev = Device::Cpu;
+    let (Some(a), Some(b)) = (real_for(&dev, "taesd"), real_for(&dev, "taesdxl")) else {
+        return;
+    };
+    let Some(refs) = refs_for("taesd") else {
+        return;
+    };
+
+    let out_a = a.decoder.decode(&refs["latent"]).expect("decode");
+    let out_b = b.decoder.decode(&refs["latent"]).expect("decode");
+    let excess = testing::allclose_excess(&out_a, &out_b, 0.0).expect("compare");
+    assert!(
+        excess > 0.1,
+        "the two checkpoints decoded the same latent to within {excess:.3e}"
+    );
 }
 
 /// A smooth gradient with a bright square in it: `[1, 3, 256, 256]` in

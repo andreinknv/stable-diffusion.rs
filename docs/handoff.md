@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 277 tests, all gates green
+table is in [roadmap.md](roadmap.md). 278 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -150,6 +150,25 @@ diffusion UI shows this and now so does this one.
 `ProgressFn` therefore carries a `Progress` struct rather than three
 positional arguments. A fourth positional `&Tensor` would have been easy to
 ignore, which is the opposite of the point.
+
+**SDXL has it too**, with `taesdxl` — verified at 1.61e-5 decoding, 7.03e-5
+encoding, and pinned as a *different* checkpoint from `taesd`: the two share an
+architecture, so the wrong one loads without complaint and decodes in visibly
+wrong colours. Nothing in the code can tell them apart, so the path is the
+caller's to get right.
+
+This is where it pays most. `decode_tiled` splits anything above a 64-latent
+edge, so a 1024 VAE decode is four tiles with their seams; TAESD does it in one
+pass. Measured at 1024, 4 steps, **both orderings**:
+
+```text
+  vae   161.7 s      taesd 117.4 s     (reversed)
+  taesd 123.8 s      vae   164.9 s
+```
+
+38-48 s, direction consistent. The absolute numbers are inflated — the machine
+was at load average 20-24 from unrelated work — which is also why they cannot
+be compared with the 86.5 s in the table above. `assets/sdxl-1024-taesdxl-crab.png`.
 
 **TAESD decodes**, `sdrs txt2img --taesd <ckpt>`. About 5 MB of 3x3
 convolutions against the VAE's 330 — no attention, no GroupNorm, no sampling
@@ -314,10 +333,11 @@ profiling it.
 
 Ported, verified and wired up (see above). Two ends left loose, neither large:
 
-- **SDXL.** Same architecture, different weights (`taesdxl`); `--taesd`
-  refuses it rather than loading weights that would silently mismatch. Flux and
-  SD 3 have their own progress callbacks and no previews yet — `Progress` is
-  the shape to converge them on.
+- **Flux and SD 3** have their own `(step, total)` callbacks and no previews.
+  `Progress` is the shape to converge them on, but their `denoised` is not the
+  same quantity: rectified flow predicts a velocity, so the `x0` a preview
+  wants is `x - t*v` rather than `x - sigma*eps`. Worth getting right rather
+  than passing whatever is in scope.
 
 ### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
 

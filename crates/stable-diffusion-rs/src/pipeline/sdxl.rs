@@ -68,7 +68,7 @@ pub struct SdxlPipeline {
     text_encoder: ClipTextEncoder,
     text_encoder_2: ClipTextEncoder,
     unet: UNet2DConditionModel,
-    vae: AutoencoderKlDecoder,
+    decoder: super::Decoder,
     vae_encoder: AutoencoderKlEncoder,
     schedule: Schedule,
     device: Device,
@@ -162,11 +162,43 @@ impl SdxlPipeline {
             text_encoder,
             text_encoder_2,
             unet,
-            vae,
+            decoder: super::Decoder::Vae(Box::new(vae)),
             vae_encoder,
             schedule: Schedule::sd15(),
             device: device.clone(),
         })
+    }
+
+    /// Use TAESD instead of the VAE for decoding.
+    ///
+    /// **SDXL needs `taesdxl`, not `taesd`.** The two share an architecture, so
+    /// the wrong one loads without complaint and decodes to a plausible image
+    /// in visibly wrong colours — nothing here can tell them apart, so the path
+    /// is the caller's to get right.
+    ///
+    /// Worth more at SDXL's sizes than at SD 1.5's: `decode_tiled` splits
+    /// anything above a 64-latent edge, so a 1024 VAE decode is four tiles and
+    /// carries their seams, where TAESD does it in one pass.
+    pub fn with_taesd(mut self, path: impl AsRef<std::path::Path>) -> Result<Self, PipelineError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(PipelineError::MissingFile(path.to_path_buf()));
+        }
+        let vb = sd_loader::safetensors_var_builder(&[path], VAE_DTYPE, &self.device)?;
+        self.decoder = super::Decoder::Tiny(Box::new(sd_models::vae::TinyDecoder::new(4, 3, vb)?));
+        // A drop frees nothing on Metal until candle returns its pooled
+        // buffers, which happens on synchronise.
+        self.device.synchronize()?;
+        Ok(self)
+    }
+
+    fn decode(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
+        self.decoder.decode(latent)
+    }
+
+    /// Decode a latent for previewing, with whichever decoder is attached.
+    pub fn preview(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
+        self.decode(latent)
     }
 
     /// The sigma ladder a sampler wants. See the SD 1.5 pipeline's copy: LCM
@@ -249,7 +281,7 @@ impl SdxlPipeline {
         // Tiled: SDXL's native 1024 needs a 9.66 GB conv intermediate as a
         // single decode, which does not fit in GPU memory. See
         // docs/backends.md.
-        Ok(self.vae.decode_tiled(&latent)?)
+        self.decode(&latent)
     }
 
     /// The sampling loop, shared by txt2img and img2img.
@@ -383,7 +415,7 @@ impl SdxlPipeline {
         let sigmas = self.sigmas_for(base.sampler, base.steps);
         let start = cfg.strength.start_index(base.steps);
         if start >= base.steps {
-            return Ok(self.vae.decode_tiled(&latent)?);
+            return self.decode(&latent);
         }
 
         let mut rng = SeededRng::new(base.seed);
@@ -401,6 +433,6 @@ impl SdxlPipeline {
             &mut rng,
             progress,
         )?;
-        Ok(self.vae.decode_tiled(&latent)?)
+        self.decode(&latent)
     }
 }
