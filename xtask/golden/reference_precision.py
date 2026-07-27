@@ -176,9 +176,50 @@ def vae(model_id):
     )
 
 
+def taesd(_model_id):
+    """All four TAESD checkpoints at once: their floors differ by 80x.
+
+    Worth running as a set rather than one at a time, because that spread is
+    the finding. `taef1` is two orders of magnitude noisier than `taesd3` in
+    f32 despite being the same architecture, so a single tolerance chosen from
+    any one of them is wrong for the others.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import AutoencoderTiny
+
+    gen = torch.Generator().manual_seed(SEED)
+    latent16 = torch.randn(1, 16, 32, 32, generator=gen)
+    image = torch.rand(1, 3, 256, 256, generator=gen) * 2 - 1
+    latent4 = torch.randn(1, 4, 32, 32, generator=torch.Generator().manual_seed(SEED))
+
+    for name in ("taesd", "taesdxl", "taesd3", "taef1"):
+        print(f"\n{name}:")
+        results = {}
+        for dtype in (torch.float32, torch.float64):
+            net = AutoencoderTiny.from_pretrained(
+                f"madebyollin/{name}", torch_dtype=torch.float32
+            ).to(dtype)
+            net.eval()
+            latent = latent16 if net.config.latent_channels == 16 else latent4
+            with torch.no_grad():
+                results[dtype] = {
+                    "encoded": net.encoder(image.to(dtype)).detach().clone(),
+                    "decoded": net.decoder(latent.to(dtype)).detach().clone(),
+                }
+            del net
+        f32, f64 = results[torch.float32], results[torch.float64]
+        for key in f64:
+            report(key, spread(f32[key], f64[key]))
+    print(
+        "\nA tolerance below these numbers is measuring float32, not the port.\n"
+        "Quote them where the tolerance is set."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("component", choices=["unet", "vae"])
+    ap.add_argument("component", choices=["unet", "vae", "taesd"])
     ap.add_argument(
         "--model-id", default="stable-diffusion-v1-5/stable-diffusion-v1-5"
     )
@@ -187,6 +228,8 @@ def main():
         unet(args.model_id)
     elif args.component == "vae":
         vae(args.model_id)
+    elif args.component == "taesd":
+        taesd(args.model_id)
 
 
 if __name__ == "__main__":

@@ -252,12 +252,21 @@ pub struct TinyAutoencoder {
 }
 
 impl TinyAutoencoder {
-    /// Build from `madebyollin/taesd` (SD 1.5/2.x) or `taesdxl` — the two are
-    /// the same architecture with different weights.
+    /// Build a 4-channel TAESD: `madebyollin/taesd` (SD 1.5/2.x) or `taesdxl`.
     pub fn new(vb: VarBuilder) -> Result<Self> {
+        Self::with_channels(4, vb)
+    }
+
+    /// Build for a given latent width.
+    ///
+    /// 4 for SD 1.5, SD 2.x and SDXL; **16 for SD 3.x (`taesd3`) and Flux
+    /// (`taef1`)**. Same architecture in every case — only the first and last
+    /// convolutions change width — so the wrong count fails to load rather
+    /// than running wrong, which is the one mismatch here that is loud.
+    pub fn with_channels(latent_channels: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            encoder: TinyEncoder::new(3, 4, vb.clone())?,
-            decoder: TinyDecoder::new(4, 3, vb)?,
+            encoder: TinyEncoder::new(3, latent_channels, vb.clone())?,
+            decoder: TinyDecoder::new(latent_channels, 3, vb)?,
         })
     }
 }

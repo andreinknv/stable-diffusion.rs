@@ -95,7 +95,7 @@ pub struct FluxPipeline {
     t5_tokenizer: T5Tokenizer,
     t5: T5EncoderModel,
     transformer: FluxTransformer,
-    vae: AutoencoderKlDecoder,
+    decoder: super::Decoder,
     flow: FlowMatchConfig,
     placement: Placement,
 }
@@ -194,7 +194,7 @@ impl FluxPipeline {
             t5_tokenizer,
             t5,
             transformer,
-            vae,
+            decoder: super::Decoder::Vae(Box::new(vae)),
             flow: FlowMatchConfig::flux(),
             placement: placement.clone(),
         })
@@ -238,17 +238,17 @@ impl FluxPipeline {
     }
 
     pub fn run(&self, cfg: &FluxConfigRun) -> Result<Tensor, PipelineError> {
-        self.run_with_progress(cfg, |_, _| {})
+        self.run_with_progress(cfg, |_| {})
     }
 
     pub fn run_with_progress(
         &self,
         cfg: &FluxConfigRun,
-        progress: impl FnMut(usize, usize),
+        progress: impl FnMut(super::Progress<'_>),
     ) -> Result<Tensor, PipelineError> {
         let latents = self.denoise(cfg, progress)?;
         let latents = placement::to(&latents, self.placement.vae())?;
-        Ok(self.vae.decode_tiled(&latents)?)
+        self.decoder.decode(&latents)
     }
 
     /// [`Self::run_with_progress`], but everything the decode does not need is
@@ -257,21 +257,54 @@ impl FluxPipeline {
     pub fn run_releasing(
         self,
         cfg: &FluxConfigRun,
-        progress: impl FnMut(usize, usize),
+        progress: impl FnMut(super::Progress<'_>),
     ) -> Result<Tensor, PipelineError> {
         let latents = self.denoise(cfg, progress)?;
         let latents = placement::to(&latents, self.placement.vae())?;
         let device = self.placement.compute().clone();
-        let Self { vae, .. } = self;
+        let Self { decoder, .. } = self;
         device.synchronize()?;
-        Ok(vae.decode_tiled(&latents)?)
+        decoder.decode(&latents)
+    }
+
+    /// Use TAESD instead of the VAE for decoding.
+    ///
+    /// **This model needs `madebyollin/taef1`.** All the TAESD checkpoints
+    /// share an architecture and differ only in weights and latent width, and
+    /// this one is 16-channel — so a 4-channel `taesd`/`taesdxl` file fails to
+    /// load here rather than decoding wrongly, which is the one mismatch in
+    /// the family that is loud.
+    ///
+    /// Mostly worth having for previews: at 16 channels and these resolutions
+    /// a VAE decode per step is not affordable, and a preview that only
+    /// appears at the end is not a preview.
+    pub fn with_taesd(mut self, path: impl AsRef<std::path::Path>) -> Result<Self, PipelineError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(PipelineError::MissingFile(path.to_path_buf()));
+        }
+        let vb = sd_loader::safetensors_var_builder(&[path], VAE_DTYPE, self.placement.vae())?;
+        self.decoder = super::Decoder::Tiny(Box::new(sd_models::vae::TinyDecoder::new(16, 3, vb)?));
+        // A drop frees nothing on Metal until candle returns its pooled
+        // buffers, which happens on synchronise.
+        self.placement.compute().synchronize()?;
+        Ok(self)
+    }
+
+    /// Decode a latent for previewing, with whichever decoder is attached.
+    ///
+    /// The latent must be unpacked — which is what `Progress::denoised`
+    /// hands over.
+    pub fn preview(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
+        self.decoder
+            .decode(&placement::to(latent, self.placement.vae())?)
     }
 
     /// The sampling loop, returning the unpacked latent before decoding.
     fn denoise(
         &self,
         cfg: &FluxConfigRun,
-        mut progress: impl FnMut(usize, usize),
+        mut progress: impl FnMut(super::Progress<'_>),
     ) -> Result<Tensor, PipelineError> {
         if cfg.steps == 0 {
             return Err(PipelineError::NoSteps);
@@ -334,15 +367,25 @@ impl FluxPipeline {
             // The step itself in F32. It is a scaled add over the whole
             // latent and accumulating 20 of them in F16 visibly quantises the
             // trajectory, for a cost of nothing.
-            xs = flow_euler_step(
-                &xs.to_dtype(DType::F32)?,
-                &velocity.to_dtype(DType::F32)?,
-                sigmas[i],
-                sigmas[i + 1],
-            )?
-            .to_dtype(MODEL_DTYPE)?;
+            let xs32 = xs.to_dtype(DType::F32)?;
+            let v32 = velocity.to_dtype(DType::F32)?;
 
-            progress(i + 1, cfg.steps);
+            // The x0 estimate, for a preview. Rectified flow predicts a
+            // *velocity*, not noise, so this is `x - sigma*v` — the inverse of
+            // the forward process `x = sigma*noise + (1-sigma)*x0`. Unpacked
+            // here too: the loop carries latents in Flux's 2x2-patch packing,
+            // and handing a decoder the packed form would decode nonsense at
+            // a shape that still looks reasonable.
+            let denoised = unpack_latents(&(&xs32 - (&v32 * sigmas[i])?)?, lat_h, lat_w)?;
+
+            xs = flow_euler_step(&xs32, &v32, sigmas[i], sigmas[i + 1])?.to_dtype(MODEL_DTYPE)?;
+
+            progress(super::Progress {
+                step: i + 1,
+                total: cfg.steps,
+                sigma: sigmas[i],
+                denoised: &denoised,
+            });
         }
 
         Ok(unpack_latents(&xs.to_dtype(VAE_DTYPE)?, lat_h, lat_w)?)
@@ -375,10 +418,10 @@ impl FluxPipeline {
         &self,
         cfg: &FluxConfigRun,
     ) -> Result<(Tensor, Tensor), PipelineError> {
-        let latents = self.denoise(cfg, |_, _| {})?;
+        let latents = self.denoise(cfg, |_| {})?;
         let image = self
-            .vae
-            .decode_tiled(&placement::to(&latents, self.placement.vae())?)?;
+            .decoder
+            .decode(&placement::to(&latents, self.placement.vae())?)?;
         Ok((latents, image))
     }
 }

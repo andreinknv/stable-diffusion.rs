@@ -50,7 +50,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let t1 = std::time::Instant::now();
     // One image, then exit: drop the transformer before the decode.
-    let image = pipe.run_releasing(&cfg, |i, n| eprintln!("  step {i}/{n}"))?;
+    // SD_PREVIEW_EVERY=5 writes the model's running x0 estimate every 5 steps.
+    // It needs a tiny decoder — a VAE decode per step costs more than the
+    // step — so point SD_TAESD at `madebyollin/taesd3`.
+    let preview_every: usize = std::env::var("SD_PREVIEW_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let pipe = match std::env::var("SD_TAESD") {
+        Ok(p) => {
+            eprintln!("decoding with TAESD from {p}");
+            pipe.with_taesd(std::path::Path::new(&p))?
+        }
+        Err(_) => pipe,
+    };
+    let image = pipe.run_with_progress(&cfg, |p| {
+        eprintln!("  step {}/{}", p.step, p.total);
+        if preview_every > 0 && (p.step % preview_every == 0 || p.step == p.total) {
+            let path = format!("{}-preview-{:03}.png", out.trim_end_matches(".png"), p.step);
+            match pipe
+                .preview(p.denoised)
+                .map_err(|e| e.to_string())
+                .and_then(|img| {
+                    stable_diffusion_rs::image_io::save_png(&img, &path).map_err(|e| e.to_string())
+                }) {
+                Ok(()) => eprintln!("  wrote {path}"),
+                Err(e) => eprintln!("  preview failed: {e}"),
+            }
+        }
+    })?;
     eprintln!("generated in {:.1}s", t1.elapsed().as_secs_f64());
     stable_diffusion_rs::image_io::save_png(&image, &out)?;
     eprintln!("wrote {out}");

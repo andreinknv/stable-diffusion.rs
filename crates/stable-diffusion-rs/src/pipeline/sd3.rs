@@ -112,7 +112,7 @@ pub struct Sd3Pipeline {
     t5_tokenizer: T5Tokenizer,
     t5: T5EncoderModel,
     transformer: Sd3Transformer,
-    vae: AutoencoderKlDecoder,
+    decoder: super::Decoder,
     flow: FlowMatchConfig,
     placement: Placement,
 }
@@ -204,7 +204,7 @@ impl Sd3Pipeline {
             t5_tokenizer,
             t5,
             transformer,
-            vae,
+            decoder: super::Decoder::Vae(Box::new(vae)),
             flow: FlowMatchConfig::sd3(),
             placement: placement.clone(),
         })
@@ -257,17 +257,17 @@ impl Sd3Pipeline {
     }
 
     pub fn run(&self, cfg: &Sd3RunConfig) -> Result<Tensor, PipelineError> {
-        self.run_with_progress(cfg, |_, _| {})
+        self.run_with_progress(cfg, |_| {})
     }
 
     pub fn run_with_progress(
         &self,
         cfg: &Sd3RunConfig,
-        progress: impl FnMut(usize, usize),
+        progress: impl FnMut(super::Progress<'_>),
     ) -> Result<Tensor, PipelineError> {
         let latents = self.denoise(cfg, progress)?;
         let latents = placement::to(&latents, self.placement.vae())?;
-        Ok(self.vae.decode_tiled(&latents)?)
+        self.decoder.decode(&latents)
     }
 
     /// [`Self::run_with_progress`], but the transformer and text encoders are
@@ -286,27 +286,60 @@ impl Sd3Pipeline {
     pub fn run_releasing(
         self,
         cfg: &Sd3RunConfig,
-        progress: impl FnMut(usize, usize),
+        progress: impl FnMut(super::Progress<'_>),
     ) -> Result<Tensor, PipelineError> {
         let latents = self.denoise(cfg, progress)?;
         let latents = placement::to(&latents, self.placement.vae())?;
         // Keep the VAE and the device, drop everything else. `latents` is
         // already computed and holds no borrow of `self`.
         let device = self.placement.compute().clone();
-        let Self { vae, .. } = self;
+        let Self { decoder, .. } = self;
         // Dropping is not enough on Metal: candle pools its buffers and hands
         // them back only when something synchronises, because that is where
         // it runs `drop_unused_buffers`. Without this the drop above frees
         // nothing at all — measured, not assumed.
         device.synchronize()?;
-        Ok(vae.decode_tiled(&latents)?)
+        decoder.decode(&latents)
+    }
+
+    /// Use TAESD instead of the VAE for decoding.
+    ///
+    /// **This model needs `madebyollin/taesd3`.** All the TAESD checkpoints
+    /// share an architecture and differ only in weights and latent width, and
+    /// this one is 16-channel — so a 4-channel `taesd`/`taesdxl` file fails to
+    /// load here rather than decoding wrongly, which is the one mismatch in
+    /// the family that is loud.
+    ///
+    /// Mostly worth having for previews: at 16 channels and these resolutions
+    /// a VAE decode per step is not affordable, and a preview that only
+    /// appears at the end is not a preview.
+    pub fn with_taesd(mut self, path: impl AsRef<std::path::Path>) -> Result<Self, PipelineError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(PipelineError::MissingFile(path.to_path_buf()));
+        }
+        let vb = sd_loader::safetensors_var_builder(&[path], DTYPE, self.placement.vae())?;
+        self.decoder = super::Decoder::Tiny(Box::new(sd_models::vae::TinyDecoder::new(16, 3, vb)?));
+        // A drop frees nothing on Metal until candle returns its pooled
+        // buffers, which happens on synchronise.
+        self.placement.compute().synchronize()?;
+        Ok(self)
+    }
+
+    /// Decode a latent for previewing, with whichever decoder is attached.
+    ///
+    /// The latent must be unpacked — which is what `Progress::denoised`
+    /// hands over.
+    pub fn preview(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
+        self.decoder
+            .decode(&placement::to(latent, self.placement.vae())?)
     }
 
     /// The sampling loop, returning the latent before decoding.
     fn denoise(
         &self,
         cfg: &Sd3RunConfig,
-        mut progress: impl FnMut(usize, usize),
+        mut progress: impl FnMut(super::Progress<'_>),
     ) -> Result<Tensor, PipelineError> {
         if cfg.steps == 0 {
             return Err(PipelineError::NoSteps);
@@ -346,8 +379,19 @@ impl Sd3Pipeline {
             // Real classifier-free guidance, two passes per step.
             let velocity = (&uncond + ((cond - &uncond)? * cfg.cfg_scale)?)?;
 
+            // The x0 estimate, for a preview. Rectified flow predicts a
+            // *velocity*, not noise, so this is `x - sigma*v` — the inverse of
+            // the forward process `x = sigma*noise + (1-sigma)*x0`. Reusing the
+            // DDPM form `x - sigma*eps` here would give a plausible-looking
+            // tensor that is not the model's estimate of anything.
+            let denoised = (&latents - (&velocity * sigmas[i])?)?;
             latents = flow_euler_step(&latents, &velocity, sigmas[i], sigmas[i + 1])?;
-            progress(i + 1, cfg.steps);
+            progress(super::Progress {
+                step: i + 1,
+                total: cfg.steps,
+                sigma: sigmas[i],
+                denoised: &denoised,
+            });
         }
 
         Ok(latents)

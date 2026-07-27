@@ -15,15 +15,47 @@ use sd_models::vae::{TinyAutoencoder, TinyDecoder, TinyEncoder};
 use sd_tensor::nn::{VarBuilder, VarMap};
 use sd_tensor::{testing, DType, Device, Tensor};
 
-/// TAESD is a distilled model of modest dynamic range — its output is an image
-/// in `[-1, 1]` — so a plain absolute bound is meaningful here in a way it is
-/// not for the UNet's mid-block activations.
-const TOL: f64 = 1e-4;
+/// Decoder tolerance, and encoder tolerance — they differ by 10x, measured.
+///
+/// `xtask/golden/reference_precision.py taesd` runs each checkpoint against
+/// **itself** in f64, same weights and inputs, so neither run has a bug and
+/// the gap between them is float32's own noise floor:
+///
+/// ```text
+///              reference f32 vs its own f64      this port vs reference f32
+///              encoded        decoded            encoded      decoded
+///   taesd      4.574e-6       1.114e-5           1.240e-5     1.860e-5
+///   taesdxl    6.257e-5       9.946e-6           7.033e-5     1.609e-5
+///   taesd3     2.661e-6       5.528e-6           3.278e-6     7.153e-6
+///   taef1      2.156e-4       3.977e-6           1.996e-4     3.934e-6
+/// ```
+///
+/// **`taef1`'s encoder is 80x noisier in f32 than `taesd3`'s despite being the
+/// same architecture**, and the port sits *below* that floor — 1.996e-4
+/// against 2.156e-4. An earlier version of this test used a flat 1e-4 and
+/// failed on exactly that entry, which was the tolerance measuring float32
+/// rather than the port. Its `mean_abs` is 8.876e-7, so the number is one
+/// outlier element and not a systematic shift.
+///
+/// So: `ENCODE_TOL` is 4.6x the worst encoder floor, `DECODE_TOL` 9x the worst
+/// decoder floor — the same margins the UNet's bound uses. A real porting bug
+/// is nowhere near either; the missing decoder ReLU found during this port
+/// showed 2.5.
+const DECODE_TOL: f64 = 1e-4;
+const ENCODE_TOL: f64 = 1e-3;
 
-/// The two published checkpoints. Same architecture, different weights — SDXL
-/// needs its own, and loading `taesd` for an SDXL run produces a plausible
-/// image in the wrong colours rather than an error, so both are verified here.
-const CHECKPOINTS: [&str; 2] = ["taesd", "taesdxl"];
+/// The published checkpoints, and their latent width.
+///
+/// Same architecture throughout — only the weights and the channel count
+/// differ. Each base model needs its own: loading `taesd` for an SDXL run
+/// produces a plausible image in the wrong colours rather than an error, and
+/// the 4/16 split at least fails loudly.
+const CHECKPOINTS: [(&str, usize); 4] = [
+    ("taesd", 4),   // SD 1.5, SD 2.x
+    ("taesdxl", 4), // SDXL
+    ("taesd3", 16), // SD 3.x
+    ("taef1", 16),  // Flux
+];
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -49,18 +81,18 @@ fn refs() -> Option<HashMap<String, Tensor>> {
     refs_for("taesd")
 }
 
-fn real_for(dev: &Device, name: &str) -> Option<TinyAutoencoder> {
+fn real_for(dev: &Device, name: &str, channels: usize) -> Option<TinyAutoencoder> {
     let path = golden_dir(name).join("weights.safetensors");
     if !path.exists() {
         eprintln!("SKIP: no {name} weights");
         return None;
     }
     let vb = sd_loader::safetensors_var_builder(&[&path], DType::F32, dev).expect("loading TAESD");
-    Some(TinyAutoencoder::new(vb).expect("building TAESD"))
+    Some(TinyAutoencoder::with_channels(channels, vb).expect("building TAESD"))
 }
 
 fn real_taesd(dev: &Device) -> Option<TinyAutoencoder> {
-    real_for(dev, "taesd")
+    real_for(dev, "taesd", 4)
 }
 
 // -- structural -----------------------------------------------------------
@@ -119,9 +151,9 @@ fn an_extreme_latent_is_soft_clamped_rather_than_blowing_up() {
 #[test]
 fn decode_matches_autoencoder_tiny() {
     let dev = Device::Cpu;
-    for name in CHECKPOINTS {
+    for (name, channels) in CHECKPOINTS {
         let Some(refs) = refs_for(name) else { continue };
-        let Some(tae) = real_for(&dev, name) else {
+        let Some(tae) = real_for(&dev, name, channels) else {
             continue;
         };
 
@@ -129,7 +161,7 @@ fn decode_matches_autoencoder_tiny() {
         let want = &refs["decoded"];
         assert_eq!(got.dims(), want.dims());
         let excess = testing::allclose_excess(&got, want, 0.0).expect("compare");
-        assert!(excess <= TOL, "{name} decode: max diff {excess:.3e}");
+        assert!(excess <= DECODE_TOL, "{name} decode: max diff {excess:.3e}");
         println!("{name} decode max diff {excess:.3e}");
     }
 }
@@ -137,9 +169,9 @@ fn decode_matches_autoencoder_tiny() {
 #[test]
 fn encode_matches_autoencoder_tiny() {
     let dev = Device::Cpu;
-    for name in CHECKPOINTS {
+    for (name, channels) in CHECKPOINTS {
         let Some(refs) = refs_for(name) else { continue };
-        let Some(tae) = real_for(&dev, name) else {
+        let Some(tae) = real_for(&dev, name, channels) else {
             continue;
         };
 
@@ -147,7 +179,7 @@ fn encode_matches_autoencoder_tiny() {
         let want = &refs["encoded"];
         assert_eq!(got.dims(), want.dims());
         let excess = testing::allclose_excess(&got, want, 0.0).expect("compare");
-        assert!(excess <= TOL, "{name} encode: max diff {excess:.3e}");
+        assert!(excess <= ENCODE_TOL, "{name} encode: max diff {excess:.3e}");
         println!("{name} encode max diff {excess:.3e}");
     }
 }
@@ -158,7 +190,7 @@ fn the_two_checkpoints_are_genuinely_different_weights() {
     // produces a plausible image in the wrong colours. This pins that they are
     // not interchangeable, which is why `--taesd` has to be told which is which.
     let dev = Device::Cpu;
-    let (Some(a), Some(b)) = (real_for(&dev, "taesd"), real_for(&dev, "taesdxl")) else {
+    let (Some(a), Some(b)) = (real_for(&dev, "taesd", 4), real_for(&dev, "taesdxl", 4)) else {
         return;
     };
     let Some(refs) = refs_for("taesd") else {

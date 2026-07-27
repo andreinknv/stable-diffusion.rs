@@ -1007,8 +1007,11 @@ def dump_taesd(output: pathlib.Path, model_id: str) -> None:
     tae.eval()
 
     gen = torch.Generator().manual_seed(SEED)
-    # The scale a real latent has: the sampler's output, not unit normal.
-    latent = torch.randn(*LATENT_SHAPE, generator=gen)
+    # Flux and SD 3 have 16-channel latents, SD 1.5/SDXL have 4. Read it from
+    # the checkpoint rather than assuming: a wrong channel count fails to load
+    # in Rust, which is the good direction, but it would fail here first.
+    channels = tae.config.latent_channels
+    latent = torch.randn(1, channels, LATENT_SHAPE[2], LATENT_SHAPE[3], generator=gen)
     image = torch.rand(1, 3, 256, 256, generator=gen) * 2 - 1
 
     with torch.no_grad():

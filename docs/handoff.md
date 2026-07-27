@@ -136,8 +136,41 @@ guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
 
-**Step previews work**, `--preview-every N`, which is what the tiny decoder
-was for: a 20-step run no longer sits blank for two minutes.
+**Step previews work for all four architectures** — SD 1.5 and SDXL via
+`--preview-every N`, Flux and SD 3.5 via `SD_PREVIEW_EVERY` on their examples.
+This is what the tiny decoder was for: a 20-step run no longer sits blank for
+two minutes.
+
+**Flux and SD 3.5 needed a different `x0`, and getting it wrong would have
+looked plausible.** They are rectified flow: the model predicts a *velocity*,
+not noise, so the estimate is `x - sigma*v` — the inverse of the forward
+process `x = sigma*noise + (1-sigma)*x0` — and not the DDPM `x - sigma*eps`.
+Flux also carries its latents 2x2-*packed* through the loop, so the estimate
+has to be unpacked before anything decodes it; handing over the packed form
+gives a tensor of an entirely reasonable shape that decodes to nonsense.
+
+Both are confirmed by a property that falls out for free and is worth
+keeping: **at the last step the x0 estimate equals the returned image
+exactly.** `sigma_next` is 0 there, so the sampler lands on `x0`; a wrong
+formula would not land. Measured against the final image, mean absolute
+difference per 8-bit channel:
+
+```text
+  flux  step 1/4   18.1      sd3.5  step  5/20   20.6
+        step 2/4   10.2             step 10/20   10.8
+        step 3/4    0.2             step 15/20    5.5
+        step 4/4    0.0             step 20/20    0.0
+```
+
+Flux schnell's estimate after a *single* step is already close to final
+(`assets/flux-preview-step01-of-04.png`) — which is what four-step
+distillation buys, seen directly.
+
+**All four TAESD checkpoints are ported**: `taesd` (SD 1.5/2.x), `taesdxl`,
+`taesd3` and `taef1`, the last two at 16 latent channels. Same architecture
+throughout, so `TinyDecoder::new` takes the width; a 4-channel file in a
+16-channel slot fails to load, which is the one mismatch in the family that
+is loud.
 
 **The preview is the `x0` estimate, not the sampler's latent**, and that is
 the whole design. The latent at step 5 of 20 is `x0 + sigma*noise` with sigma
@@ -333,11 +366,11 @@ profiling it.
 
 Ported, verified and wired up (see above). Two ends left loose, neither large:
 
-- **Flux and SD 3** have their own `(step, total)` callbacks and no previews.
-  `Progress` is the shape to converge them on, but their `denoised` is not the
-  same quantity: rectified flow predicts a velocity, so the `x0` a preview
-  wants is `x - t*v` rather than `x - sigma*eps`. Worth getting right rather
-  than passing whatever is in scope.
+- **Flux and SD 3 have no CLI subcommand**, so their previews are driven by
+  `SD_PREVIEW_EVERY` / `SD_TAESD` on `examples/{flux,sd3}_txt2img.rs`. Folding
+  them into `sdrs` is the obvious tidy-up and is a bigger question than it
+  looks: they take paths to five and six files respectively, where txt2img
+  takes one directory.
 
 ### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
 
