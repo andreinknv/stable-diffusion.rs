@@ -196,6 +196,20 @@ impl FluxPipeline {
         Ok(self.vae.decode_tiled(&latents)?)
     }
 
+    /// [`Self::run_with_progress`], but everything the decode does not need is
+    /// dropped first. See `Sd3Pipeline::run_releasing` for the reasoning and
+    /// for what it is actually worth on Metal.
+    pub fn run_releasing(
+        self,
+        cfg: &FluxConfigRun,
+        progress: impl FnMut(usize, usize),
+    ) -> Result<Tensor, PipelineError> {
+        let latents = self.denoise(cfg, progress)?;
+        let Self { vae, device, .. } = self;
+        device.synchronize()?;
+        Ok(vae.decode_tiled(&latents)?)
+    }
+
     /// The sampling loop, returning the unpacked latent before decoding.
     fn denoise(
         &self,

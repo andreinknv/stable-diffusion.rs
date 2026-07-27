@@ -177,10 +177,48 @@ impl AutoencoderKlDecoder {
         self.decode_raw_tiled(&self.unscale(latents)?)
     }
 
+    /// The tile edge this decode will use.
+    ///
+    /// An explicit [`TILE_LATENT_EDGE_ENV`] wins outright — a caller who set
+    /// it is answering this question themselves. Otherwise the largest edge
+    /// that is projected to fit is chosen, from [`TILE_LATENT_EDGE`] down.
+    ///
+    /// **Why this is chosen rather than fixed.** A 64-latent tile allocates a
+    /// 2.42 GB convolution im2col. That is comfortable when the VAE is most of
+    /// what is resident and impossible when a 10 GB transformer is also on the
+    /// GPU — and the failure lands at the *end* of a run, after every denoise
+    /// step has been paid for. Projecting the cost against what is actually
+    /// free turns that into a slightly different image instead of a dead run.
+    ///
+    /// Halving rather than searching finely: the peak scales with the tile's
+    /// area, so the candidates are already far apart, and each extra step down
+    /// costs another seam to blend.
+    pub fn tile_edge_for(&self, batch: usize, dtype: sd_tensor::DType) -> Result<usize> {
+        if let Some(explicit) = explicit_tile_latent_edge()? {
+            return Ok(explicit);
+        }
+        let cfg = self.decoder.config();
+        let mut tile = TILE_LATENT_EDGE;
+        while tile > MIN_TILE_LATENT_EDGE {
+            let peak = cfg.peak_alloc_bytes(batch, tile, tile, dtype);
+            // `check_headroom` refuses when the projection exceeds the
+            // configured fraction of free memory, which is exactly the
+            // question being asked; its error is discarded rather than
+            // returned because a tile that does not fit is not an error here.
+            if sd_tensor::sysmem::check_headroom(peak.unwrap_or(u64::MAX), "a VAE decode tile")
+                .is_ok()
+            {
+                break;
+            }
+            tile /= 2;
+        }
+        Ok(tile)
+    }
+
     /// [`Self::decode_raw`], in overlapping tiles.
     pub fn decode_raw_tiled(&self, latents: &Tensor) -> Result<Tensor> {
-        let (_, _, lh, lw) = latents.dims4()?;
-        let tile = tile_latent_edge()?;
+        let (b, _, lh, lw) = latents.dims4()?;
+        let tile = self.tile_edge_for(b, latents.dtype())?;
         if lh <= tile && lw <= tile {
             return self.decode_raw(latents);
         }
@@ -352,9 +390,16 @@ impl AutoencoderKlEncoder {
     /// this is safe to call unconditionally.
     pub fn encode_tiled(&self, image: &Tensor) -> Result<Tensor> {
         let (_, _, ih, iw) = image.dims4()?;
-        // Same knob as the decode: an encode that no longer fits is the same
-        // problem, and having the two disagree would make img2img tile one
-        // way in and another way out.
+        // An explicit override applies here too, but unlike the decode this
+        // does *not* size itself to available memory: `EncoderConfig` has no
+        // `peak_alloc_bytes`, so there is nothing to project against. Writing
+        // one means deriving the peak through the downsampling stack the way
+        // `DecoderConfig` does for the upsampling one — worth doing if an
+        // encode is ever the thing that runs out, which it has not been.
+        //
+        // The two directions choosing different tile edges is not a
+        // correctness problem, only a slightly different image; tiling is an
+        // implementation detail of each direction, not a shared contract.
         let tile_latent = tile_latent_edge()?;
         let tile_px = tile_latent * 8;
         if ih <= tile_px && iw <= tile_px {
@@ -435,17 +480,28 @@ impl AutoencoderKlEncoder {
 pub const TILE_LATENT_EDGE: usize = 64;
 
 /// Environment override for [`TILE_LATENT_EDGE`], in latent cells.
+///
+/// Setting it disables the automatic choice in
+/// [`AutoencoderKlDecoder::tile_edge_for`] entirely, rather than capping it.
 pub const TILE_LATENT_EDGE_ENV: &str = "SD_VAE_TILE_LATENT";
 
-/// The active decode tile edge, honouring [`TILE_LATENT_EDGE_ENV`].
+/// Smallest tile the automatic choice will fall to.
+///
+/// Below this the seams outnumber the picture and the projection has stopped
+/// being the real constraint anyway — if an 8-latent tile does not fit, the
+/// run is not going to finish. Refusing loudly at the decode beats emitting a
+/// heavily seamed image and calling it success.
+pub const MIN_TILE_LATENT_EDGE: usize = 8;
+
+/// An explicitly configured tile edge, if [`TILE_LATENT_EDGE_ENV`] is set.
 ///
 /// Refuses 0 rather than defaulting it: a zero tile means an infinite loop in
 /// the tiling walk, and silently substituting 64 for a value the caller
 /// deliberately set would hide the mistake.
-pub fn tile_latent_edge() -> Result<usize> {
+pub fn explicit_tile_latent_edge() -> Result<Option<usize>> {
     let raw = match std::env::var(TILE_LATENT_EDGE_ENV) {
         Ok(raw) => raw,
-        Err(std::env::VarError::NotPresent) => return Ok(TILE_LATENT_EDGE),
+        Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(sd_tensor::Error::Msg(format!(
                 "{TILE_LATENT_EDGE_ENV} is not valid UTF-8"
@@ -456,8 +512,17 @@ pub fn tile_latent_edge() -> Result<usize> {
         Ok(0) | Err(_) => Err(sd_tensor::Error::Msg(format!(
             "{TILE_LATENT_EDGE_ENV} must be a positive latent-cell count, got {raw:?}"
         ))),
-        Ok(n) => Ok(n),
+        Ok(n) => Ok(Some(n)),
     }
+}
+
+/// The tile edge to assume before a decoder is available.
+///
+/// Load-time headroom projections use this: they run before any latent
+/// exists, so they cannot ask [`AutoencoderKlDecoder::tile_edge_for`]. An
+/// explicit override still applies, since that is the caller's own answer.
+pub fn tile_latent_edge() -> Result<usize> {
+    Ok(explicit_tile_latent_edge()?.unwrap_or(TILE_LATENT_EDGE))
 }
 
 /// Fraction of a tile that overlaps its neighbour.
@@ -516,6 +581,44 @@ impl ForwardT for Conv2d {
 #[cfg(test)]
 mod tile_env_tests {
     use super::*;
+
+    #[test]
+    fn the_chosen_tile_shrinks_only_when_the_projection_does_not_fit() {
+        // The auto-choice is a loop over `check_headroom`, which asks the
+        // machine. Testing it against a real decoder would make the result
+        // depend on whatever else is running, so the arithmetic it relies on
+        // is checked directly instead: the peak must fall fast enough with the
+        // tile edge for halving to be a useful move, and the walk must stop.
+        let cfg = DecoderConfig::from(&VaeConfig::sd35());
+        let peak = |e: usize| {
+            cfg.peak_alloc_bytes(1, e, e, sd_tensor::DType::F32)
+                .unwrap()
+        };
+
+        // Area-scaling: halving the edge must cut the peak by roughly 4x, or
+        // stepping down would barely help and the loop would be pointless.
+        let ratio = peak(64) as f64 / peak(32) as f64;
+        assert!(
+            (3.5..4.5).contains(&ratio),
+            "halving the tile should quarter the peak, got {ratio:.2}x"
+        );
+
+        // Strictly decreasing, so the loop always makes progress.
+        for e in [64usize, 32, 16, 8] {
+            assert!(peak(e) > peak(e / 2), "peak must fall with the tile edge");
+        }
+
+        // And the floor is reachable by halving from the ceiling, so the walk
+        // cannot step past it into a smaller-than-minimum tile.
+        let mut e = TILE_LATENT_EDGE;
+        while e > MIN_TILE_LATENT_EDGE {
+            e /= 2;
+        }
+        assert_eq!(
+            e, MIN_TILE_LATENT_EDGE,
+            "halving must land exactly on the floor"
+        );
+    }
 
     #[test]
     fn the_tile_override_is_validated_rather_than_defaulted() {

@@ -297,24 +297,40 @@ now renders correctly on Metal in **20.8 s against 159.3 s on CPU**. See
 [roadmap.md](roadmap.md) for how it was localised, why every per-op check
 passed while it was broken, and the verification table for the other models.
 
-### What still does not fit on Metal, and the tile knob
+### What still does not fit on Metal
 
-Correctness is no longer the constraint; memory is. Two runs die *after* the
-denoise loop completes, in the VAE decode, because the transformer is still
-resident and never used again:
+Correctness is no longer the constraint; memory is. **Dense f32 weights are
+what does not fit**, and it is not a decode problem:
 
-- **SD 3.5 at 512** needs `SD_VAE_TILE_LATENT=32`. At the default 64 the
-  decode is a single 2.42 GB tile and SD 3.5's 10 GB transformer leaves no
-  room. With the smaller tile it renders in 25.1 s, no visible seam.
-- **Flux mini at 512** does not fit at any tile size tried. Its 3.2B
-  parameters are dense f32 — 12.8 GB — against schnell's 6.8 GB for 12B held
-  as Q4_K. Quantisation is what makes the *larger* model the one that runs.
+- **SD 3.5 at 512** is marginal. Its transformer is 10.2 GB dense at f32, the
+  load leaves about 1.1 GB free of 36 GB, and with anything else running the
+  job dies in denoise **step 1**. A 1.79 GB Q4_K_M GGUF exists but cannot be
+  loaded yet — see the handoff.
+- **Flux mini at 512** does not fit either. 3.2B parameters dense at f32 is
+  12.8 GB, against schnell's 6.8 GB for 12B held as Q4_K. Quantisation is what
+  makes the *larger* model the one that runs.
 
-`sd_models::vae::tile_latent_edge` reads that variable and the load-time
-headroom projections in `sdxl.rs` and `txt2img.rs` honour it too, so lowering
-the tile also lowers the bar a load has to clear. The default stays 64 because
-tiling changes the image: the decoder is not shift-invariant, so tiles are
-blended rather than abutted.
+**This section used to blame the VAE decode for both**, on the strength of the
+error appearing there. It does not: candle queues Metal work and only inspects
+the command buffer on synchronise, so a failed buffer is attributed to the
+first thing that waits. Synchronising per step moves SD 3.5's failure to step
+1. Do not trust where a Metal error surfaces without checking.
+
+### The decode tile sizes itself
+
+`decode_tiled` asks `tile_edge_for` for the largest edge from
+`TILE_LATENT_EDGE` (64) down whose projected peak — `peak_alloc_bytes` against
+`sysmem` — fits what is free, stopping at `MIN_TILE_LATENT_EDGE` (8). A decode
+that would not fit becomes a seamed-but-correct image rather than a dead run.
+Where 64 already fits nothing changes, and SD 1.5 on Metal is bit-identical
+before and after.
+
+`SD_VAE_TILE_LATENT` overrides the choice outright, since a caller who sets it
+is answering the question themselves; the load-time headroom projections in
+`sdxl.rs` and `txt2img.rs` honour it too. The ceiling stays 64 because tiling
+changes the image: the decoder is not shift-invariant, so tiles are blended
+rather than abutted. The *encoder* does not auto-size — `EncoderConfig` has no
+peak projection to search against.
 
 ## The VAE decode at 1024 does not fit in GPU memory
 

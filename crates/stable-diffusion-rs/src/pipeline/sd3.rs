@@ -52,6 +52,18 @@ pub struct Sd3Paths {
 }
 
 /// Fixture layout used by this repository.
+///
+/// **Deliberately the dense `.safetensors`, even though a 1.79 GB Q4_K_M GGUF
+/// sits beside it.** `load` below dispatches a `.gguf` transformer to
+/// `flux_qtensors_from_gguf`, which requires Flux's `double_blocks.*` naming
+/// and rejects SD 3.5's MMDiT layout outright. Preferring the quantised file
+/// the way Flux's `paths_in` does therefore breaks the model rather than
+/// shrinking it.
+///
+/// That is worth fixing rather than working around: the dense transformer is
+/// 10.2 GB at f32 against 1.79 GB quantised, and on a 36 GB Mac that is the
+/// difference between SD 3.5 running at 512 on Metal and running out of memory
+/// in the first denoise step. See the handoff.
 pub fn sd3_paths_in(dir: &Path) -> Sd3Paths {
     Sd3Paths {
         transformer: dir.join("sd35-medium.safetensors"),
@@ -200,6 +212,46 @@ impl Sd3Pipeline {
     pub fn run_with_progress(
         &self,
         cfg: &Sd3RunConfig,
+        progress: impl FnMut(usize, usize),
+    ) -> Result<Tensor, PipelineError> {
+        let latents = self.denoise(cfg, progress)?;
+        Ok(self.vae.decode_tiled(&latents)?)
+    }
+
+    /// [`Self::run_with_progress`], but the transformer and text encoders are
+    /// dropped before the VAE decode.
+    ///
+    /// Consuming rather than borrowing, because that is the honest signature:
+    /// the pipeline cannot generate again afterwards. Worth it for a one-shot
+    /// run, which is what the CLI and the examples do.
+    ///
+    /// The decode is where this pipeline peaks. It allocates a convolution
+    /// im2col — 2.42 GB for a 512px image in one tile — while the transformer
+    /// that produced the latent is still resident and will never be used
+    /// again. For SD 3.5 that is 10 GB held for nothing, and on Metal it was
+    /// the difference between rendering at 512 and dying after all 20 denoise
+    /// steps had run.
+    pub fn run_releasing(
+        self,
+        cfg: &Sd3RunConfig,
+        progress: impl FnMut(usize, usize),
+    ) -> Result<Tensor, PipelineError> {
+        let latents = self.denoise(cfg, progress)?;
+        // Keep the VAE and the device, drop everything else. `latents` is
+        // already computed and holds no borrow of `self`.
+        let Self { vae, device, .. } = self;
+        // Dropping is not enough on Metal: candle pools its buffers and hands
+        // them back only when something synchronises, because that is where
+        // it runs `drop_unused_buffers`. Without this the drop above frees
+        // nothing at all — measured, not assumed.
+        device.synchronize()?;
+        Ok(vae.decode_tiled(&latents)?)
+    }
+
+    /// The sampling loop, returning the latent before decoding.
+    fn denoise(
+        &self,
+        cfg: &Sd3RunConfig,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<Tensor, PipelineError> {
         if cfg.steps == 0 {
@@ -241,7 +293,7 @@ impl Sd3Pipeline {
             progress(i + 1, cfg.steps);
         }
 
-        Ok(self.vae.decode_tiled(&latents)?)
+        Ok(latents)
     }
 }
 

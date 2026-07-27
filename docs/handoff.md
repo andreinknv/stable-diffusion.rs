@@ -19,19 +19,37 @@ sensible default rather than a broken option.
 | SD 3.5 medium 256, 20 steps | 71.8 s | **9.0 s** | mean 7.0/255, same image |
 | Flux mini (3.2B) 512, 20 steps | 212 s | does not fit ‡ | — |
 
-† needs `SD_VAE_TILE_LATENT=32`. At the default 64 a 512px decode is a single
-2.42 GB tile, and SD 3.5's 10 GB transformer is still resident, so the decode
-overruns Metal's working set — **after all 20 denoise steps have run**. The
-knob is new; see [`tile_latent_edge`](../crates/sd-models/src/vae/mod.rs).
+† **Marginal, not reliable.** That 25.1 s run is real, but SD 3.5 on Metal
+succeeds or fails on how much memory the machine happens to have: loading the
+dense f32 transformer leaves about **1.1 GB free of 36 GB**, and with anything
+else running the job dies in denoise **step 1**. It is not a decode problem.
+An earlier note in this file blamed the VAE decode, because that was where the
+error surfaced — candle queues Metal work and only reports a failed command
+buffer at the next synchronisation point, so the first thing to synchronise
+gets the blame. Synchronising after each step puts it at step 1. Item 1 below
+is the fix.
 
 ‡ Flux mini holds dense f32 weights: 12.8 GB for a 3.2B model, against
-schnell's 6.8 GB for 12B held as Q4_K. The denoise loop completes and the
-decode does not fit at any tile size tried. Quantisation is what makes the
-*larger* model the one that runs — worth remembering before reaching for a
-dense checkpoint.
+schnell's 6.8 GB for 12B held as Q4_K. Quantisation is what makes the *larger*
+model the one that runs — worth remembering before reaching for a dense
+checkpoint, and the same reason SD 3.5 needs item 1.
+
+**The VAE decode now sizes its own tile.** `decode_tiled` picks the largest
+edge from 64 down whose projected peak fits the memory that is actually free,
+so a decode that would not fit degrades to a seamed-but-correct image instead
+of dying. `SD_VAE_TILE_LATENT` still overrides it outright. Where 64 already
+fits, nothing changes — SD 1.5 on Metal is bit-identical before and after.
+
+**One-shot runs release before decoding.** `FluxPipeline::run_releasing` and
+`Sd3Pipeline::run_releasing` consume the pipeline, drop everything the decode
+does not need, and then synchronise — on Metal a drop alone frees *nothing*,
+because candle pools its buffers and only returns them inside
+`drop_unused_buffers`, which runs on synchronise. Measured worth: about
+0.7 GB for SD 3.5. Real, and far less than hoped; see the table note above for
+what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 232 tests, all gates green
+table is in [roadmap.md](roadmap.md). 233 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -48,31 +66,25 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. Make the decode tile fit itself, instead of needing an env var
+### 1. An SD 3 GGUF loader — the one thing that would make SD 3.5 fit
 
-`SD_VAE_TILE_LATENT=32` is a workaround, not an answer: a user has no way to
-know they need it until a 20-step run dies at the last moment. The decode's
-peak allocation is computable up front — `DecoderConfig::peak_alloc_bytes`
-already does it — and `sysmem` already knows what is free. Choosing the
-largest tile that fits, once, at decode time would turn "SD 3.5 fails at 512
-on Metal" into "SD 3.5 works".
+`Sd3Pipeline::load` already branches on a `.gguf` transformer, and
+`tests/golden/sd35/sd35-medium-q4_k_m.gguf` already exists at **1.79 GB
+against the dense checkpoint's 10.2 GB at f32**. The branch does not work:
+it calls `sd_loader::flux_qtensors_from_gguf`, which requires Flux's
+`double_blocks.*` naming and refuses SD 3.5's MMDiT layout outright. Point
+`sd3_paths_in` at the GGUF today and the model stops loading entirely.
 
-Two cautions. Tiling changes the image, so a size that fits whole must still
-be decoded whole — pick the tile *only* when the untiled decode would not fit,
-and keep 64 as the ceiling. And on Metal the number that matters is not free
-system memory but the device's working set, which is smaller; measure rather
-than assume they are the same.
+So it needs an SD 3 tensor-name mapping alongside the Flux one. That is the
+whole job, and it is the difference between SD 3.5 running on Metal and not:
+loading the dense form leaves **1.1 GB free on a 36 GB machine**, and the run
+then dies in denoise **step 1**. The golden tests (`golden_sd3`) will catch a
+wrong name mapping immediately, and Flux's quantised path is the template.
 
-### 2. Free the transformer before decoding
+Expect roughly the Flux outcome: quantisation is what makes the *larger* model
+the one that runs.
 
-The same problem from the other end, and it helps every model. During the VAE
-decode the transformer is still resident and is never used again — 10 GB for
-SD 3.5, 12.8 GB for Flux mini. Dropping it first is what would let Flux mini
-render at 512 on Metal at all. This is a pipeline-lifetime change (the models
-are fields of one struct), so it is more invasive than item 1; do it if item 1
-is not enough.
-
-### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
+### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
 
 Three hand-written copies exist — `sd-models/src/t5/mod.rs`,
 `flux/mod.rs`, `sd3/mod.rs` — each doing its own f32 upcast. candle ships a
@@ -135,6 +147,14 @@ go NaN around block 10; Flux's transformer NaNs too. Hold weights quantised
 instead (`weights::Source::Quantized`) — activations stay f32 and residency
 drops further than F16 would have. bf16 would fix it but candle's CPU backend
 has no bf16 matmul.
+
+**On Metal, the op that reports the error is rarely the op that caused it.**
+candle queues GPU work and only inspects the command buffer when something
+synchronises, so a failure is attributed to the first thing that *waits*.
+SD 3.5 at 512 "failed in the VAE decode" through several sessions and a
+written handoff note; synchronising after each denoise step put it at step 1,
+where it had been all along. Before believing where a Metal error happened,
+put a `device.synchronize()` after each stage and watch it move.
 
 **A tensor that does not own its buffer is a different tensor.** candle 0.11's
 Metal quantised matmul ignores `start_offset`, so a view into the middle of a

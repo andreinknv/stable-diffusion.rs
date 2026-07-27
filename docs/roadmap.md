@@ -319,7 +319,7 @@ separable from this bug while it stood:
 | SD 1.5 512, 20 steps | 113 s | **17.5 s** | max 1/255, 98.8% of pixels exact |
 | SDXL 1024, 20 steps | — | **86.5 s** | renders correctly |
 | Flux schnell 512, 4 steps | 159 s | **20.8 s** | mean 9.2/255, same image |
-| SD 3.5 medium 512, 20 steps | 230 s | **25.1 s** | needs `SD_VAE_TILE_LATENT=32` |
+| SD 3.5 medium 512, 20 steps | 230 s | **25.1 s** | marginal — see below |
 | SD 3.5 medium 256, 20 steps | 71.8 s | **9.0 s** | mean 7.0/255, same image |
 | Flux mini 512, 20 steps | 212 s | does not fit | dense f32, 12.8 GB resident |
 
@@ -327,6 +327,21 @@ SD 1.5's near-exact agreement and Flux's mean 9.2/255 are both expected: SD 1.5
 is 20 steps through a shallow UNet, Flux is 4 steps through 57 blocks whose CPU
 path carries 0.3-1.9% quantisation noise per layer that Metal does not. Same
 picture either way; not interchangeable as files.
+
+**SD 3.5's 25.1 s is a real run but not a reliable one, and the reason is
+worth recording.** Its transformer is dense f32 — 10.2 GB — and loading it
+leaves about 1.1 GB free on a 36 GB machine; with anything else running, the
+job dies in denoise **step 1**. It was recorded here and in the handoff as a
+*VAE decode* failure, which was wrong: candle queues Metal work and inspects
+the command buffer only when something synchronises, so the failure is
+attributed to whatever waits first, and the decode was simply the first thing
+to wait. A `synchronize()` after each step moves it to step 1.
+
+The fix is not a smaller decode tile — it is the 1.79 GB Q4_K_M GGUF that
+already sits in the fixtures and cannot yet be loaded, because
+`Sd3Pipeline::load` routes a `.gguf` transformer to `flux_qtensors_from_gguf`
+and that loader requires Flux's `double_blocks.*` naming. An SD 3 name mapping
+is the top handoff item.
 
 **Root cause: candle 0.11's Metal quantised matmul ignores the activation's
 `start_offset`.** A tensor that is a view into the middle of a larger buffer is

@@ -43,7 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed: 42,
     };
     let t1 = std::time::Instant::now();
-    let image = pipe.run_with_progress(&cfg, |i, n| eprintln!("  step {i}/{n}"))?;
+    // Releasing rather than borrowing: this renders one image and exits, so
+    // the transformer is dead weight by the time the VAE runs.
+    let image = pipe.run_releasing(&cfg, |i, n| eprintln!("  step {i}/{n}"))?;
     eprintln!("generated in {:.1}s", t1.elapsed().as_secs_f64());
 
     stable_diffusion_rs::image_io::save_png(&image, &out)?;

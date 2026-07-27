@@ -399,6 +399,15 @@ impl Decoder {
         })
     }
 
+    /// The geometry this decoder was built with.
+    ///
+    /// Exposed so the tiling logic can project a decode's peak allocation
+    /// without rebuilding the config from a [`super::VaeConfig`] it does not
+    /// have.
+    pub fn config(&self) -> &DecoderConfig {
+        &self.cfg
+    }
+
     /// `[b, latent_channels, h, w]` -> `[b, out_channels, h*8, w*8]`.
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b, _, lh, lw) = xs.dims4()?;
