@@ -166,12 +166,7 @@ impl RmsNorm {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dtype = xs.dtype();
-        let xs32 = xs.to_dtype(DType::F32)?;
-        let rrms = (xs32.sqr()?.mean_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
-        xs32.broadcast_div(&rrms)?
-            .to_dtype(dtype)?
-            .broadcast_mul(&self.scale.to_dtype(dtype)?)
+        ops::rms_norm(xs, &self.scale, 1e-6)
     }
 }
 
@@ -271,14 +266,7 @@ impl PlainLayerNorm {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dtype = xs.dtype();
-        let xs32 = xs.to_dtype(DType::F32)?;
-        let mean = xs32.mean_keepdim(D::Minus1)?;
-        let centred = xs32.broadcast_sub(&mean)?;
-        let var = centred.sqr()?.mean_keepdim(D::Minus1)?;
-        centred
-            .broadcast_div(&(var + self.eps)?.sqrt()?)?
-            .to_dtype(dtype)
+        ops::plain_layer_norm(xs, self.eps)
     }
 }
 

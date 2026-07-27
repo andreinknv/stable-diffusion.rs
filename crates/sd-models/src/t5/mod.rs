@@ -25,7 +25,7 @@ pub use tokenizer::{T5Tokenizer, FLUX_MAX_LENGTH};
 use sd_tensor::gguf::QTensor;
 use sd_tensor::nn::{linear_no_bias, Embedding, Linear, VarBuilder};
 use sd_tensor::quantized::QLinear;
-use sd_tensor::{ops, DType, Module, Result, Tensor, D};
+use sd_tensor::{ops, Module, Result, Tensor};
 
 /// T5 v1.1 encoder geometry.
 #[derive(Debug, Clone)]
@@ -188,16 +188,11 @@ impl T5RmsNorm {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // The variance is accumulated in f32 even when the weights are f16.
-        // transformers does the same, and at d_model = 4096 the sum of
-        // squares overflows f16 for perfectly ordinary activations.
-        let dtype = xs.dtype();
-        let xs32 = xs.to_dtype(DType::F32)?;
-        let variance = xs32.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = xs32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        normed
-            .to_dtype(dtype)?
-            .broadcast_mul(&self.weight.to_dtype(dtype)?)
+        // `ops::rms_norm` normalises in f32 whatever the input dtype, which
+        // this model needs rather than merely prefers: transformers does the
+        // same, and at d_model = 4096 the sum of squares overflows f16 for
+        // perfectly ordinary activations.
+        ops::rms_norm(xs, &self.weight, self.eps)
     }
 }
 

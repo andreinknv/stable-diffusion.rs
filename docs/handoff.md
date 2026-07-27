@@ -119,42 +119,22 @@ Measure on a discrete GPU if one is ever available. Everything below was
 verified on unified memory, where the mechanism is right but the payoff is
 smallest.
 
-### 2. Upstream an f16 matmul to candle's Accelerate backend
+### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
+answer was no**
 
-`--features accelerate` is **1.7-1.9x faster on CPU** and now passes the whole
-suite (240/240). It is still not the default, and the reason is upstream:
-candle's Accelerate CPU backend has **no f16 matmul at all** — it bails with
-"the accelerate backend does not support f16 matmul"
-(`candle-core/src/cpu_backend/mod.rs:1497`).
+The three copies are now one, in `ops::rms_norm`, and `PlainLayerNorm`'s two
+copies are one in `ops::plain_layer_norm`. But **candle's fused kernels are
+not what they were deduped onto**, and that is the part worth keeping: its
+`rms_norm` sums each row with a sequential `.sum::<f32>()` where
+`mean_keepdim` reduces in blocks, so it is 4-11x less accurate, worst at long
+rows. Measured against f64 at `[1, 154, 4096]`: 9.695e-7 for ours against
+9.627e-6 for candle's. Swapping T5 onto it moved `golden_t5` to 3.891e-3,
+past a 3e-3 bound that was itself measured. The speed it buys is 2.1x on that
+shape and *negative* — 2.7x slower — at `[1, 77, 768]`.
 
-**This cannot be fixed in this workspace, and it is worth knowing why before
-anyone tries.** Accelerate's BLAS takes f32 operands, so f16 data has to be
-converted. Converting per call means converting the *weights* every forward —
-for SDXL's UNet that is 5 GB per step, costing far more than 1.9x saves.
-Converting once means storing f32, which is simply not using f16 and loses the
-memory saving that motivated it. Only converting per gemm *tile*, where the
-block stays in cache, gets both — and that is inside candle's matmul. It is
-also not only matmul: probing each op shows `Linear` **and `Conv2d`** hit the
-same bail, so a seam-level wrapper would have to reimplement im2col
-convolution.
-
-The upstream fix is small — in `cpu_backend`, convert f16 blocks to f32, call
-`cblas_sgemm`, convert back — and it would make Accelerate usable with f16 for
-every candle user. The reproducer is four lines: `matmul` two f16 CPU tensors
-with the feature on.
-
-Until then this workspace copes rather than papers over: SDXL picks f32 on CPU
-when built with the feature (`model_dtype` in `sdxl.rs`), trading 13.9 GB
-resident for a run that works, and `t5_xxl_gguf` skips with a message saying
-why. Flux, SD 3.5 and SD 1.5 are unaffected — they are f32 or quantised, so
-they take the 1.9x today.
-
-### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
-
-Three hand-written copies exist — `sd-models/src/t5/mod.rs`,
-`flux/mod.rs`, `sd3/mod.rs` — each doing its own f32 upcast. candle ships a
-fused one. Mechanical, and the golden tests (`golden_t5`,
-`golden_flux_transformer`, `golden_sd3`) will catch any error immediately.
+`candle_nn::ops::layer_norm` is the same shape of question and is listed below
+untried. Measure it the same way before adopting it; the fused-is-better
+assumption has now failed twice.
 
 ### Also open
 

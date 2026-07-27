@@ -62,6 +62,76 @@ pub mod ops {
         xs.gelu()
     }
 
+    /// RMS normalisation: `xs / sqrt(mean(xs^2) + eps) * alpha`.
+    ///
+    /// One copy for T5, Flux and SD 3, which had three identical hand-written
+    /// ones. **Deliberately not `candle_nn::ops::rms_norm`**, which is the
+    /// obvious thing to reach for and is worse on both axes that matter.
+    ///
+    /// candle's fused kernel sums the row with a plain sequential
+    /// `.sum::<f32>()`, where `mean_keepdim` reduces in blocks. Sequential
+    /// error grows with row length, and these rows are long — T5's `d_model`
+    /// is 4096. Measured against an f64 reference:
+    ///
+    /// ```text
+    ///   shape [1, 154, 4096]        max abs error    relative
+    ///     this implementation        9.695e-7        7.9e-8
+    ///     candle_nn fused            9.627e-6        7.9e-7     10x worse
+    ///   shape [1, 77, 768]
+    ///     this implementation        1.258e-6        9.4e-8
+    ///     candle_nn fused            4.775e-6        3.6e-7     3.8x worse
+    /// ```
+    ///
+    /// That is not academic: swapping T5 to the fused kernel moved
+    /// `golden_t5` from passing to 3.891e-3, past a 3e-3 bound that was itself
+    /// set by measuring the reference's own f32-vs-f64 spread.
+    ///
+    /// And the speed it buys back is small and not even one-directional —
+    /// 2.1x faster at `[1, 154, 4096]`, 2.7x *slower* at `[1, 77, 768]` — on
+    /// an op that is a rounding error of any real run. There was no trade to
+    /// make.
+    ///
+    /// The f32 normalisation is required rather than tidy: T5's activations
+    /// reach ~200,000 against f16's 65,504 ceiling, so the reciprocal has to
+    /// be formed in f32 or the row silently becomes zero. `alpha` is applied
+    /// in the input dtype, matching what the three copies did and what
+    /// transformers does.
+    pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f64) -> Result<Tensor> {
+        let dtype = xs.dtype();
+        let xs32 = xs.to_dtype(DType::F32)?;
+        let rrms = (xs32.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?;
+        xs32.broadcast_div(&rrms)?
+            .to_dtype(dtype)?
+            .broadcast_mul(&alpha.to_dtype(dtype)?)
+    }
+
+    /// LayerNorm with no learned scale or shift: `(x - mean) / sqrt(var + eps)`.
+    ///
+    /// Flux and SD 3 both need this and had a byte-identical copy each. It is
+    /// not what `candle_nn::layer_norm` gives you: that always reads a
+    /// `weight`, even told `affine: false` — the flag only drops the bias — so
+    /// it cannot express a norm with no parameters at all. In these models the
+    /// scale and shift arrive from the modulation vector instead, which *is*
+    /// the conditioning mechanism, so a norm that quietly applied a learned
+    /// weight would be conditioning the model twice.
+    ///
+    /// `candle_nn::ops::layer_norm` is the fused kernel and is not used here,
+    /// for the reason given on [`rms_norm`]: its sibling sums each row
+    /// sequentially where `mean_keepdim` reduces in blocks, and these rows are
+    /// 3072 wide. The same measurement should be made before adopting it.
+    ///
+    /// Normalised in f32 whatever comes in, then narrowed back.
+    pub fn plain_layer_norm(xs: &Tensor, eps: f64) -> Result<Tensor> {
+        let dtype = xs.dtype();
+        let xs32 = xs.to_dtype(DType::F32)?;
+        let mean = xs32.mean_keepdim(D::Minus1)?;
+        let centred = xs32.broadcast_sub(&mean)?;
+        let var = centred.sqr()?.mean_keepdim(D::Minus1)?;
+        centred
+            .broadcast_div(&(var + eps)?.sqrt()?)?
+            .to_dtype(dtype)
+    }
+
     /// CLIP's activation: `x * sigmoid(1.702 * x)`.
     pub fn quick_gelu(xs: &Tensor) -> Result<Tensor> {
         xs * candle_nn::ops::sigmoid(&(xs * 1.702f64)?)?
