@@ -20,6 +20,21 @@ thiserror.workspace = true
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
+# Apple's Accelerate: 1.7-1.9x on CPU (SD 1.5 512, 4 steps, interleaved:
+# 19.1/20.6 s against 34.6/35.0 s), output agreeing to 1/255. It links a
+# system framework and compiles nothing.
+#
+# **Opt-in, and it must stay opt-in until f16 is handled.** candle's Accelerate
+# CPU backend does not implement f16 matmul at all — it bails with "the
+# accelerate backend does not support f16 matmul" (cpu_backend/mod.rs) — so
+# enabling this breaks any CPU path that keeps weights in f16. T5 loaded from
+# GGUF trips it today; SDXL's f16 weights are the other candidate. Turning it
+# on by default would trade a capability for a speed-up.
+#
+# Making it default is otherwise ready: a target-scoped dependency covers
+# macOS in one line without touching other platforms, and the golden
+# tolerances it used to break have been corrected against measurement (see
+# UNET_RTOL in golden_unet.rs). f16 is the only thing left.
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 
 # Deliberately NOT exposing candle's `mkl` feature.

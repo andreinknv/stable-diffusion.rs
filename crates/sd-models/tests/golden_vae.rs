@@ -192,6 +192,27 @@ fn an_oversized_decode_is_refused_before_it_allocates() {
 /// that, which is why this test exists rather than a shape check.
 #[test]
 fn encoder_matches_diffusers_reference() {
+    // Relative, for the reason spelled out on `UNET_RTOL` in golden_unet.rs.
+    // Measured with `xtask/golden/reference_precision.py vae`, which runs the
+    // diffusers VAE against *itself* in f64 on these exact inputs:
+    //
+    //   encoder_moments  peak 18.063  max_abs 7.751e-5  max_rel 4.291e-6
+    //
+    // This port sits at 2.418e-4, which is 3.1x that self-spread rather than
+    // inside it — worth stating plainly rather than calling noise. Two
+    // independent f32 implementations have uncorrelated rounding, so a small
+    // multiple of the self-spread is expected, and the arithmetic agrees: the
+    // encoder's convolutions reduce over 3*3*512 terms, so a random-walk f32
+    // bound is sqrt(4608) * 1.2e-7 = 8e-6 relative against an observed
+    // 1.34e-5 — the same order, on a tensor peaking at 18.
+    //
+    // 1e-3 is where this project already draws the line between noise and a
+    // bug ("if a test fails at 1e-3, that is a bug" — xtask/golden/README.md),
+    // and the failure this test exists to catch is nowhere near it: a
+    // symmetric downsampler pad shows 17.32.
+    const ENCODER_RTOL: f64 = 1e-3;
+    const ENCODER_ATOL: f64 = 1e-3;
+
     let path = golden_path();
     let vae_weights = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/vae_decoder/vae.safetensors");
@@ -219,8 +240,14 @@ fn encoder_matches_diffusers_reference() {
     assert_eq!(got.dims(), expected.dims());
 
     let c = testing::closeness(&got, expected).expect("comparing tensors");
-    eprintln!("vae encoder vs diffusers: {c}");
-    testing::assert_close(&got, expected, testing::DEFAULT_ATOL, "vae encoder moments").unwrap();
+    let excess = testing::allclose_excess(&got, expected, ENCODER_RTOL).expect("comparing");
+    eprintln!("vae encoder vs diffusers: {c}, excess {excess:.3e}");
+    assert!(
+        excess <= ENCODER_ATOL,
+        "vae encoder moments diverged by {excess:.3e} beyond atol={ENCODER_ATOL:.0e} + \
+         rtol={ENCODER_RTOL:.0e}\n  {c}\n\
+         Hint: the downsampler pads asymmetrically; a symmetric pad shows ~17, not ~1e-4."
+    );
 }
 
 /// The GGUF path end to end: an LDM-named, Q4_0-quantised checkpoint decoded

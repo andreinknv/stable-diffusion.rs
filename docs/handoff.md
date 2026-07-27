@@ -119,30 +119,23 @@ Measure on a discrete GPU if one is ever available. Everything below was
 verified on unified memory, where the mechanism is right but the payoff is
 smallest.
 
-### 2. Make the UNet golden bounds relative, then turn Accelerate on by default
+### 2. Teach the CPU f16 matmul path to survive Accelerate
 
-`--features accelerate` is **1.7-1.9x faster on CPU** — SD 1.5 at 512, 4
-steps: 19.1/20.6 s against 34.6/35.0 s, interleaved, for output agreeing to
-1/255. Every CPU number in these documents was measured without it. It links a
-system framework and compiles nothing, so it costs nothing but the flag.
+`--features accelerate` is **1.7-1.9x faster on CPU** and stays opt-in for one
+reason only, now that the tolerance work is done: candle's Accelerate CPU
+backend **does not implement f16 matmul at all**. It bails with "the
+accelerate backend does not support f16 matmul"
+(`candle-core/src/cpu_backend/mod.rs`), so enabling it breaks any CPU path
+holding weights in f16 — `t5_xxl_gguf` trips it today, and SDXL's f16 weights
+are the other candidate.
 
-Turning it on for macOS is one target-scoped dependency in
-`sd-tensor/Cargo.toml` and it was tried: it fails two golden tests,
-`mid_block_matches_diffusers` at `max_abs = 1.087e-4` and
-`down_pass_skips_match_diffusers` at `1.049e-4`, against `DEFAULT_ATOL = 1e-4`.
-Those tensors peak at **16.2**, so that is 6.7e-6 relative — f32
-reduction-order noise sitting at the theoretical floor for the reduction
-length (`sqrt(4096) * 1.2e-7 = 7.7e-6`), with mean absolute error 1.6e-5, six
-times under the bound. The tests are absolute where they should be relative:
-the same mistake already recorded for text encoders, and
-`testing::allclose_excess` exists for it.
-
-**Do the tolerance work first, on its own merits, and only then flip the
-flag.** Loosening a correctness bound as a side effect of landing a speed-up
-is how a gate stops meaning anything. The standard is in the traps below:
-measure the reference's own f32-vs-f64 spread and cite it. That needs torch,
-which is not installed here — `pip install torch diffusers` and
-`xtask/golden/dump_reference.py` is the path.
+Turning it on is otherwise ready. A target-scoped dependency covers macOS in
+one line without touching other platforms, and the golden bounds that used to
+break are now measured and correct. The remaining choice is between upcasting
+f16 to f32 for matmul in the seam (costs a copy, keeps the speed-up) and
+sending f16 matmuls down candle's non-Accelerate path (needs candle to expose
+that, which it does not). Measure the upcast: it may well pay for itself at
+1.9x.
 
 ### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
 
@@ -195,12 +188,26 @@ load.** SD 3.5's single fp16 file and its converted fp32 copy differ by up to
 like a bug in our code. Regenerating the reference from the file Rust reads
 took it to 5.5e-6.
 
-**Absolute tolerances are wrong for text encoders.** CLIP peaks at 851, T5 at
-~200,000, SD 3.5's blocks at ~97,000. Use `testing::allclose_excess(a, b,
-rtol)`. Where a loose bound is unavoidable, *measure the reference
-implementation's own f32-vs-f64 spread* and cite it — that is how the Flux
-VAE encoder's 2e-3 bound and T5's 3e-3 were set, and both turned out to sit
-at or below the reference's own noise floor.
+**Absolute tolerances are wrong for anything that is not order-1 — including
+the UNet, which nobody suspected.** CLIP peaks at 851, T5 at ~200,000, SD
+3.5's blocks at ~97,000; the UNet's mid block peaks at a mere 16, and a 1e-4
+*absolute* bound on it still turned out to be **below the reference's own
+noise floor**. `xtask/golden/reference_precision.py` runs a diffusers module
+against itself in f64: `mid_output` shows diffusers missing its own f64 by
+1.108e-4. That test could only ever pass by accident of summation order, and
+it duly broke the first time Apple's Accelerate reordered it — at 1.087e-4,
+*closer to the reference than the reference's own f32 was*.
+
+So: use `testing::allclose_excess(a, b, rtol)` with an absolute floor beside
+it, and **measure before choosing either number.** The script exists now; run
+it rather than picking a value that turns the light green. That is how the
+Flux VAE encoder's 2e-3 bound and T5's 3e-3 were set, and both sat at or below
+the reference's own noise floor.
+
+**Do not `git checkout` a file to undo a temporary edit if it also holds
+uncommitted work.** Reverting a one-line test perturbation this way discarded
+an hour of tolerance work in the same file. Copy the file aside and restore
+from the copy, or commit first.
 
 **F16 is not a safe way to halve memory.** T5's activations exceed 65,504 and
 go NaN around block 10; Flux's transformer NaNs too. Hold weights quantised

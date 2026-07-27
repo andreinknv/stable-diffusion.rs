@@ -36,11 +36,41 @@ committing hundreds of megabytes. Numerical verification is a local step.
 
 ## Tolerances
 
-`atol = 1e-4`, `rtol = 1e-3` for f32.
+`atol = 1e-4`, `rtol = 1e-3` for f32 — but **`atol` alone is wrong wherever the
+tensors are not order-1**, and several here are not.
 
-Tighter and you chase phantom failures caused by accumulation order — candle
-and PyTorch will not sum in the same sequence. Looser and real bugs slip
-through. If a test fails at `1e-3`, that is a bug, not noise.
+Do not guess a bound. Measure what the reference does against *itself*:
+
+```bash
+python3 xtask/golden/reference_precision.py unet
+python3 xtask/golden/reference_precision.py vae
+```
+
+That runs the same diffusers module in float32 and in float64 on identical
+inputs. Neither run has a bug, so the gap between them is float32's own noise
+floor for that computation, and a tolerance below it tests summation order
+rather than this port. Measured:
+
+| tensor | peak | max_abs | max_rel |
+|---|---|---|---|
+| `mid_output` | 16.169 | 1.108e-4 | 6.850e-6 |
+| `down_11` | 19.219 | 1.083e-4 | 5.636e-6 |
+| `encoder_moments` | 18.063 | 7.751e-5 | 4.291e-6 |
+| `output` (UNet) | 3.889 | 9.700e-6 | 2.494e-6 |
+
+**`mid_output` cannot be held to `atol = 1e-4`: diffusers misses that against
+its own f64 by 1.108e-4.** That bound passed only because candle happened to
+sum near PyTorch's order, and it broke the moment Apple's Accelerate reordered
+it. `golden_unet.rs` and `golden_vae.rs` now use `atol + rtol*|want|` via
+`testing::allclose_excess`, with the numbers above quoted where the constants
+are set.
+
+Both halves are needed: a relative term allows nothing where `want` is near
+zero, and an absolute term alone is the bound that failed. Sensitivity of the
+result, checked by perturbing the reference: passes at 0.1% (that is `rtol`),
+fails at 0.2% and above, against a measured noise floor of 0.0007%. Real
+porting bugs are far past that — the VAE's asymmetric-padding bug showed
+17.32.
 
 ## Reading a failure
 

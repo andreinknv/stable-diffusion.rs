@@ -13,6 +13,48 @@ use sd_models::unet::{UNet2DConditionModel, UNetConfig};
 use sd_tensor::nn::{VarBuilder, VarMap};
 use sd_tensor::{testing, DType, Device, Tensor};
 
+/// Tolerance for the UNet's intermediate tensors, as `atol + rtol*|want|`.
+///
+/// **Relative, not absolute, and the difference is not cosmetic.** These
+/// activations peak between 2.7 and 26.6, so the project-wide
+/// `DEFAULT_ATOL = 1e-4` asked for agreement to 4e-6 relative on the largest
+/// of them — *tighter than float32 can deliver*, which makes it a test of
+/// summation order rather than of this port.
+///
+/// That is measured, not argued. `xtask/golden/reference_precision.py unet`
+/// runs the diffusers UNet against **itself** in f64, same weights, same
+/// inputs, so neither run has a bug and the gap between them is float32's own
+/// noise floor:
+///
+/// ```text
+///   tensor        peak      max_abs     max_rel
+///   mid_output   16.169    1.108e-4    6.850e-6
+///   down_11      19.219    1.083e-4    5.636e-6
+///   down_09      26.601    9.991e-5    3.756e-6
+///   output        3.889    9.700e-6    2.494e-6
+///   worst across all captured tensors: 1.108e-4 absolute, 6.850e-6 relative
+/// ```
+///
+/// So `mid_output` could never be pinned to 1e-4 absolutely: **diffusers
+/// misses that bound against its own f64 by 1.108e-4.** The old bound passed
+/// only because candle's summation order happened to sit near PyTorch's, and
+/// it failed the moment Apple's Accelerate reordered it — at 1.087e-4, which
+/// is *closer to the reference than the reference's own f32 is*.
+///
+/// Both halves of the bound are needed. `allclose_excess` applies the
+/// `rtol*|want|` term and returns the remainder; the assertion supplies
+/// `atol`. A relative term alone allows nothing where `want` is near zero, and
+/// these tensors have such elements — which is why every skip reports a small
+/// non-zero excess. An absolute term alone is the bound that just failed.
+///
+/// `rtol = 1e-3` is 146x the measured relative floor and the value this
+/// project already documents for f32. `atol = 1e-3` is 9x the measured
+/// absolute floor. Real porting bugs are nowhere near either: the VAE's
+/// asymmetric-padding bug showed 17.32, and the largest excess seen here with
+/// a correct port is 4.1e-5.
+const UNET_RTOL: f64 = 1e-3;
+const UNET_ATOL: f64 = 1e-3;
+
 fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/unet_full")
 }
@@ -159,14 +201,16 @@ fn down_pass_skips_match_diffusers() {
             .get(&name)
             .unwrap_or_else(|| panic!("reference has no {name}"));
         let c = testing::closeness(got, want).expect("comparing");
-        eprintln!("{name}: {c}");
-        if c.max_abs > testing::DEFAULT_ATOL && first_bad.is_none() {
-            first_bad = Some((i, c.max_abs));
+        let excess = testing::allclose_excess(got, want, UNET_RTOL).expect("comparing");
+        eprintln!("{name}: {c}, excess {excess:.3e}");
+        if excess > UNET_ATOL && first_bad.is_none() {
+            first_bad = Some((i, c.max_abs, excess));
         }
     }
-    if let Some((i, max_abs)) = first_bad {
+    if let Some((i, max_abs, excess)) = first_bad {
         panic!(
-            "first bad skip is index {i} (max_abs={max_abs:.3e}). \
+            "first bad skip is index {i} (max_abs={max_abs:.3e}, {excess:.3e} beyond \
+             atol={UNET_ATOL:.0e} + rtol={UNET_RTOL:.0e}). \
              0 is conv_in; 1-3 is down block 0; all-green means the fault is \
              downstream of the down pass."
         );
@@ -190,8 +234,14 @@ fn mid_block_matches_diffusers() {
     let want = refs.get("mid_output").expect("mid_output");
 
     let c = testing::closeness(&mid, want).expect("comparing");
-    eprintln!("mid_output: {c}");
-    testing::assert_close(&mid, want, testing::DEFAULT_ATOL, "mid block").unwrap();
+    let excess = testing::allclose_excess(&mid, want, UNET_RTOL).expect("comparing");
+    eprintln!("mid_output: {c}, excess {excess:.3e}");
+    assert!(
+        excess <= UNET_ATOL,
+        "mid block diverged by {excess:.3e} beyond atol={UNET_ATOL:.0e} + \
+         rtol={UNET_RTOL:.0e}\n  {c}\n\
+         Hint: check axis order and parameter naming before suspecting the kernel."
+    );
 }
 
 #[test]
