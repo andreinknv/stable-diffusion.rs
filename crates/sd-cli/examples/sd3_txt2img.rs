@@ -18,11 +18,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = sd3_paths_in(std::path::Path::new("tests/golden/sd35"));
     // SD_TEXT_ENCODERS_ON=cpu keeps the three encoders off the accelerator.
     // They run once and then hold more memory than the transformer does.
-    let placement = match std::env::var("SD_TEXT_ENCODERS_ON").as_deref() {
+    let mut placement = match std::env::var("SD_TEXT_ENCODERS_ON").as_deref() {
         Ok("cpu") => Placement::on(&dev).with_text_encoders_on(&sd_tensor::Device::Cpu),
         Ok("auto") => Placement::auto(&dev, Sd3Pipeline::stage_bytes(&paths)?)?,
         _ => Placement::on(&dev),
     };
+    if std::env::var("SD_STREAM_DIFFUSION").is_ok() {
+        placement = placement.with_streamed_diffusion();
+    }
+    eprintln!("diffusion residency: {:?}", placement.diffusion());
     eprintln!(
         "placement: compute {:?}, text encoders {:?}, vae {:?}",
         placement.compute(),

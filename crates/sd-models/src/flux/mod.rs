@@ -528,34 +528,6 @@ impl LastLayer {
 }
 
 /// The Flux transformer.
-/// One block's weights, copied to `device` and still quantised.
-///
-/// Selected by name prefix, which is exact rather than a guess: GGUF names are
-/// `double_blocks.<i>.<...>`, and the trailing dot is what stops
-/// `double_blocks.1` from also matching `double_blocks.10`.
-fn block_weights(
-    all: &QuantizedWeights,
-    path: &str,
-    device: &sd_tensor::Device,
-) -> Result<QuantizedWeights> {
-    let prefix = format!("{path}.");
-    let mut out = QuantizedWeights::new();
-    for (name, weight) in all.iter() {
-        if name.starts_with(&prefix) {
-            out.insert(
-                name.clone(),
-                sd_tensor::quantized::to_device(weight, device)?,
-            );
-        }
-    }
-    if out.is_empty() {
-        return Err(sd_tensor::Error::Msg(format!(
-            "no quantised weights under {prefix}"
-        )));
-    }
-    Ok(out)
-}
-
 #[derive(Debug)]
 pub struct FluxTransformer {
     img_in: Proj,
@@ -596,6 +568,26 @@ enum Blocks {
     /// quantised block bytes verbatim, so it is cheap and bit-exact; a dense
     /// checkpoint would have to move 4x the bytes, and there is no lossless
     /// route for it that is any cheaper.
+    ///
+    /// **Where the overhead actually goes is not where it looks.** Per step,
+    /// over the 19 double blocks (`SD_STREAM_PROFILE=1`):
+    ///
+    /// ```text
+    ///   copy   354 ms      build  1019 ms      run  244 ms
+    /// ```
+    ///
+    /// Rebuilding the block costs three times the copy and four times the
+    /// arithmetic. It is GPU-call overhead rather than data: `QMatMul::from_arc`
+    /// dequantises any F32/F16 tensor it is handed, and `Source::linear`
+    /// dequantises every bias, so a block build issues roughly a dozen small
+    /// device operations — 468 of this checkpoint's 776 tensors are F32
+    /// biases and norm scales.
+    ///
+    /// So prefetching the copy, the obvious next move, would hide the
+    /// *smallest* of the three. Caching the dequantised biases and norm
+    /// scales instead — they are tiny, and constant across steps — is where
+    /// the second is. Measure before assuming otherwise; that is what the
+    /// profile hook is for.
     Streamed {
         weights: QuantizedWeights,
         device: sd_tensor::Device,
@@ -779,17 +771,36 @@ impl FluxTransformer {
                 }
             }
             Blocks::Streamed { weights, device } => {
+                // `SD_STREAM_PROFILE=1` splits a streamed step three ways. It
+                // is here because the split is not what anyone guesses: the
+                // copy is the small part. See `Blocks::Streamed`.
+                let dbg = std::env::var("SD_STREAM_PROFILE").is_ok();
+                let (mut t_copy, mut t_build, mut t_run) = (0.0f64, 0.0f64, 0.0f64);
                 for i in 0..self.cfg.depth {
                     let path = format!("double_blocks.{i}");
-                    let resident = block_weights(weights, &path, device)?;
+                    let t0 = std::time::Instant::now();
+                    let resident = crate::weights::block_weights(weights, &path, device)?;
+                    let t1 = std::time::Instant::now();
                     let block =
                         DoubleStreamBlock::new(&self.cfg, Source::Quantized(&resident), &path)?;
+                    let t2 = std::time::Instant::now();
+                    t_copy += (t1 - t0).as_secs_f64();
+                    t_build += (t2 - t1).as_secs_f64();
                     let (a, t) = block.forward(&img, &txt, &vec, &pe)?;
+                    t_run += t2.elapsed().as_secs_f64();
                     img = a;
                     txt = t;
                     // `block` and `resident` drop here, releasing the device
                     // copy before the next one is made — which is the whole
                     // point, so it is worth not moving this line.
+                }
+                if dbg {
+                    eprintln!(
+                        "  [stream] double: copy {:.0} ms, build {:.0} ms, run {:.0} ms",
+                        t_copy * 1e3,
+                        t_build * 1e3,
+                        t_run * 1e3
+                    );
                 }
             }
         }
@@ -807,7 +818,7 @@ impl FluxTransformer {
             Blocks::Streamed { weights, device } => {
                 for i in 0..self.cfg.depth_single_blocks {
                     let path = format!("single_blocks.{i}");
-                    let resident = block_weights(weights, &path, device)?;
+                    let resident = crate::weights::block_weights(weights, &path, device)?;
                     let block =
                         SingleStreamBlock::new(&self.cfg, Source::Quantized(&resident), &path)?;
                     xs = block.forward(&xs, &vec, &pe)?;
@@ -881,7 +892,7 @@ mod streaming_tests {
             fake(&format!("double_blocks.{i}.img_attn.qkv.weight"), &mut all);
             fake(&format!("double_blocks.{i}.img_mlp.0.weight"), &mut all);
         }
-        let one = block_weights(&all, "double_blocks.1", &Device::Cpu).unwrap();
+        let one = crate::weights::block_weights(&all, "double_blocks.1", &Device::Cpu).unwrap();
         assert_eq!(
             one.len(),
             2,
@@ -889,7 +900,7 @@ mod streaming_tests {
         );
         assert!(one.keys().all(|k| k.starts_with("double_blocks.1.")));
 
-        let ten = block_weights(&all, "double_blocks.10", &Device::Cpu).unwrap();
+        let ten = crate::weights::block_weights(&all, "double_blocks.10", &Device::Cpu).unwrap();
         assert_eq!(ten.len(), 2);
         assert!(ten.keys().all(|k| k.starts_with("double_blocks.10.")));
     }
@@ -901,7 +912,7 @@ mod streaming_tests {
         // rather than as the wrong index here.
         let mut all = QuantizedWeights::new();
         fake("double_blocks.0.img_attn.qkv.weight", &mut all);
-        let err = block_weights(&all, "double_blocks.7", &Device::Cpu)
+        let err = crate::weights::block_weights(&all, "double_blocks.7", &Device::Cpu)
             .expect_err("block 7 does not exist");
         assert!(err.to_string().contains("double_blocks.7."), "{err}");
     }

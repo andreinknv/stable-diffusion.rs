@@ -363,6 +363,22 @@ impl Embedder {
     }
 }
 
+/// Where the MMDiT's joint blocks keep their weights.
+///
+/// The same split Flux uses, for the same reason: the blocks are nearly all of
+/// the model, and they are the only part worth streaming.
+#[derive(Debug)]
+enum Blocks {
+    /// Built once, resident on the compute device for the whole run.
+    Resident(Vec<JointBlock>),
+    /// Held in host memory, copied to the compute device one block at a time.
+    /// See `flux::Blocks::Streamed` for the measurements behind this.
+    Streamed {
+        weights: QuantizedWeights,
+        device: sd_tensor::Device,
+    },
+}
+
 /// The SD 3 / SD 3.5 transformer.
 #[derive(Debug)]
 pub struct Sd3Transformer {
@@ -376,7 +392,7 @@ pub struct Sd3Transformer {
     t_embedder: Embedder,
     y_embedder: Embedder,
     context_embedder: Proj,
-    blocks: Vec<JointBlock>,
+    blocks: Blocks,
     final_ada_ln: Proj,
     final_linear: Proj,
     cfg: Sd3Config,
@@ -389,11 +405,56 @@ impl Sd3Transformer {
 
     /// Build with the weights left quantised. See
     /// [`crate::weights`] for why this is not merely an optimisation.
+    /// Build with the blocks streamed rather than resident.
+    ///
+    /// `weights` stay where the caller loaded them — host memory is the point
+    /// — and each block is copied to `device` as it is reached. The embedders
+    /// and output head are moved once and stay: they run every step and are a
+    /// small fraction of the model.
+    pub fn from_quantized_streaming(
+        cfg: &Sd3Config,
+        weights: &QuantizedWeights,
+        device: &sd_tensor::Device,
+    ) -> Result<Self> {
+        let mut resident = QuantizedWeights::new();
+        for (name, weight) in weights.iter() {
+            if !name.starts_with("joint_blocks.") {
+                resident.insert(
+                    name.clone(),
+                    sd_tensor::quantized::to_device(weight, device)?,
+                );
+            }
+        }
+        Self::from_source_with_blocks(
+            cfg,
+            Source::Quantized(&resident),
+            Blocks::Streamed {
+                weights: weights.clone(),
+                device: device.clone(),
+            },
+        )
+    }
+
     pub fn from_quantized(cfg: &Sd3Config, weights: &QuantizedWeights) -> Result<Self> {
         Self::from_source(cfg, Source::Quantized(weights))
     }
 
     fn from_source(cfg: &Sd3Config, src: Source) -> Result<Self> {
+        let blocks = Blocks::Resident(
+            (0..cfg.depth)
+                .map(|i| JointBlock::new(cfg, i, src, &format!("joint_blocks.{i}")))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        Self::from_source_with_blocks(cfg, src, blocks)
+    }
+
+    /// Everything but the blocks, which the caller supplies.
+    ///
+    /// Split out so the streaming constructor can build the embedders and the
+    /// output head from device-resident weights while the blocks stay in host
+    /// memory. Without it the streaming path asks `from_source` to build
+    /// blocks from a weight map that deliberately no longer contains them.
+    fn from_source_with_blocks(cfg: &Sd3Config, src: Source, blocks: Blocks) -> Result<Self> {
         let h = cfg.hidden_size;
         let p = cfg.patch_size;
         let patch_elems = cfg.in_channels * p * p;
@@ -416,9 +477,7 @@ impl Sd3Transformer {
             t_embedder: Embedder::new(TIME_EMBED_DIM, h, src, "t_embedder")?,
             y_embedder: Embedder::new(cfg.pooled_dim, h, src, "y_embedder")?,
             context_embedder: src.linear("context_embedder", cfg.context_dim, h)?,
-            blocks: (0..cfg.depth)
-                .map(|i| JointBlock::new(cfg, i, src, &format!("joint_blocks.{i}")))
-                .collect::<Result<Vec<_>>>()?,
+            blocks,
             final_ada_ln: src.linear("final_layer.adaLN_modulation.1", h, 2 * h)?,
             final_linear: src.linear("final_layer.linear", h, p * p * cfg.in_channels)?,
             cfg: cfg.clone(),
@@ -429,8 +488,16 @@ impl Sd3Transformer {
         &self.cfg
     }
 
+    /// Weight bytes held *on the compute device*.
+    ///
+    /// Streamed blocks count as zero: their weights are in host memory and
+    /// only ever one block at a time on the device, so counting them would
+    /// report the opposite of what streaming achieves.
     pub fn resident_bytes(&self) -> usize {
-        self.blocks.iter().map(|b| b.resident_bytes()).sum()
+        match &self.blocks {
+            Blocks::Resident(b) => b.iter().map(|b| b.resident_bytes()).sum(),
+            Blocks::Streamed { .. } => 0,
+        }
     }
 
     /// The slice of the stored positional table for an `h x w` patch grid.
@@ -519,14 +586,34 @@ impl Sd3Transformer {
         let c = (t + self.y_embedder.forward(pooled)?)?;
         let mut context = Some(self.context_embedder.forward(context)?);
 
-        for block in &self.blocks {
-            let (ctx, x) = block.forward(
-                context.as_ref().expect("only the last block drops context"),
-                &xs,
-                &c,
-            )?;
-            context = ctx;
-            xs = x;
+        match &self.blocks {
+            Blocks::Resident(blocks) => {
+                for block in blocks {
+                    let (ctx, x) = block.forward(
+                        context.as_ref().expect("only the last block drops context"),
+                        &xs,
+                        &c,
+                    )?;
+                    context = ctx;
+                    xs = x;
+                }
+            }
+            Blocks::Streamed { weights, device } => {
+                for i in 0..self.cfg.depth {
+                    let path = format!("joint_blocks.{i}");
+                    let resident = crate::weights::block_weights(weights, &path, device)?;
+                    let block = JointBlock::new(&self.cfg, i, Source::Quantized(&resident), &path)?;
+                    let (ctx, x) = block.forward(
+                        context.as_ref().expect("only the last block drops context"),
+                        &xs,
+                        &c,
+                    )?;
+                    context = ctx;
+                    xs = x;
+                    // `block` and `resident` drop here, freeing the device copy
+                    // before the next is made. That is the whole mechanism.
+                }
+            }
         }
 
         let params = self.final_ada_ln.forward(&ops::silu(&c)?)?;

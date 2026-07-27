@@ -76,9 +76,14 @@ compute device as it is reached, releasing it after — `stable-diffusion.cpp`'s
 `--offload-to-cpu`, and the answer for a GPU too small to hold the model at
 all, where no static placement helps. Flux only, so far.
 
-Measured on Flux schnell, 512, 4 steps, Metal: **21.0 s resident against
-25.1 s streamed**, +19.5%, and the images are **bit-identical** — the copy
-moves quantised block bytes verbatim, so nothing is rounded twice.
+Measured, and the images are **bit-identical** either way — the copy moves
+quantised block bytes verbatim, so nothing is rounded twice:
+
+| model | resident | streamed | device memory freed |
+|---|---|---|---|
+| Flux schnell 512, 4 steps | 21.0 s | 25.1 s (+19.5%) | 2.4 GB |
+| SD 3.5 medium 512, 20 steps | 24.4 s | 29.0 s (+18.9%) | 1.6 GB |
+
 `quantized::to_device` is the primitive; `FluxTransformer::resident_bytes`
 reports 0 for streamed blocks, because saying otherwise would report the
 opposite of what streaming achieves.
@@ -109,25 +114,46 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. Extend streaming past Flux, and measure it on a discrete GPU
+### 1. Cache the dequantised biases in the streamed path
 
-`Residency::Streamed` exists and works — see the note above — but only for
-**Flux's quantised transformer**. Three gaps, in the order they matter:
+Streaming costs about +19%, and the profile says the obvious fix is the wrong
+one. Per step over Flux's 19 double blocks (`SD_STREAM_PROFILE=1`):
 
-- **SD 3.5's MMDiT does not stream.** Same shape of change:
-  `Sd3Transformer` needs the `Blocks` split that `flux/mod.rs` now has, and
-  `sd3_qtensors_from_gguf` already loads the weights it would keep in host
-  memory. This is the mechanical one.
+```text
+  copy   354 ms      build  1019 ms      run  244 ms
+```
+
+**Rebuilding the block costs three times the copy and four times the
+arithmetic.** It is GPU-call overhead rather than bytes: `QMatMul::from_arc`
+dequantises any F32/F16 tensor it is handed, and `Source::linear` dequantises
+every bias, so each block build issues roughly a dozen small device
+operations. 468 of this checkpoint's 776 tensors are F32 biases and norm
+scales.
+
+Those are tiny and constant across steps, so they should be dequantised once
+onto the device and reused, leaving only the quantised weight matrices to
+stream. That needs `Source` to be able to supply an already-dequantised bias,
+which is the actual design question — `Source::Quantized` currently owns that
+decision and always dequantises.
+
+**Prefetch was the plan and the profile killed it**: overlapping the copy with
+compute would hide 354 ms of a 1617 ms step, the smallest of the three. Worth
+doing after the build cost is gone, not before.
+
+### 2. Extend streaming past Flux, and measure it on a discrete GPU
+
+`Residency::Streamed` works for **Flux and SD 3.5**, both quantised. Gaps, in
+the order they matter:
+
 - **Dense checkpoints cannot stream at all.** `quantized::to_device` moves
   quantised block bytes verbatim, which is what makes it cheap and bit-exact;
   a dense model would move 4x the bytes with no equivalent shortcut. Flux mini
   — the model that most needs this, at 12.8 GB dense — is therefore the one
   that cannot have it. Whether a dense path is worth it is a measurement
   nobody has made.
-- **Nothing prefetches.** Each block is copied when it is reached, so the
-  copy and the compute serialise. `stable-diffusion.cpp` overlaps them
-  (`stream_layers`), which should hide most of the 19.5% this currently costs.
-  That is the obvious next win and needs no new concepts.
+- **Nothing prefetches**, and per the profile above that is not the first
+  thing to fix. `stable-diffusion.cpp` overlaps copy and compute
+  (`stream_layers`); worth doing once the build cost is gone.
 
 And the honest one: **the payoff has not been measured on the hardware it is
 for.** On unified memory the host copy sits in the same pool, so freeing the
@@ -136,7 +162,7 @@ same mechanism should take VRAM from 6.78 GB to one block, ~192 MB — by
 construction, not by measurement. If a CUDA machine ever appears, measure this
 first.
 
-### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
+### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
 answer was no**
 
 The three copies are now one, in `ops::rms_norm`, and `PlainLayerNorm`'s two

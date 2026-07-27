@@ -49,6 +49,40 @@ impl Proj {
     }
 }
 
+/// One transformer block's weights, copied to `device` and still quantised.
+///
+/// The selection primitive for streamed residency: a model too large for an
+/// accelerator keeps its blocks in host memory and calls this as each is
+/// reached. Shared between Flux and SD 3 because the naming convention is —
+/// both carry the original upstream `<stack>.<i>.<...>` layout.
+///
+/// The trailing dot is load-bearing. Without it `double_blocks.1` also matches
+/// `double_blocks.10` through `19`, and Flux schnell has 19 double and 38
+/// single blocks, so every single-digit index has two-digit siblings. The
+/// block would be built from whichever duplicate name won, silently.
+pub fn block_weights(
+    all: &QuantizedWeights,
+    path: &str,
+    device: &sd_tensor::Device,
+) -> Result<QuantizedWeights> {
+    let prefix = format!("{path}.");
+    let mut out = QuantizedWeights::new();
+    for (name, weight) in all.iter() {
+        if name.starts_with(&prefix) {
+            out.insert(
+                name.clone(),
+                sd_tensor::quantized::to_device(weight, device)?,
+            );
+        }
+    }
+    if out.is_empty() {
+        return Err(sd_tensor::Error::Msg(format!(
+            "no quantised weights under {prefix}"
+        )));
+    }
+    Ok(out)
+}
+
 /// Where a model's weights come from.
 #[derive(Clone, Copy)]
 pub enum Source<'a> {

@@ -175,8 +175,18 @@ impl Sd3Pipeline {
         let t5 = T5EncoderModel::from_quantized(&T5Config::xxl(), &weights)?;
 
         let transformer = if paths.transformer.extension().is_some_and(|e| e == "gguf") {
-            let w = sd_loader::sd3_qtensors_from_gguf(&paths.transformer, device)?;
-            Sd3Transformer::from_quantized(cfg, &w)?
+            match placement.diffusion() {
+                // Streamed: load onto the *host*, not the compute device —
+                // keeping them off it is the entire point.
+                super::Residency::Streamed => {
+                    let w = sd_loader::sd3_qtensors_from_gguf(&paths.transformer, &Device::Cpu)?;
+                    Sd3Transformer::from_quantized_streaming(cfg, &w, device)?
+                }
+                super::Residency::Resident => {
+                    let w = sd_loader::sd3_qtensors_from_gguf(&paths.transformer, device)?;
+                    Sd3Transformer::from_quantized(cfg, &w)?
+                }
+            }
         } else {
             let vb = sd_loader::safetensors_var_builder(&[&paths.transformer], DTYPE, device)?;
             // The single-file checkpoint nests the transformer; the VAE lives
