@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 313 tests, all gates green
+table is in [roadmap.md](roadmap.md). 315 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,34 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**AnimateDiff motion modules are ported and verified** at **2.662e-7**. The
+temporal transformer is done; what remains is inserting the 21 of them into
+the UNet's blocks (see [Next](#next)).
+
+A motion module is a small transformer whose attention runs across *frames*
+rather than pixels, and our own `Attention` and `FeedForward` are reused
+verbatim — the checkpoint's names match theirs exactly. **21 of them, one per
+resnet**: down 2x4, mid 1, up 3x4. Note `down_blocks.3` has two despite having
+no attentions, which is the clue that they attach to resnets rather than to
+transformers.
+
+Three things were wrong on the first attempt and **every one of them kept all
+shapes valid**, which is why this was verified numerically rather than by
+inspection:
+
+- **The positional encoding goes on the normed states inside each attention
+  path, and twice** — once before `attn1`, once before `attn2`. Adding it once
+  to the residual stream is the natural reading and is wrong by ~3.
+- **The GroupNorm spans frames.** `[b*f, c, h, w]` is regrouped to
+  `[b, c, f, h, w]` first, so each group's statistics are taken over the whole
+  clip. Normalising per frame is wrong by ~3.
+- **The temporal permute happens once, in the module**, not per block: the
+  blocks receive `[b*h*w, f, c]` already.
+
+Frame count is ambient (`motion::with_frames`), for the same reason the
+IP-Adapter's weights are: it must reach 21 modules and is uniform. The UNet has
+no frame axis — frames ride on the batch.
 
 **Two-pass generation works**, `--hires 1024`, and the failure it fixes is
 visible rather than theoretical. SD 1.5 asked to compose at 1024 directly
@@ -612,22 +640,25 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. Motion modules (AnimateDiff)
+### 1. Insert the motion modules into the UNet
 
-The last item from the animation issue, and the only large one left. Temporal
-attention layers inserted into the UNet, turning "N images that share a seed"
-into "frames of one motion".
+The module itself is done and verified at 2.662e-7 (above). What remains is
+wiring, and the shape of it is known:
 
-Two things make it less daunting than it looks now. The **installation
-mechanism already exists**: `unet::ip` demonstrates reaching every attention
-layer during construction without threading a parameter, and a motion module
-needs the same shape of wiring. And the **batch axis is the frame axis** —
-temporal attention attends across it — so the change is mostly about giving
-the UNet a notion of frames rather than about new maths.
+- **21 modules, one after each resnet** — `down_blocks.{0..3}.motion_modules.{0,1}`,
+  `mid_block.motion_modules.0`, `up_blocks.{0..3}.motion_modules.{0,1,2}`. Not
+  after each *attention*: `down_blocks.3` has motion modules and no attentions.
+- Install them the way `unet::ip` installs IP weights — a construction-scoped
+  thread-local, pulled as each block is built. That mechanism exists and works.
+- The UNet needs a frame count at forward time; `motion::with_frames` already
+  carries it.
+- **The batch is the frames.** A 16-frame clip is a batch of 16, so the whole
+  pipeline needs to stop assuming batch 1 — that is the largest single piece of
+  this, and it is the same change a batched still-image path would need.
 
-The trap to expect, by analogy with IP-Adapter: whatever order the checkpoint
-numbers its layers in will not be this UNet's construction order, and it will
-be silent. Verify end to end against a reference, not per module.
+Verify end to end against `diffusers`' `UNetMotionModel`, not per module: the
+insertion order is exactly the kind of thing that is silent when wrong, as the
+IP-Adapter index mapping was.
 
 ### ~~2. TAESD and step previews~~ — both done
 

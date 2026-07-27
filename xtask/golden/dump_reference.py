@@ -1276,6 +1276,56 @@ def dump_ip_adapter(output: pathlib.Path, model_id: str) -> None:
         print(f"  {k:<14} {tuple(v.shape)}")
 
 
+def dump_motion(output: pathlib.Path, model_id: str) -> None:
+    """One AnimateDiff motion module, in isolation.
+
+    In isolation on purpose: the thing that goes wrong is the permute that
+    makes attention temporal, and it produces correct shapes either way. A
+    module-level comparison localises that, where a whole-UNet one would only
+    say something is off.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import MotionAdapter
+    from safetensors.torch import save_file
+
+    out = output / "motion"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id}")
+    adapter = MotionAdapter.from_pretrained(model_id, torch_dtype=torch.float32)
+    adapter.eval()
+    module = adapter.down_blocks[0].motion_modules[0]
+
+    frames, channels, size = 4, 320, 8
+    gen = torch.Generator().manual_seed(SEED)
+    hidden = torch.randn(frames, channels, size, size, generator=gen)
+
+    with torch.no_grad():
+        result = module(hidden, num_frames=frames)
+    if isinstance(result, tuple):
+        result = result[0]
+
+    tensors = {
+        "hidden": hidden.contiguous(),
+        "output": result.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    weights = hf_hub_download(repo_id=model_id, filename="diffusion_pytorch_model.safetensors")
+    link = out / "motion_adapter.safetensors"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(weights)
+
+    print(f"\\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<8} {tuple(v.shape)}")
+
+
 SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
 
 
@@ -1618,6 +1668,10 @@ def main() -> None:
     )
     unet_full.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    mo = sub.add_parser("motion", help="dump AnimateDiff motion module references")
+    mo.add_argument("--model-id", default="guoyww/animatediff-motion-adapter-v1-5-2")
+    mo.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     ipa = sub.add_parser("ip_adapter", help="dump IP-Adapter UNet references")
     ipa.add_argument("--model-id", default="h94/IP-Adapter")
     ipa.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -1659,7 +1713,9 @@ def main() -> None:
     gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
     args = ap.parse_args()
-    if args.component == "ip_adapter":
+    if args.component == "motion":
+        dump_motion(args.output, args.model_id)
+    elif args.component == "ip_adapter":
         dump_ip_adapter(args.output, args.model_id)
     elif args.component == "clip_vision":
         dump_clip_vision(args.output, args.model_id)

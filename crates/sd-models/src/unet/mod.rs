@@ -8,6 +8,7 @@ mod blocks;
 mod embeddings;
 pub mod ip;
 mod model;
+pub mod motion;
 mod resnet;
 
 pub use attention::{Attention, BasicTransformerBlock, FeedForward, Transformer2DModel};
