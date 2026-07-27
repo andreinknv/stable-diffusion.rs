@@ -12,6 +12,7 @@
 //! mmap call below and justify any addition.
 
 pub mod embedding;
+pub mod merge;
 
 pub mod flux_gguf;
 pub mod gguf;

@@ -287,6 +287,32 @@ enum Command {
         output: String,
     },
 
+    /// Merge two checkpoints by weighted average.
+    ///
+    /// `(1 - alpha) * a + alpha * b`, tensor by tensor. Only meaningful
+    /// between checkpoints of the same architecture, and mismatches are
+    /// refused rather than skipped — an SD 1.5 and an SDXL share enough tensor
+    /// names to produce a file that loads and renders noise.
+    #[command(name = "merge")]
+    Merge {
+        #[arg(long)]
+        a: String,
+
+        #[arg(long)]
+        b: String,
+
+        /// Weight of --b. 0 is --a exactly, 1 is --b exactly.
+        #[arg(long, default_value_t = 0.5)]
+        alpha: f64,
+
+        /// Carry through tensors only one side has, instead of refusing.
+        #[arg(long)]
+        allow_unmatched: bool,
+
+        #[arg(long, short, default_value = "merged.safetensors")]
+        output: String,
+    },
+
     /// Upscale an image 4x with Real-ESRGAN.
     ///
     /// Runs after generation and knows nothing about it, so it works on any
@@ -1026,6 +1052,43 @@ fn main() -> Result<()> {
                 .context("running SD 3")?;
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             tracing::info!(elapsed = ?t1.elapsed(), output = %output, "done");
+        }
+
+        Command::Merge {
+            a,
+            b,
+            alpha,
+            allow_unmatched,
+            output,
+        } => {
+            // On the CPU regardless of the active device: this is file
+            // arithmetic, and moving gigabytes onto an accelerator to add them
+            // pays a transfer for no gain.
+            let cpu = sd_tensor::Device::Cpu;
+            let left = sd_tensor::safetensors::load(Path::new(&a), &cpu)
+                .with_context(|| format!("reading {a}"))?;
+            let right = sd_tensor::safetensors::load(Path::new(&b), &cpu)
+                .with_context(|| format!("reading {b}"))?;
+            tracing::info!(a = %a, b = %b, alpha, "merging");
+
+            let (merged, report) = sd::loader::merge::merge(
+                &left,
+                &right,
+                &sd::loader::merge::MergeOptions {
+                    alpha,
+                    allow_unmatched,
+                },
+            )
+            .context("merging")?;
+
+            sd_tensor::safetensors::save(&merged, Path::new(&output))
+                .with_context(|| format!("writing {output}"))?;
+            tracing::info!(
+                blended = report.blended,
+                carried = report.carried,
+                output = %output,
+                "done"
+            );
         }
 
         Command::Upscale {

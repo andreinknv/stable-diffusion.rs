@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 315 tests, all gates green
+table is in [roadmap.md](roadmap.md). 319 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -180,6 +180,23 @@ a fixed palette.
 
 The second pass draws from `seed + 1`, so the two passes do not draw the same
 noise for differently-sized latents.
+
+**Checkpoints merge**, `sdrs merge --a X --b Y --alpha 0.3`. Loader-level
+arithmetic — `(1-alpha)*a + alpha*b` per tensor, on the CPU regardless of the
+active device, since moving gigabytes onto an accelerator to add them pays a
+transfer for no gain.
+
+What it refuses is the point. Merging is only meaningful within one
+architecture, and the failure otherwise is quiet: an SD 1.5 and an SDXL share
+enough tensor *names* to produce a file that loads and renders noise. So shape
+mismatches and one-sided tensors are both refused — with a count and an
+example — rather than skipped, since skipping silently takes one side's
+weights and yields a third model nobody asked for. `--allow-unmatched` opts
+back in.
+
+Verified on real weights: merging the SD 1.5 VAE with itself at alpha 0.5 is
+**bit-identical** across all 248 tensors, and merging it with the UNet is
+refused naming `conv_in.bias`.
 
 **Textual inversion works**, `--embedding <file>` (repeatable), triggered by
 the file stem. Kilobytes against a checkpoint's gigabytes, which is the whole
