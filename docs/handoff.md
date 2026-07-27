@@ -167,11 +167,12 @@ the order they matter:
   (`stream_layers`); worth doing once the build cost is gone.
 
 And the honest one: **the payoff has not been measured on the hardware it is
-for.** On unified memory the host copy sits in the same pool, so freeing the
-device buys only about 2.4 GB of the 6.78 GB in play. On a discrete card the
-same mechanism should take VRAM from 6.78 GB to one block, ~192 MB — by
-construction, not by measurement. If a CUDA machine ever appears, measure this
-first.
+for.** On unified memory the host copy sits in the same pool, so what the
+device gives up it gives up to the same allocator — the mechanism is
+demonstrable there (one block resident instead of the stack, at the default
+sync interval) but the *benefit* is not. On a discrete card it should take
+VRAM from 6.66 GB to ~192 MB, by construction rather than by measurement. If a
+CUDA machine ever appears, measure this before anything else here.
 
 ### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
 answer was no**
