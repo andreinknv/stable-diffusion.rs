@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use sd_models::clip::{ClipTextConfig, ClipTextEncoder, ClipTokenizer};
 use sd_models::unet::{UNet2DConditionModel, UNetConfig};
 use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, VaeConfig};
-use sd_sample::{euler_ancestral_step, sigmas_for_steps, DpmSolverPlusPlus2M, Schedule};
+use sd_sample::{
+    euler_ancestral_step, lcm_sigmas, lcm_step, lcm_timesteps, sigmas_for_steps,
+    DpmSolverPlusPlus2M, Schedule,
+};
 use sd_tensor::rng::SeededRng;
 use sd_tensor::{DType, Device, Tensor};
 
@@ -15,6 +18,11 @@ pub enum SamplerKind {
     #[default]
     EulerAncestral,
     DpmPlusPlus2M,
+    /// Latent consistency sampling. **Only meaningful with an LCM-distilled
+    /// model or adapter**, and wants 4-8 steps at `cfg_scale` near 1 — the
+    /// guidance is distilled in, so applying more on top double-counts it and
+    /// blows the image out.
+    Lcm,
 }
 
 /// Everything a single generation needs.
@@ -392,7 +400,7 @@ impl Txt2ImgPipeline {
         let uncond = self.encode(&cfg.negative_prompt)?;
         let context = Tensor::cat(&[&uncond, &cond], 0)?;
 
-        let sigmas = sigmas_for_steps(&self.schedule, cfg.steps);
+        let sigmas = self.sigmas_for(cfg.sampler, cfg.steps);
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
 
         // One generator per image, drawn in order: initial latent first, then
@@ -410,6 +418,25 @@ impl Txt2ImgPipeline {
         // 512px output is bit-identical to before. Above that it tiles, which
         // is what keeps a 1024px decode inside GPU memory.
         Ok(self.vae.decode_tiled(&latent)?)
+    }
+
+    /// The sigma ladder a sampler wants.
+    ///
+    /// LCM does not take an even spread: it visits the subset of timesteps its
+    /// distillation used, so it builds its own ladder. Everything else shares
+    /// the usual one.
+    fn sigmas_for(&self, sampler: SamplerKind, steps: usize) -> Vec<f64> {
+        match sampler {
+            SamplerKind::Lcm => lcm_sigmas(
+                &self.schedule,
+                &lcm_timesteps(
+                    self.schedule.alphas_cumprod.len(),
+                    sd_sample::ORIGINAL_INFERENCE_STEPS,
+                    steps,
+                ),
+            ),
+            _ => sigmas_for_steps(&self.schedule, steps),
+        }
     }
 
     /// The sampling loop, shared by txt2img and img2img.
@@ -458,6 +485,12 @@ impl Txt2ImgPipeline {
                     euler_ancestral_step(&latent, &denoised, sigma, sigma_next, &noise)?
                 }
                 SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next)?,
+                SamplerKind::Lcm => {
+                    // Fresh noise each step: LCM re-noises rather than
+                    // integrating, so a reused draw correlates the steps.
+                    let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+                    lcm_step(&latent, &denoised, sigma, sigma_next, t, &noise)?
+                }
             };
 
             progress(i + 1, steps, sigma);
@@ -501,7 +534,7 @@ impl Txt2ImgPipeline {
         // the randomness, so this stays a function of the seed alone.
         let latent = self.vae_encoder.encode(&image)?;
 
-        let sigmas = sigmas_for_steps(&self.schedule, base.steps);
+        let sigmas = self.sigmas_for(base.sampler, base.steps);
         let start = cfg.strength.start_index(base.steps);
         // Strength 0 means "return the input", and there is nothing to run.
         if start >= base.steps {

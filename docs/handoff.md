@@ -116,9 +116,25 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 248 tests, all gates green
+table is in [roadmap.md](roadmap.md). 253 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
+
+**LCM sampling works**, `--sampler lcm`, in both SD 1.5 and SDXL. It is not
+another ODE solver: a consistency model maps any point on the trajectory
+straight to its origin, so the loop jumps to `x0` and re-noises out to the next
+sigma rather than integrating. Four steps instead of twenty.
+
+With `lcm-lora-sdv1-5` at 4 steps and `--cfg-scale 1.0`: a clean photographic
+crab in **31 s**, against 57 s for 8 steps of `dpmpp2m` that came out blown
+out. Two controls make it a demonstration rather than a hope — the LCM sampler
+*without* the adapter gives a brown blob, and the adapter without the LCM
+sampler blows out. Each piece is necessary.
+
+Two things make it look broken if missed, both documented on the module:
+guidance must be ~1, because the distillation folded one in already; and the
+timesteps are a fixed subset of the distillation ladder
+(`[999, 759, 519, 279]` at four steps), not an even spread.
 
 **LoRA adapters load and merge**, for SD 1.5's dense path:
 `sdrs txt2img --lora <file> --lora-scale <f>`, or
@@ -145,25 +161,7 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. An LCM scheduler
-
-Not on the roadmap and never needed until now — nothing here used an LCM
-checkpoint, so nothing wanted the sampler. Adding LoRA created the need: the
-adapter used to verify it, `lcm-lora-sdv1-5`, is a *consistency* adapter and
-cannot show what it does without one. Driven by `dpmpp2m` at CFG 7.5 it
-overexposes badly; at CFG 1.5 it is much better and still stippled, because
-the sampler is wrong for it rather than because the merge is.
-
-LCM sampling is small and self-contained: predict, solve for `x0` through the
-consistency boundary conditions, re-noise to the next sigma, repeat for 4-8
-steps at CFG ~1. It belongs beside `euler_ancestral_step` and
-`DpmSolverPlusPlus2M` in `sd-sample`, and `SamplerKind` already exists to
-select it.
-
-It would also give the LoRA feature a proper end-to-end demonstration rather
-than a structural one, which is the gap in how it is currently verified.
-
-### 2. Overlap the block copy with compute
+### 1. Overlap the block copy with compute
 
 Now worth doing, and only now. The streamed step used to divide as copy
 354 ms / build 1019 ms / run 244 ms, so prefetching the copy would have hidden
@@ -181,7 +179,7 @@ using it — and on Metal the release only happens on synchronise. A prefetch
 thread and `SD_STREAM_SYNC_EVERY` are pulling on the same string; work out
 that interaction before writing the thread.
 
-### 3. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
+### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
 
 `Residency::Streamed` works for **Flux and SD 3.5**, both quantised. Gaps, in
 the order they matter:
@@ -204,7 +202,7 @@ sync interval) but the *benefit* is not. On a discrete card it should take
 VRAM from 6.66 GB to ~192 MB, by construction rather than by measurement. If a
 CUDA machine ever appears, measure this before anything else here.
 
-### 4. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
+### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
 answer was no**
 
 The three copies are now one, in `ops::rms_norm`, and `PlainLayerNorm`'s two

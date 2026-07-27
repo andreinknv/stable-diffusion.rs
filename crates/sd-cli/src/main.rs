@@ -95,7 +95,7 @@ enum Command {
         #[arg(long, default_value_t = 42)]
         seed: u64,
 
-        /// `euler-a` or `dpmpp2m`.
+        /// `euler-a`, `dpmpp2m`, or `lcm` (needs an LCM model or --lora).
         #[arg(long, default_value = "euler-a")]
         sampler: String,
 
@@ -180,7 +180,11 @@ fn parse_sampler(name: &str) -> Result<SamplerKind> {
     match name {
         "euler-a" | "euler_a" | "euler" => Ok(SamplerKind::EulerAncestral),
         "dpmpp2m" | "dpm++2m" | "dpmpp-2m" => Ok(SamplerKind::DpmPlusPlus2M),
-        other => anyhow::bail!("unknown sampler {other:?}; expected 'euler-a' or 'dpmpp2m'"),
+        "lcm" => Ok(SamplerKind::Lcm),
+        other => anyhow::bail!(
+            "unknown sampler {other:?}; expected 'euler-a', 'dpmpp2m' or 'lcm'.\n\
+             'lcm' needs an LCM-distilled model or --lora, 4-8 steps, and --cfg-scale near 1."
+        ),
     }
 }
 

@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use sd_models::clip::{ClipTextConfig, ClipTextEncoder, ClipTokenizer};
 use sd_models::unet::{UNet2DConditionModel, UNetConfig};
 use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, VaeConfig};
-use sd_sample::{euler_ancestral_step, sigmas_for_steps, DpmSolverPlusPlus2M, Schedule};
+use sd_sample::{
+    euler_ancestral_step, lcm_sigmas, lcm_step, lcm_timesteps, sigmas_for_steps,
+    DpmSolverPlusPlus2M, Schedule,
+};
 use sd_tensor::rng::SeededRng;
 use sd_tensor::{DType, Device, Tensor};
 
@@ -166,6 +169,23 @@ impl SdxlPipeline {
         })
     }
 
+    /// The sigma ladder a sampler wants. See the SD 1.5 pipeline's copy: LCM
+    /// visits the subset of timesteps its distillation used rather than an
+    /// even spread.
+    fn sigmas_for(&self, sampler: SamplerKind, steps: usize) -> Vec<f64> {
+        match sampler {
+            SamplerKind::Lcm => lcm_sigmas(
+                &self.schedule,
+                &lcm_timesteps(
+                    self.schedule.alphas_cumprod.len(),
+                    sd_sample::ORIGINAL_INFERENCE_STEPS,
+                    steps,
+                ),
+            ),
+            _ => sigmas_for_steps(&self.schedule, steps),
+        }
+    }
+
     /// Encode a prompt through both towers.
     ///
     /// Returns the 2048-wide sequence and the 1280-wide pooled embedding.
@@ -217,7 +237,7 @@ impl SdxlPipeline {
         // inputs the model was trained on, not metadata.
         let (context, pooled, time_ids) = self.conditioning(cfg)?;
 
-        let sigmas = sigmas_for_steps(&self.schedule, cfg.steps);
+        let sigmas = self.sigmas_for(cfg.sampler, cfg.steps);
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
 
         let mut rng = SeededRng::new(cfg.seed);
@@ -287,6 +307,10 @@ impl SdxlPipeline {
                     euler_ancestral_step(&latent, &denoised, sigma, sigma_next, &noise)?
                 }
                 SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next)?,
+                SamplerKind::Lcm => {
+                    let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+                    lcm_step(&latent, &denoised, sigma, sigma_next, t, &noise)?
+                }
             };
 
             progress(i + 1, steps, sigma);
@@ -351,7 +375,7 @@ impl SdxlPipeline {
         // randomness, so a run stays a function of the seed alone.
         let latent = self.vae_encoder.encode(&image)?;
 
-        let sigmas = sigmas_for_steps(&self.schedule, base.steps);
+        let sigmas = self.sigmas_for(base.sampler, base.steps);
         let start = cfg.strength.start_index(base.steps);
         if start >= base.steps {
             return Ok(self.vae.decode_tiled(&latent)?);
