@@ -18,6 +18,45 @@ use sd_sample::{
 use sd_tensor::rng::SeededRng;
 use sd_tensor::{DType, Device, Tensor};
 
+/// How the first pass is enlarged before the second sees it.
+///
+/// The choice matters more than it looks. **Nearest** is the one to reach for
+/// whenever the output must not gain colours absent from the input — every
+/// interpolating mode invents intermediate values, which is right for
+/// photographic work and destructive for anything with a fixed palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Upscale {
+    /// Resize the *latent*, keeping the model's own texture. Cheap: no decode
+    /// and re-encode, and no VAE round trip to lose detail to.
+    #[default]
+    LatentNearest,
+    /// Latent-space bilinear. Smoother, and it invents values.
+    LatentBilinear,
+    /// Decode, resize in pixel space with Lanczos, re-encode.
+    ///
+    /// The most faithful to what an upscaler would see, and the most
+    /// expensive — it pays for a full VAE round trip, which is itself lossy.
+    PixelLanczos,
+}
+
+/// A two-pass generation: compose small, then add detail large.
+///
+/// Not the same as generating big. A model composes at its training resolution
+/// and **duplicates subjects** when asked to compose above it — two heads, two
+/// horizons. The first pass fixes composition at a size the model handles; the
+/// second adds detail at a size it could not have composed coherently.
+#[derive(Debug, Clone)]
+pub struct HiresConfig {
+    /// The first pass. Its width and height are the *native* size.
+    pub base: Txt2ImgConfig,
+    pub width: usize,
+    pub height: usize,
+    /// How much of the schedule the second pass re-runs. 0.5-0.7 is the usual
+    /// band: high enough to add detail, low enough to keep the composition.
+    pub strength: Strength,
+    pub upscale: Upscale,
+}
+
 /// A cancellation token, shared with whatever wants to stop a generation.
 ///
 /// A token rather than a callback return value, so the ordinary
@@ -1005,6 +1044,89 @@ impl Txt2ImgPipeline {
         Ok(Conditioning {
             context: Tensor::cat(&[&base.context, &doubled], 1)?,
         })
+    }
+
+    /// Generate in two passes: compose at the native size, then add detail.
+    ///
+    /// Returns `[1, 3, height, width]`. The second pass starts from the
+    /// enlarged first-pass latent noised to the sigma `strength` selects, so
+    /// it refines rather than replaces — which is what keeps the composition.
+    pub fn run_hires(&self, cfg: &HiresConfig) -> Result<Tensor, PipelineError> {
+        self.run_hires_with_progress(cfg, &mut |_| {})
+    }
+
+    /// [`Self::run_hires`], reporting progress across *both* passes.
+    pub fn run_hires_with_progress(
+        &self,
+        cfg: &HiresConfig,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        if cfg.width % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("width", cfg.width));
+        }
+        if cfg.height % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("height", cfg.height));
+        }
+        if cfg.width < cfg.base.width || cfg.height < cfg.base.height {
+            return Err(PipelineError::Tensor(sd_tensor::Error::Msg(format!(
+                "the second pass is {}x{}, smaller than the first at {}x{} — \
+                 hires enlarges",
+                cfg.width, cfg.height, cfg.base.width, cfg.base.height
+            ))));
+        }
+
+        // Pass one, at the size the model composes well at.
+        let (_, latent) = self.run_with_latent(&cfg.base, None, progress)?;
+
+        let (lh, lw) = (cfg.height / 8, cfg.width / 8);
+        let enlarged = match cfg.upscale {
+            Upscale::LatentNearest => latent.upsample_nearest2d(lh, lw)?,
+            Upscale::LatentBilinear => latent.interpolate2d(lh, lw)?,
+            Upscale::PixelLanczos => {
+                // The only mode that pays for a VAE round trip, and it is
+                // lossy in both directions — which is the trade for resizing
+                // where an upscaler would.
+                let image = self.decode(&latent)?;
+                let resized =
+                    crate::image_io::resize_signed(&image, cfg.width as u32, cfg.height as u32)?;
+                self.vae_encoder.encode(&resized)?
+            }
+        };
+
+        // Pass two: noise the enlarged latent to where `strength` starts and
+        // run the tail of the schedule from there.
+        let second = Txt2ImgConfig {
+            width: cfg.width,
+            height: cfg.height,
+            ..cfg.base.clone()
+        };
+        let sigmas = self.sigmas_for(second.sampler, second.steps);
+        let start = cfg.strength.start_index(second.steps);
+        if start >= second.steps {
+            // Strength 0: the first pass, merely enlarged.
+            return self.decode(&enlarged);
+        }
+
+        // A distinct seed for the second pass, derived from the first, so the
+        // two passes do not draw the same noise for different-sized latents.
+        let mut rng = SeededRng::new(second.seed.wrapping_add(1));
+        let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+        let latent = (enlarged + (noise * sigmas[start])?)?;
+
+        let contexts = vec![
+            self.encode_conditioning(&second.prompt, &second.negative_prompt)?
+                .context,
+        ];
+        let latent = self.denoise_selecting(
+            &second,
+            latent,
+            &sigmas[start..],
+            &contexts,
+            None,
+            &mut rng,
+            progress,
+        )?;
+        self.decode(&latent)
     }
 
     /// Encode a prompt pair once, for reuse across a sequence.

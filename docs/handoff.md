@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 311 tests, all gates green
+table is in [roadmap.md](roadmap.md). 313 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,23 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**Two-pass generation works**, `--hires 1024`, and the failure it fixes is
+visible rather than theoretical. SD 1.5 asked to compose at 1024 directly
+produced **three knights** where one was asked for
+(`assets/hires-off-1024-duplicates.png`); composing at 512 and refining at
+1024 gives one, sharp (`assets/hires-on-512to1024.png`) — and is *faster*,
+93.8 s against 115.1 s, because the first pass runs at the smaller size.
+
+Three upscale modes between the passes, and the choice is not cosmetic:
+latent-nearest (default), latent-bilinear, and pixel-lanczos, which is the
+only one that pays for a VAE round trip. **Nearest introduces no colours that
+were not already there** — every interpolating mode invents intermediate
+values, which is right for photographic work and destructive for anything with
+a fixed palette.
+
+The second pass draws from `seed + 1`, so the two passes do not draw the same
+noise for differently-sized latents.
 
 **Textual inversion works**, `--embedding <file>` (repeatable), triggered by
 the file stem. Kilobytes against a checkpoint's gigabytes, which is the whole

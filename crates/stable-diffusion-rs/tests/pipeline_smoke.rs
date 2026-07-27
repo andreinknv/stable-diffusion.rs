@@ -684,3 +684,87 @@ fn an_embedding_of_the_wrong_width_is_refused() {
         .expect("loading is fine; using it is not");
     assert!(pipeline.run(&cfg).is_err(), "wrong width was accepted");
 }
+
+#[test]
+fn hires_produces_the_larger_size_and_refuses_to_shrink() {
+    let _heavy = heavy();
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP hires_produces_the_larger_size_and_refuses_to_shrink");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::{HiresConfig, Strength, Txt2ImgPipeline, Upscale};
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+
+    let mut base = tiny_config(31);
+    base.steps = 2;
+    base.width = 64;
+    base.height = 64;
+
+    let cfg = HiresConfig {
+        base: base.clone(),
+        width: 128,
+        height: 128,
+        strength: Strength::new(0.5),
+        upscale: Upscale::LatentNearest,
+    };
+    let out = pipeline.run_hires(&cfg).expect("hires");
+    assert_eq!(out.dims(), &[1, 3, 128, 128]);
+
+    // Shrinking is a caller error, not a mode: "hires" that reduces is a
+    // request that cannot mean what it says.
+    let shrink = HiresConfig {
+        width: 32,
+        height: 32,
+        ..cfg.clone()
+    };
+    assert!(
+        pipeline.run_hires(&shrink).is_err(),
+        "shrinking was allowed"
+    );
+}
+
+#[test]
+fn hires_at_strength_zero_is_the_first_pass_enlarged() {
+    // Strength 0 means the second pass runs no steps, so the result must be
+    // the first pass decoded at the larger size — nothing added. Without this,
+    // an off-by-one in the schedule slice could run one step and go unnoticed.
+    let _heavy = heavy();
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP hires_at_strength_zero_is_the_first_pass_enlarged");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::{HiresConfig, Strength, Txt2ImgPipeline, Upscale};
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+
+    let mut base = tiny_config(32);
+    base.steps = 2;
+    base.width = 64;
+    base.height = 64;
+
+    let zero = pipeline
+        .run_hires(&HiresConfig {
+            base: base.clone(),
+            width: 128,
+            height: 128,
+            strength: Strength::new(0.0),
+            upscale: Upscale::LatentNearest,
+        })
+        .expect("strength 0");
+    let half = pipeline
+        .run_hires(&HiresConfig {
+            base,
+            width: 128,
+            height: 128,
+            strength: Strength::new(0.5),
+            upscale: Upscale::LatentNearest,
+        })
+        .expect("strength 0.5");
+
+    let a = zero.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = half.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_ne!(a, b, "the second pass did nothing at strength 0.5");
+}

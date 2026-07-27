@@ -114,6 +114,27 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f64,
 
+        /// Two-pass generation: compose at --width/--height, then add detail
+        /// at this size. `1024x1024`, or `1024` for a square.
+        ///
+        /// Not the same as generating big. A model composes at its training
+        /// resolution and duplicates subjects above it — two heads, two
+        /// horizons. Two passes avoid that.
+        #[arg(long, value_name = "WxH")]
+        hires: Option<String>,
+
+        /// How much of the schedule the second pass re-runs. 0.5-0.7 is usual.
+        #[arg(long, default_value_t = 0.55)]
+        hires_strength: f64,
+
+        /// How the first pass is enlarged: latent-nearest, latent-bilinear,
+        /// or pixel-lanczos.
+        ///
+        /// Nearest introduces no colours that were not already there, which
+        /// matters for anything with a fixed palette.
+        #[arg(long, default_value = "latent-nearest")]
+        hires_upscale: String,
+
         /// Textual-inversion embedding, triggered by its file stem. Repeatable.
         ///
         /// Kilobytes rather than gigabytes: the cheapest way to bring a style.
@@ -554,6 +575,33 @@ fn with_taesd(pipeline: Txt2ImgPipeline, path: Option<&str>) -> anyhow::Result<T
     }
 }
 
+/// `1024x768`, or `1024` for a square.
+fn parse_size(spec: &str) -> anyhow::Result<(usize, usize)> {
+    let (w, h) = match spec.split_once(['x', 'X']) {
+        Some((a, b)) => (a, b),
+        None => (spec, spec),
+    };
+    let parse = |v: &str| -> anyhow::Result<usize> {
+        v.trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("`{spec}` is not a size like 1024 or 1024x768"))
+    };
+    Ok((parse(w)?, parse(h)?))
+}
+
+fn parse_upscale(name: &str) -> anyhow::Result<sd::pipeline::Upscale> {
+    use sd::pipeline::Upscale;
+    match name {
+        "latent-nearest" => Ok(Upscale::LatentNearest),
+        "latent-bilinear" => Ok(Upscale::LatentBilinear),
+        "pixel-lanczos" => Ok(Upscale::PixelLanczos),
+        other => anyhow::bail!(
+            "unknown --hires-upscale `{other}`; expected latent-nearest, \
+             latent-bilinear or pixel-lanczos"
+        ),
+    }
+}
+
 fn parse_sampler(name: &str) -> Result<SamplerKind> {
     match name {
         "euler-a" | "euler_a" | "euler" => Ok(SamplerKind::EulerAncestral),
@@ -690,6 +738,9 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
+            hires,
+            hires_strength,
+            hires_upscale,
             embedding,
             ip_adapter,
             ip_image,
@@ -825,9 +876,30 @@ fn main() -> Result<()> {
                         None if pipeline.has_ip_adapter() => {
                             anyhow::bail!("--ip-adapter needs --ip-image")
                         }
-                        None => pipeline
-                            .run_with_progress(&cfg, &mut report)
-                            .context("running txt2img")?,
+                        None => match &hires {
+                            Some(spec) => {
+                                let (hw, hh) = parse_size(spec)?;
+                                tracing::info!(
+                                    from = format!("{}x{}", cfg.width, cfg.height),
+                                    to = format!("{hw}x{hh}"),
+                                    strength = hires_strength,
+                                    "hires"
+                                );
+                                let hcfg = sd::pipeline::HiresConfig {
+                                    base: cfg.clone(),
+                                    width: hw,
+                                    height: hh,
+                                    strength: Strength::new(hires_strength),
+                                    upscale: parse_upscale(&hires_upscale)?,
+                                };
+                                pipeline
+                                    .run_hires_with_progress(&hcfg, &mut report)
+                                    .context("running hires")?
+                            }
+                            None => pipeline
+                                .run_with_progress(&cfg, &mut report)
+                                .context("running txt2img")?,
+                        },
                     }
                 }
             };

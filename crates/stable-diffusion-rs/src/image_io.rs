@@ -132,6 +132,29 @@ pub fn load_rgb_unit_resized<P: AsRef<std::path::Path>>(
         .unsqueeze(0)
 }
 
+/// Resize a `[1, 3, h, w]` image in `[-1, 1]`, via Lanczos in pixel space.
+///
+/// Through 8-bit, which is worth knowing: the round trip quantises. That is
+/// acceptable here because the result is immediately re-encoded by a VAE whose
+/// own round trip loses more, and it keeps one resize implementation rather
+/// than two.
+pub fn resize_signed(image: &Tensor, width: u32, height: u32) -> Result<Tensor> {
+    let (w, h, bytes) = tensor_to_rgb8(image)?;
+    let buf = image::RgbImage::from_raw(w, h, bytes)
+        .ok_or_else(|| sd_tensor::Error::Msg("RGB buffer size mismatch".to_string()))?;
+    let resized =
+        image::imageops::resize(&buf, width, height, image::imageops::FilterType::Lanczos3);
+    let data: Vec<f32> = resized
+        .as_raw()
+        .iter()
+        .map(|&b| b as f32 / 127.5 - 1.0)
+        .collect();
+    Tensor::from_vec(data, (height as usize, width as usize, 3), image.device())?
+        .permute((2, 0, 1))?
+        .contiguous()?
+        .unsqueeze(0)
+}
+
 /// Composite `generated` over `original` where `mask` is 1, in pixel space.
 ///
 /// The last step of an inpaint, and not cosmetic. Blending in latent space
