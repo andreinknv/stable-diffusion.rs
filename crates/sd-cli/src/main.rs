@@ -105,6 +105,14 @@ enum Command {
         /// Treat the model directory as SDXL (two text encoders).
         #[arg(long)]
         sdxl: bool,
+
+        /// LoRA adapter to merge into the UNet. SD 1.5 only for now.
+        #[arg(long)]
+        lora: Option<String>,
+
+        /// LoRA strength. 0 is identical to not passing --lora.
+        #[arg(long, default_value_t = 1.0)]
+        lora_scale: f64,
     },
 
     /// Generate an image from a text prompt and an existing image.
@@ -298,6 +306,8 @@ fn main() -> Result<()> {
             sampler,
             output,
             sdxl,
+            lora,
+            lora_scale,
         } => {
             let cfg = Txt2ImgConfig {
                 prompt,
@@ -340,8 +350,20 @@ fn main() -> Result<()> {
                 }
                 (None, false) => {
                     let m = model.as_deref().context("--model or --gguf is required")?;
-                    let pipeline = Txt2ImgPipeline::load(Path::new(m), &dev)
-                        .with_context(|| format!("loading pipeline from {m}"))?;
+                    let pipeline = match lora.as_deref() {
+                        Some(l) => {
+                            tracing::info!(lora = %l, scale = lora_scale, "merging LoRA");
+                            Txt2ImgPipeline::load_with_lora(
+                                Path::new(m),
+                                &dev,
+                                Path::new(l),
+                                lora_scale,
+                            )
+                            .with_context(|| format!("loading {m} with LoRA {l}"))?
+                        }
+                        None => Txt2ImgPipeline::load(Path::new(m), &dev)
+                            .with_context(|| format!("loading pipeline from {m}"))?,
+                    };
                     pipeline
                         .run_with_progress(&cfg, &mut report)
                         .context("running txt2img")?

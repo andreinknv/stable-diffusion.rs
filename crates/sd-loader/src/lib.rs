@@ -14,6 +14,7 @@
 pub mod flux_gguf;
 pub mod gguf;
 pub mod ldm;
+pub mod lora;
 pub mod t5_gguf;
 
 pub use flux_gguf::{
@@ -23,6 +24,7 @@ pub use gguf::{
     clip_var_builder_from_gguf, gguf_var_builder, unet_var_builder_from_gguf,
     vae_var_builder_from_gguf, GgufInfo, Layout,
 };
+pub use lora::{Applied as LoraApplied, Lora};
 pub use t5_gguf::{t5_key, t5_qtensors_from_gguf, t5_var_builder_from_gguf};
 
 use std::path::{Path, PathBuf};
@@ -144,6 +146,36 @@ pub fn resident_bytes<P: AsRef<Path>>(paths: &[P], dtype: DType) -> Result<u64> 
 ///
 /// Uses `mmap`. The caller must not modify the files while the returned
 /// `VarBuilder` is alive.
+/// A `VarBuilder` over safetensors with a LoRA already merged in.
+///
+/// Separate from [`safetensors_var_builder`] because it cannot mmap: merging
+/// rewrites the weights, so they have to be materialised. That costs full
+/// dense residency — 4.26 GB for SD 1.5 at f32 — which is the price of the
+/// adapter and is why the plain path is left alone.
+///
+/// Returns what was merged so the caller can refuse a partial application
+/// rather than render with one. See [`lora::Applied`].
+pub fn safetensors_var_builder_with_lora<'a, P: AsRef<Path>>(
+    paths: &[P],
+    dtype: DType,
+    device: &Device,
+    lora: &lora::Lora,
+    multiplier: f64,
+) -> Result<(VarBuilder<'a>, lora::Applied)> {
+    let mut tensors = std::collections::HashMap::new();
+    for p in paths {
+        let p = p.as_ref();
+        if !p.exists() {
+            return Err(LoadError::NotFound(p.to_path_buf()));
+        }
+        for (name, tensor) in sd_tensor::safetensors::load(p, device)? {
+            tensors.insert(name, tensor.to_dtype(dtype)?);
+        }
+    }
+    let applied = lora.merge_into(&mut tensors, multiplier)?;
+    Ok((VarBuilder::from_tensors(tensors, dtype, device), applied))
+}
+
 pub fn safetensors_var_builder<'a, P: AsRef<Path>>(
     paths: &[P],
     dtype: DType,

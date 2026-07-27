@@ -75,6 +75,15 @@ pub enum PipelineError {
     Tokenize(#[from] sd_models::clip::TokenizeError),
     #[error("loading weights: {0}")]
     Load(#[from] sd_loader::LoadError),
+    #[error(
+        "the LoRA does not match this model: {unmatched} of its layers have no weight here, \
+         first `{first}`.\n\n\
+         A LoRA names the layers it corrects, so entries with nowhere to go mean it was \
+         trained for a different architecture — an SDXL adapter on SD 1.5, say. Applying \
+         the rest would render a plausible image that is not the one the adapter describes, \
+         which nothing downstream can detect, so it is refused here instead."
+    )]
+    LoraMismatch { unmatched: usize, first: String },
     #[error("tensor: {0}")]
     Tensor(#[from] sd_tensor::Error),
 }
@@ -177,8 +186,37 @@ pub fn sigma_to_timestep(schedule: &Schedule, sigma: f64) -> f64 {
 }
 
 impl Txt2ImgPipeline {
+    /// Load with a LoRA merged into the UNet.
+    ///
+    /// `multiplier` is the adapter's strength; 0 reproduces [`Self::load`]
+    /// exactly, bit for bit.
+    ///
+    /// **A partially-applied adapter is refused rather than rendered.** If any
+    /// of the LoRA's entries finds no weight in this UNet, the adapter is for
+    /// a different architecture — or the name mapping missed — and the result
+    /// would be a plausible image that is not the one the adapter describes.
+    /// That is the failure worth erroring on, because nothing downstream can
+    /// detect it.
+    pub fn load_with_lora(
+        model_dir: &Path,
+        device: &Device,
+        lora_path: &Path,
+        multiplier: f64,
+    ) -> Result<Self, PipelineError> {
+        let lora = sd_loader::Lora::load(lora_path, device)?;
+        Self::load_inner(model_dir, device, Some((&lora, multiplier)))
+    }
+
     /// Load from the standard diffusers directory layout.
     pub fn load(model_dir: &Path, device: &Device) -> Result<Self, PipelineError> {
+        Self::load_inner(model_dir, device, None)
+    }
+
+    fn load_inner(
+        model_dir: &Path,
+        device: &Device,
+        lora: Option<(&sd_loader::Lora, f64)>,
+    ) -> Result<Self, PipelineError> {
         let tokenizer_path = model_dir.join("tokenizer/tokenizer.json");
         if !tokenizer_path.exists() {
             // Its own variant: this one is missing from a *correct* SD 1.5
@@ -209,7 +247,28 @@ impl Txt2ImgPipeline {
         let vb = sd_loader::safetensors_var_builder(&[&text_encoder_path], DType::F32, device)?;
         let text_encoder = ClipTextEncoder::new(&ClipTextConfig::sd15(), vb)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&unet_path], DType::F32, device)?;
+        let vb = match lora {
+            None => sd_loader::safetensors_var_builder(&[&unet_path], DType::F32, device)?,
+            Some((lora, multiplier)) => {
+                let (vb, applied) = sd_loader::safetensors_var_builder_with_lora(
+                    &[&unet_path],
+                    DType::F32,
+                    device,
+                    lora,
+                    multiplier,
+                )?;
+                if !applied.unmatched.is_empty() {
+                    return Err(PipelineError::LoraMismatch {
+                        unmatched: applied.unmatched.len(),
+                        first: applied.unmatched[0].clone(),
+                    });
+                }
+                // No log line: this crate deliberately has no logging
+                // dependency (see `ProgressFn`). The count is on `Applied` for
+                // a caller that wants to report it.
+                vb
+            }
+        };
         let unet = UNet2DConditionModel::new(&UNetConfig::sd15(), vb)?;
 
         let vb = sd_loader::safetensors_var_builder(&[&vae_path], DType::F32, device)?;

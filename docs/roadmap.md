@@ -141,7 +141,8 @@ Remaining milestone 2 work:
 ## Milestone 3 — breadth
 
 SD 2.x · SD 3 · Flux (schnell, dev) · ControlNet · LoRA · TAESD ·
-ESRGAN upscaling · inpainting  —  ✅ Flux (flux-mini), ✅ T5 text encoder
+ESRGAN upscaling · inpainting  —  ✅ Flux (flux-mini), ✅ T5 text encoder,
+✅ LoRA (SD 1.5 dense path)
 
 This is the phase that took upstream years, and it parallelizes well: each
 architecture is independent and verifiable against its own golden data.
