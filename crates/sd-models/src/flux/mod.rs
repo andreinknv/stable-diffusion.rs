@@ -590,6 +590,10 @@ enum Blocks {
     /// profile hook is for.
     Streamed {
         weights: QuantizedWeights,
+        /// Biases and norm scales, dequantised once and kept on the device.
+        /// 127 MB against the weights' 6.66 GB, and the difference between a
+        /// block rebuild costing a dozen device operations and costing none.
+        dense: crate::weights::DenseCache,
         device: sd_tensor::Device,
     },
 }
@@ -636,11 +640,14 @@ impl FluxTransformer {
                 );
             }
         }
+        let dense =
+            crate::weights::dense_cache(weights, &["double_blocks.", "single_blocks."], device)?;
         Self::from_source_with_blocks(
             cfg,
             Source::Quantized(&resident),
             Blocks::Streamed {
                 weights: weights.clone(),
+                dense,
                 device: device.clone(),
             },
         )
@@ -770,19 +777,27 @@ impl FluxTransformer {
                     txt = t;
                 }
             }
-            Blocks::Streamed { weights, device } => {
+            Blocks::Streamed {
+                weights,
+                dense,
+                device,
+            } => {
                 // `SD_STREAM_PROFILE=1` splits a streamed step three ways. It
                 // is here because the split is not what anyone guesses: the
                 // copy is the small part. See `Blocks::Streamed`.
                 let dbg = std::env::var("SD_STREAM_PROFILE").is_ok();
+                let sync_every = crate::weights::stream_sync_every();
                 let (mut t_copy, mut t_build, mut t_run) = (0.0f64, 0.0f64, 0.0f64);
                 for i in 0..self.cfg.depth {
                     let path = format!("double_blocks.{i}");
                     let t0 = std::time::Instant::now();
                     let resident = crate::weights::block_weights(weights, &path, device)?;
                     let t1 = std::time::Instant::now();
-                    let block =
-                        DoubleStreamBlock::new(&self.cfg, Source::Quantized(&resident), &path)?;
+                    let block = DoubleStreamBlock::new(
+                        &self.cfg,
+                        Source::QuantizedCached(&resident, dense),
+                        &path,
+                    )?;
                     let t2 = std::time::Instant::now();
                     t_copy += (t1 - t0).as_secs_f64();
                     t_build += (t2 - t1).as_secs_f64();
@@ -790,10 +805,20 @@ impl FluxTransformer {
                     t_run += t2.elapsed().as_secs_f64();
                     img = a;
                     txt = t;
-                    // `block` and `resident` drop here, releasing the device
-                    // copy before the next one is made — which is the whole
-                    // point, so it is worth not moving this line.
+                    // Release this block's device memory before making the
+                    // next copy. Dropping is not enough on Metal: candle
+                    // pools its buffers and only hands them back inside
+                    // `drop_unused_buffers`, which runs on synchronise. Without
+                    // this the pool grows by a block per iteration — measured
+                    // going from 354 ms of copy per step to 62 seconds as the
+                    // machine started swapping.
+                    drop(block);
+                    drop(resident);
+                    if (i + 1) % sync_every == 0 {
+                        device.synchronize()?;
+                    }
                 }
+                device.synchronize()?;
                 if dbg {
                     eprintln!(
                         "  [stream] double: copy {:.0} ms, build {:.0} ms, run {:.0} ms",
@@ -815,13 +840,23 @@ impl FluxTransformer {
                     xs = block.forward(&xs, &vec, &pe)?;
                 }
             }
-            Blocks::Streamed { weights, device } => {
+            Blocks::Streamed {
+                weights,
+                dense,
+                device,
+            } => {
                 for i in 0..self.cfg.depth_single_blocks {
                     let path = format!("single_blocks.{i}");
                     let resident = crate::weights::block_weights(weights, &path, device)?;
-                    let block =
-                        SingleStreamBlock::new(&self.cfg, Source::Quantized(&resident), &path)?;
+                    let block = SingleStreamBlock::new(
+                        &self.cfg,
+                        Source::QuantizedCached(&resident, dense),
+                        &path,
+                    )?;
                     xs = block.forward(&xs, &vec, &pe)?;
+                    drop(block);
+                    drop(resident);
+                    device.synchronize()?;
                 }
             }
         }

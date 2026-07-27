@@ -375,6 +375,9 @@ enum Blocks {
     /// See `flux::Blocks::Streamed` for the measurements behind this.
     Streamed {
         weights: QuantizedWeights,
+        /// Biases and norm scales, dequantised once onto the device. See
+        /// `flux::Blocks::Streamed`.
+        dense: crate::weights::DenseCache,
         device: sd_tensor::Device,
     },
 }
@@ -425,11 +428,13 @@ impl Sd3Transformer {
                 );
             }
         }
+        let dense = crate::weights::dense_cache(weights, &["joint_blocks."], device)?;
         Self::from_source_with_blocks(
             cfg,
             Source::Quantized(&resident),
             Blocks::Streamed {
                 weights: weights.clone(),
+                dense,
                 device: device.clone(),
             },
         )
@@ -598,11 +603,21 @@ impl Sd3Transformer {
                     xs = x;
                 }
             }
-            Blocks::Streamed { weights, device } => {
+            Blocks::Streamed {
+                weights,
+                dense,
+                device,
+            } => {
+                let sync_every = crate::weights::stream_sync_every();
                 for i in 0..self.cfg.depth {
                     let path = format!("joint_blocks.{i}");
                     let resident = crate::weights::block_weights(weights, &path, device)?;
-                    let block = JointBlock::new(&self.cfg, i, Source::Quantized(&resident), &path)?;
+                    let block = JointBlock::new(
+                        &self.cfg,
+                        i,
+                        Source::QuantizedCached(&resident, dense),
+                        &path,
+                    )?;
                     let (ctx, x) = block.forward(
                         context.as_ref().expect("only the last block drops context"),
                         &xs,
@@ -610,9 +625,17 @@ impl Sd3Transformer {
                     )?;
                     context = ctx;
                     xs = x;
-                    // `block` and `resident` drop here, freeing the device copy
-                    // before the next is made. That is the whole mechanism.
+                    // Release before the next copy. See the note in
+                    // `flux::FluxTransformer::forward`: dropping alone frees
+                    // nothing on Metal, because candle returns pooled buffers
+                    // only on synchronise.
+                    drop(block);
+                    drop(resident);
+                    if (i + 1) % sync_every == 0 {
+                        device.synchronize()?;
+                    }
                 }
+                device.synchronize()?;
             }
         }
 

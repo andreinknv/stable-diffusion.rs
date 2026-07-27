@@ -76,13 +76,32 @@ compute device as it is reached, releasing it after — `stable-diffusion.cpp`'s
 `--offload-to-cpu`, and the answer for a GPU too small to hold the model at
 all, where no static placement helps. Flux only, so far.
 
-Measured, and the images are **bit-identical** either way — the copy moves
-quantised block bytes verbatim, so nothing is rounded twice:
+Output is **bit-identical** to the resident path — the copy moves quantised
+block bytes verbatim, so nothing is rounded twice.
 
-| model | resident | streamed | device memory freed |
-|---|---|---|---|
-| Flux schnell 512, 4 steps | 21.0 s | 25.1 s (+19.5%) | 2.4 GB |
-| SD 3.5 medium 512, 20 steps | 24.4 s | 29.0 s (+18.9%) | 1.6 GB |
+**How much it costs depends on how tightly you want the memory held**, and
+that is a real dial rather than a tuning detail. Dropping a block frees
+nothing on Metal by itself: candle pools its buffers and returns them only
+inside `drop_unused_buffers`, which runs on synchronise. So the interval
+between synchronises *is* the peak residency. On Flux schnell, 512, 4 steps,
+against 20.9 s resident:
+
+```text
+  sync every  1    29.5 s    ~1 block resident   (191 MB)   default
+  sync every  4    26.6 s
+  sync every  8    25.2 s
+  sync every 19    25.3 s    whole stack pools   (3.6 GB)
+```
+
+`SD_STREAM_SYNC_EVERY` sets it. The default is 1 because the reason to stream
+is the memory.
+
+**An earlier version of this note claimed 25.1 s and "2.4 GB freed" — that was
+measured before the synchronise existed**, so the pool was growing and the run
+was not holding the memory it claimed. Two lessons: leaving the synchronise
+out is not merely untidy — with no release at all a 25 s run degraded past
+60 s *per step* as the machine started swapping; and a memory claim measured
+without checking when memory is actually returned is not a measurement.
 
 `quantized::to_device` is the primitive; `FluxTransformer::resident_bytes`
 reports 0 for streamed blocks, because saying otherwise would report the
@@ -114,33 +133,25 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. Cache the dequantised biases in the streamed path
+### 1. Overlap the block copy with compute
 
-Streaming costs about +19%, and the profile says the obvious fix is the wrong
-one. Per step over Flux's 19 double blocks (`SD_STREAM_PROFILE=1`):
+Now worth doing, and only now. The streamed step used to divide as copy
+354 ms / build 1019 ms / run 244 ms, so prefetching the copy would have hidden
+the smallest third. `Source::QuantizedCached` removed the build entirely —
+**1019 ms to 0** — by dequantising the biases and norm scales once instead of
+per block, and the split is now copy ~220 ms against run ~225 ms.
 
-```text
-  copy   354 ms      build  1019 ms      run  244 ms
-```
+So copy and compute are finally the same size, which is exactly when
+overlapping them pays: it should hide most of the copy.
+`stable-diffusion.cpp` does this as `stream_layers`.
 
-**Rebuilding the block costs three times the copy and four times the
-arithmetic.** It is GPU-call overhead rather than bytes: `QMatMul::from_arc`
-dequantises any F32/F16 tensor it is handed, and `Source::linear` dequantises
-every bias, so each block build issues roughly a dozen small device
-operations. 468 of this checkpoint's 776 tensors are F32 biases and norm
-scales.
+The obstacle is that the copy must finish before the block that needs it runs,
+while the *release* of the previous block must not outrun the compute still
+using it — and on Metal the release only happens on synchronise. A prefetch
+thread and `SD_STREAM_SYNC_EVERY` are pulling on the same string; work out
+that interaction before writing the thread.
 
-Those are tiny and constant across steps, so they should be dequantised once
-onto the device and reused, leaving only the quantised weight matrices to
-stream. That needs `Source` to be able to supply an already-dequantised bias,
-which is the actual design question — `Source::Quantized` currently owns that
-decision and always dequantises.
-
-**Prefetch was the plan and the profile killed it**: overlapping the copy with
-compute would hide 354 ms of a 1617 ms step, the smallest of the three. Worth
-doing after the build cost is gone, not before.
-
-### 2. Extend streaming past Flux, and measure it on a discrete GPU
+### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
 
 `Residency::Streamed` works for **Flux and SD 3.5**, both quantised. Gaps, in
 the order they matter:
