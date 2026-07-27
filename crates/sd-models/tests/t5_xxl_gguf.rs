@@ -37,6 +37,18 @@ fn t5_xxl_loads_from_gguf_and_encodes() {
     }
 
     let dev = Device::Cpu;
+    // F16 deliberately, and it is the one thing in this workspace that a
+    // build with `--features accelerate` cannot run: candle's Accelerate
+    // backend has no f16 matmul and bails rather than falling back. Skipping
+    // is the honest outcome — the mapping this verifies is dtype-independent,
+    // and the alternative is either a false failure or loading 18.8 GB at f32.
+    if cfg!(feature = "accelerate") {
+        eprintln!(
+            "SKIP t5_xxl_loads_from_gguf_and_encodes: this loads F16, and candle's \
+             Accelerate CPU backend has no f16 matmul. Run it without the feature."
+        );
+        return;
+    }
     let vb = match sd_loader::t5_var_builder_from_gguf(&path, DType::F16, &dev) {
         Ok(vb) => vb,
         Err(e) => {

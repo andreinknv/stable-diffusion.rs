@@ -509,6 +509,14 @@ clearly available twice:
   already does. A reproducer is four lines: quantise any weight, `narrow` an
   activation off dim 0, and compare against `force_contiguous()` of the same
   view. `--example metal_check` contains it.
+- **candle: implement f16 matmul in the Accelerate CPU backend.** Today it
+  bails outright (`cpu_backend/mod.rs:1497`), which means `--features
+  accelerate` — worth 1.7-1.9x on CPU — cannot be used with any f16 model.
+  `Linear` and `Conv2d` reach the same path, so it is not a niche gap: an SDXL
+  run dies on its first convolution. The fix is to convert per gemm tile to
+  f32 and call `cblas_sgemm`; converting whole tensors instead defeats the
+  point, which is why this cannot be worked around downstream. Reproducer:
+  `matmul` two f16 CPU tensors with the feature enabled.
 - **candle: drop the `onig` C dependency.** One-line feature swap, verified to
   build and pass every test. See [native-deps.md](native-deps.md). Better
   still: make `tokenizers` optional in `candle-core` and feature-gate

@@ -31,7 +31,25 @@ const TOKENIZER_2_PAD: &str = "!";
 /// on the GPU — 13.9 GB for this model, 10.3 GB of it the UNet — which does
 /// not leave room for a decode on a 36 GiB machine. Holding them in f16
 /// roughly halves that, and is what every other implementation does.
-const MODEL_DTYPE: DType = DType::F16;
+///
+/// **Except on a CPU built with Accelerate, where f16 does not work at all.**
+/// candle's Accelerate backend has no f16 matmul — it bails outright, and not
+/// only in `matmul`: `Linear` and `Conv2d` reach it internally, so an SDXL run
+/// dies on the first convolution. Nothing in this workspace can paper over
+/// that, because the fix has to convert per gemm tile to be worth anything;
+/// converting whole weights per call costs more than Accelerate saves, and
+/// converting them once *is* f32. See `sd-tensor/Cargo.toml`.
+///
+/// So this build trades the memory back for the 1.7-1.9x: 13.9 GB resident on
+/// a machine that has RAM to spare, rather than a run that fails. The GPU path
+/// is untouched, and a build without the feature keeps f16 everywhere.
+fn model_dtype(device: &Device) -> DType {
+    if cfg!(feature = "accelerate") && device.is_cpu() {
+        DType::F32
+    } else {
+        DType::F16
+    }
+}
 
 /// Dtype for the VAE, and for the sampler's own arithmetic.
 ///
@@ -89,8 +107,9 @@ impl SdxlPipeline {
         // — 6.9 GB of files here — and they stay resident for the entire run,
         // so checking a single activation against a fixed ceiling would never
         // have caught the case that mattered.
-        let weights = sd_loader::resident_bytes(&[&te_path, &te2_path, &unet_path], MODEL_DTYPE)?
-            .saturating_add(sd_loader::resident_bytes(&[&vae_path], VAE_DTYPE)?);
+        let weights =
+            sd_loader::resident_bytes(&[&te_path, &te2_path, &unet_path], model_dtype(device))?
+                .saturating_add(sd_loader::resident_bytes(&[&vae_path], VAE_DTYPE)?);
         // Plus the largest single allocation a decode will make. Tiling keeps
         // this to one tile — the *active* tile, since lowering it is exactly
         // how a caller makes a decode fit, and projecting the default here
@@ -107,13 +126,13 @@ impl SdxlPipeline {
         let tokenizer = ClipTokenizer::from_file(&tok_path)?;
         let tokenizer_2 = ClipTokenizer::from_file(&tok2_path)?.with_pad_token(TOKENIZER_2_PAD)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&te_path], MODEL_DTYPE, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&te_path], model_dtype(device), device)?;
         let text_encoder = ClipTextEncoder::new(&ClipTextConfig::sdxl_1(), vb)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&te2_path], MODEL_DTYPE, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&te2_path], model_dtype(device), device)?;
         let text_encoder_2 = ClipTextEncoder::new(&ClipTextConfig::sdxl_2(), vb)?;
 
-        let vb = sd_loader::safetensors_var_builder(&[&unet_path], MODEL_DTYPE, device)?;
+        let vb = sd_loader::safetensors_var_builder(&[&unet_path], model_dtype(device), device)?;
         let unet = UNet2DConditionModel::new(&UNetConfig::sdxl(), vb)?;
 
         let vb = sd_loader::safetensors_var_builder(&[&vae_path], VAE_DTYPE, device)?;
