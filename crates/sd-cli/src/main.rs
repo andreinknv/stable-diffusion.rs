@@ -114,6 +114,14 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f64,
 
+        /// Textual-inversion embedding, triggered by its file stem. Repeatable.
+        ///
+        /// Kilobytes rather than gigabytes: the cheapest way to bring a style.
+        /// `--embedding styles/mystyle.safetensors` makes `mystyle` a prompt
+        /// word.
+        #[arg(long)]
+        embedding: Vec<String>,
+
         /// Condition on a reference image (IP-Adapter). Path to
         /// `ip-adapter_sd15.safetensors`.
         ///
@@ -682,6 +690,7 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
+            embedding,
             ip_adapter,
             ip_image,
             image_encoder,
@@ -786,6 +795,11 @@ fn main() -> Result<()> {
                         },
                     };
                     let pipeline = with_taesd(pipeline, taesd.as_deref())?;
+                    let pipeline = embedding.iter().try_fold(pipeline, |p, e| {
+                        tracing::info!(embedding = %e, "textual inversion");
+                        p.with_embedding(Path::new(e))
+                            .with_context(|| format!("loading embedding {e}"))
+                    })?;
                     let mut report = previewing(&pipeline, preview_every, &output);
                     match ip_image.as_deref() {
                         Some(path) if pipeline.has_ip_adapter() => {

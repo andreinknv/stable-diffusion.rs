@@ -341,10 +341,28 @@ impl ClipTextEncoder {
     /// reference, the per-layer outputs say *which* layer diverged first,
     /// which localizes the bug far better than a single final number.
     pub fn forward_with_layers(&self, token_ids: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        self.forward_embeds(&self.embed_tokens(token_ids)?)
+    }
+
+    /// Look up token embeddings without running the transformer.
+    ///
+    /// Split out so a caller can *replace* rows before encoding, which is what
+    /// textual inversion needs: a learned embedding has no token id, so it
+    /// cannot be looked up — it is spliced in at the position its trigger word
+    /// occupied.
+    pub fn embed_tokens(&self, token_ids: &Tensor) -> Result<Tensor> {
         // The reference stores ids as int64; embedding lookup wants U32.
         let token_ids = token_ids.to_dtype(DType::U32)?;
+        self.token_embedding.forward(&token_ids)
+    }
 
-        let xs = self.token_embedding.forward(&token_ids)?;
+    /// The transformer, from embeddings rather than ids.
+    ///
+    /// Position embeddings are added *here*, not in [`Self::embed_tokens`], so
+    /// splicing happens before them — a learned vector occupies a position in
+    /// the sequence like any other token and must be positioned accordingly.
+    pub fn forward_embeds(&self, embeds: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        let xs = embeds.to_dtype(self.dtype)?;
         let pos = self.position_embedding.forward(&self.positions)?;
         let mut xs = xs.broadcast_add(&pos)?;
 

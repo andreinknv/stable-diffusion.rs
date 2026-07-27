@@ -140,6 +140,24 @@ impl ClipTokenizer {
         Ok(encoding.get_ids().len().saturating_sub(2))
     }
 
+    /// The content token ids for a string, without BOS, EOS or padding.
+    ///
+    /// For finding where a word landed in an encoded prompt — BPE splits are
+    /// not character positions, so a substring search on the text cannot say.
+    pub fn encode_content(&self, text: &str) -> Result<Vec<u32>, TokenizeError> {
+        let encoding = self
+            .inner
+            .encode(text, true)
+            .map_err(|e| TokenizeError::Encode(e.to_string()))?;
+        let ids = encoding.get_ids();
+        Ok(ids
+            .iter()
+            .copied()
+            .skip(1)
+            .take(ids.len().saturating_sub(2))
+            .collect())
+    }
+
     /// Content tokens that fit before truncation: `max_length - 2`.
     pub fn content_capacity(&self) -> usize {
         self.max_length.saturating_sub(2)

@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 306 tests, all gates green
+table is in [roadmap.md](roadmap.md). 311 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,31 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**Textual inversion works**, `--embedding <file>` (repeatable), triggered by
+the file stem. Kilobytes against a checkpoint's gigabytes, which is the whole
+point of it.
+
+**A learned embedding has no token id**, so it is *spliced*, not looked up.
+The trigger is tokenised like any other word — all it does is reserve
+positions — and after the embedding lookup those rows are overwritten with the
+learned vectors. Multi-vector embeddings expand the trigger to as many copies
+as they have vectors, so a short trigger cannot silently drop the tail.
+
+That needed `embed_tokens` and `forward_embeds` split apart on the text
+encoder, with the splice landing *between* them: position embeddings are added
+after, because a learned vector occupies a position like any other token.
+
+Three tests, and each catches something the others do not: a prompt naming the
+trigger must differ from the same prompt without the embedding loaded; a
+prompt *not* naming it must be **bit-identical**, which is what fails if the
+splice writes to arbitrary positions; and a wrong-width embedding is refused,
+since SD 2.x's 1024 in an SD 1.5 prompt would otherwise be a shape error from
+inside the transformer.
+
+Three file layouts are accepted (`emb_params`, `string_to_param.*`, and a bare
+single-tensor file) because a user downloading one has no reason to know which
+tool wrote it.
 
 **IP-Adapter works**, `sdrs txt2img --ip-adapter <ckpt> --image-encoder <dir>
 --ip-image <img>`, verified against diffusers at **2.267e-6** through the whole

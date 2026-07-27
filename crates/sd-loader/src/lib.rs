@@ -11,6 +11,8 @@
 //! equivalent C++ parsers have a CVE history. Keep `unsafe` confined to the
 //! mmap call below and justify any addition.
 
+pub mod embedding;
+
 pub mod flux_gguf;
 pub mod gguf;
 pub mod ldm;

@@ -206,6 +206,17 @@ pub enum PipelineError {
          attached after the fact."
     )]
     NoIpAdapter,
+    #[error(
+        "the embedding `{name}` is {got} wide but this text encoder is {want}.\n\n\
+         Embeddings are trained against one encoder: 768 for SD 1.5, 1024 for SD 2.x, \
+         and SDXL's are a pair. Using the wrong one is the common mistake and would \
+         otherwise surface as a shape error from inside the transformer."
+    )]
+    EmbeddingWidth {
+        name: String,
+        got: usize,
+        want: usize,
+    },
     #[error("cancelled after {completed} of {total} steps")]
     Cancelled { completed: usize, total: usize },
     #[error("tensor: {0}")]
@@ -356,6 +367,8 @@ pub struct Txt2ImgPipeline {
     controlnets: Vec<ControlNet>,
     /// What the UNet's output means. See [`Prediction`].
     prediction: Prediction,
+    /// Textual-inversion embeddings, spliced into prompts by trigger word.
+    embeddings: Vec<sd_loader::embedding::Embedding>,
     /// The image tower and projection, when an IP-Adapter is attached. The
     /// adapter's own weights live inside the UNet.
     ip: Option<(ClipVisionEncoder, ImageProjModel)>,
@@ -599,6 +612,7 @@ impl Txt2ImgPipeline {
             device: device.clone(),
             controlnets: Vec::new(),
             prediction,
+            embeddings: Vec::new(),
             ip: None,
         })
     }
@@ -661,6 +675,7 @@ impl Txt2ImgPipeline {
             device: device.clone(),
             controlnets: Vec::new(),
             prediction: Prediction::Epsilon,
+            embeddings: Vec::new(),
             ip: None,
         })
     }
@@ -823,9 +838,75 @@ impl Txt2ImgPipeline {
 
     /// Encode a prompt to `[1, 77, 768]`.
     fn encode(&self, text: &str) -> Result<Tensor, PipelineError> {
-        let ids = self.tokenizer.encode(text)?;
-        let ids = Tensor::from_vec(ids, (1, self.tokenizer.max_length()), &self.device)?;
-        Ok(self.text_encoder.forward(&ids)?)
+        if self.embeddings.is_empty() {
+            let ids = self.tokenizer.encode(text)?;
+            let ids = Tensor::from_vec(ids, (1, self.tokenizer.max_length()), &self.device)?;
+            return Ok(self.text_encoder.forward(&ids)?);
+        }
+        self.encode_with_embeddings(text)
+    }
+
+    /// [`Self::encode`] with textual-inversion triggers spliced in.
+    ///
+    /// The trigger is tokenised like any other word, and the *first* `n`
+    /// positions it occupies are overwritten with the learned vectors. That
+    /// works because the trigger only ever needs to reserve space — its own
+    /// token embeddings are discarded — and because reserving is all a word
+    /// with no vocabulary entry can do.
+    ///
+    /// A trigger that tokenises to fewer positions than the embedding has
+    /// vectors is padded by repeating it in the prompt text, so the count is
+    /// checked rather than assumed: a short trigger would otherwise silently
+    /// drop the tail of a multi-vector embedding.
+    fn encode_with_embeddings(&self, text: &str) -> Result<Tensor, PipelineError> {
+        // Expand each trigger to as many copies as it has vectors, so it
+        // reserves the right number of positions.
+        let mut expanded = text.to_string();
+        for emb in &self.embeddings {
+            if emb.len() > 1 {
+                let repeated = std::iter::repeat_n(emb.name.as_str(), emb.len())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                expanded = expanded.replace(&emb.name, &repeated);
+            }
+        }
+
+        let ids = self.tokenizer.encode(&expanded)?;
+        let ids = Tensor::from_vec(ids.clone(), (1, self.tokenizer.max_length()), &self.device)?;
+        let mut embeds = self.text_encoder.embed_tokens(&ids)?;
+
+        // Where each trigger's first token landed. Recomputed from the ids
+        // rather than from character offsets: BPE splits are not positions in
+        // the string.
+        for emb in &self.embeddings {
+            let trigger_ids = self.tokenizer.encode_content(&emb.name)?;
+            if trigger_ids.is_empty() {
+                continue;
+            }
+            let width = embeds.dim(2)?;
+            if emb.width() != width {
+                return Err(PipelineError::EmbeddingWidth {
+                    name: emb.name.clone(),
+                    got: emb.width(),
+                    want: width,
+                });
+            }
+            let flat: Vec<u32> = ids.flatten_all()?.to_vec1::<u32>()?;
+            let mut placed = 0usize;
+            let mut i = 0usize;
+            while i + trigger_ids.len() <= flat.len() && placed < emb.len() {
+                if flat[i..i + trigger_ids.len()] == trigger_ids[..] {
+                    let vector = emb.vectors.narrow(0, placed, 1)?.unsqueeze(0)?;
+                    embeds = embeds.slice_assign(&[0..1, i..i + 1, 0..width], &vector)?;
+                    placed += 1;
+                    i += trigger_ids.len();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        Ok(self.text_encoder.forward_embeds(&embeds)?.0)
     }
 
     /// Generate. Returns `[1, 3, height, width]` in `[-1, 1]`.
@@ -868,6 +949,27 @@ impl Txt2ImgPipeline {
         let proj = ImageProjModel::new(1024, 768, NUM_TOKENS, ip_vb.pp("image_proj"))?;
         pipeline.ip = Some((vision, proj));
         Ok(pipeline)
+    }
+
+    /// Add a textual-inversion embedding, triggered by its file stem.
+    ///
+    /// Kilobytes against a checkpoint's gigabytes, which is the point. The
+    /// trigger is the file name without its extension, because that is what
+    /// every tool that writes these uses and what a user will have been told
+    /// to type.
+    pub fn with_embedding(mut self, path: impl AsRef<Path>) -> Result<Self, PipelineError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(PipelineError::MissingFile(path.to_path_buf()));
+        }
+        let emb = sd_loader::embedding::Embedding::load(path, &self.device)?;
+        self.embeddings.push(emb);
+        Ok(self)
+    }
+
+    /// Trigger words currently registered.
+    pub fn embedding_names(&self) -> Vec<&str> {
+        self.embeddings.iter().map(|e| e.name.as_str()).collect()
     }
 
     /// Whether an IP-Adapter is attached.

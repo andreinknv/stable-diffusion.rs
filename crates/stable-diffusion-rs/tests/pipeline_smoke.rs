@@ -13,6 +13,18 @@ use stable_diffusion_rs::sample::{sigmas_for_steps, Schedule};
 use stable_diffusion_rs::tensor::rng::SeededRng;
 use stable_diffusion_rs::tensor::{DType, Device, Tensor};
 
+/// Serialises tests that load a pipeline.
+///
+/// Each one is about 6 GB resident, and `cargo test` runs the file's tests in
+/// parallel — enough of them at once got the binary SIGKILLed by the OS. The
+/// pure tests still run concurrently; only the heavy ones queue.
+fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock here means another test panicked while holding it, which
+    // is not a reason to fail every later test as well.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn config_defaults_are_sane() {
     let cfg = Txt2ImgConfig::default();
@@ -96,6 +108,7 @@ fn different_seeds_give_different_latents() {
 
 #[test]
 fn end_to_end_produces_finite_image_in_range() {
+    let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
         eprintln!(
             "SKIP end_to_end_produces_finite_image_in_range: set SD_TEST_MODEL_DIR \
@@ -143,6 +156,7 @@ fn end_to_end_produces_finite_image_in_range() {
 
 #[test]
 fn strength_selects_where_in_the_schedule_to_start() {
+    let _heavy = heavy();
     use stable_diffusion_rs::pipeline::Strength;
 
     // 1.0 replaces everything: start at 0 and run all 20 steps, which is the
@@ -193,6 +207,7 @@ fn strength_maps_to_the_number_of_steps_actually_run() {
 
 #[test]
 fn img2img_round_trips_an_image_through_the_encoder() {
+    let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
         eprintln!("SKIP img2img_round_trips_an_image_through_the_encoder: set SD_TEST_MODEL_DIR.");
         return;
@@ -233,6 +248,7 @@ fn img2img_round_trips_an_image_through_the_encoder() {
 
 #[test]
 fn sdxl_end_to_end_produces_finite_image_in_range() {
+    let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_SDXL_DIR") else {
         eprintln!(
             "SKIP sdxl_end_to_end_produces_finite_image_in_range: set SD_TEST_SDXL_DIR \
@@ -285,6 +301,7 @@ fn tiny_config(seed: u64) -> stable_diffusion_rs::pipeline::Txt2ImgConfig {
 
 #[test]
 fn supplying_the_initial_latent_reproduces_the_seeded_run_exactly() {
+    let _heavy = heavy();
     // The contract that makes `initial_latent` useful: it must be the *same*
     // latent the seeded path would have drawn, so a caller can take it,
     // perturb it, and know that an unperturbed round trip changes nothing.
@@ -314,6 +331,7 @@ fn supplying_the_initial_latent_reproduces_the_seeded_run_exactly() {
 
 #[test]
 fn a_different_initial_latent_gives_a_different_image() {
+    let _heavy = heavy();
     // The other half: if the supplied latent were quietly ignored, the test
     // above would still pass. This one fails in that case.
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
@@ -341,6 +359,7 @@ fn a_different_initial_latent_gives_a_different_image() {
 
 #[test]
 fn generation_is_deterministic_across_runs() {
+    let _heavy = heavy();
     // Same seed and parameters must give byte-identical output. Callers record
     // generation parameters as provenance and promise their users the asset can
     // be reproduced later, so this is a guarantee rather than an accident —
@@ -380,6 +399,7 @@ fn generation_is_deterministic_across_runs() {
 
 #[test]
 fn control_maps_must_match_the_attached_controlnets() {
+    let _heavy = heavy();
     // With several ControlNets bound, a caller passing the wrong number of
     // maps would otherwise get them zipped to the shorter list — every shape
     // still valid, the wrong ControlNet reading the wrong hint, and a
@@ -445,6 +465,7 @@ fn control_maps_must_match_the_attached_controlnets() {
 
 #[test]
 fn one_conditioning_selected_every_step_is_the_ordinary_run() {
+    let _heavy = heavy();
     // The equivalence that makes `run_conditioned` safe to reach for: a
     // single-entry set with a constant selector must reproduce the plain run
     // bit-identically. Anything less would mean the conditioned path takes a
@@ -474,6 +495,7 @@ fn one_conditioning_selected_every_step_is_the_ordinary_run() {
 
 #[test]
 fn gating_the_negative_prompt_to_a_window_changes_the_image() {
+    let _heavy = heavy();
     // The technique the hook exists for: a negative applied only during part
     // of the schedule. If the selector were ignored this would be identical to
     // applying it throughout, so this is the test that proves per-step
@@ -524,6 +546,7 @@ fn gating_the_negative_prompt_to_a_window_changes_the_image() {
 
 #[test]
 fn a_cancelled_run_stops_and_says_where() {
+    let _heavy = heavy();
     use stable_diffusion_rs::pipeline::{Cancel, PipelineError, Txt2ImgPipeline};
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
         eprintln!("SKIP a_cancelled_run_stops_and_says_where");
@@ -555,4 +578,109 @@ fn a_cancelled_run_stops_and_says_where() {
         }
         other => panic!("expected Cancelled, got {other}"),
     }
+}
+
+#[test]
+fn a_textual_inversion_changes_the_prompt_it_appears_in() {
+    let _heavy = heavy();
+    // The whole feature in one assertion: a trigger word with an embedding
+    // behind it must condition differently from the same word without one.
+    // If the splice silently did nothing, the trigger would tokenise as an
+    // ordinary word and the two would match.
+    let (Ok(dir), Ok(emb)) = (
+        std::env::var("SD_TEST_MODEL_DIR"),
+        std::env::var("SD_TEST_EMBEDDING"),
+    ) else {
+        eprintln!("SKIP a_textual_inversion_changes_the_prompt_it_appears_in");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let plain = Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+    let stem = std::path::Path::new(&emb)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap()
+        .to_string();
+
+    let mut cfg = tiny_config(21);
+    cfg.steps = 2;
+    cfg.prompt = format!("a painting of a cat in the style of {stem}");
+
+    let without = plain.run(&cfg).expect("without the embedding");
+
+    let with = Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev)
+        .expect("loading pipeline")
+        .with_embedding(std::path::Path::new(&emb))
+        .expect("loading the embedding");
+    assert_eq!(with.embedding_names(), vec![stem.as_str()]);
+    let with_out = with.run(&cfg).expect("with the embedding");
+
+    let a = without.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = with_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_ne!(a, b, "the embedding was not spliced into the prompt");
+}
+
+#[test]
+fn a_prompt_without_the_trigger_is_unaffected() {
+    let _heavy = heavy();
+    // The other half: registering an embedding must not change prompts that
+    // do not name it. Without this, the test above would pass even if the
+    // splice were overwriting arbitrary positions.
+    let (Ok(dir), Ok(emb)) = (
+        std::env::var("SD_TEST_MODEL_DIR"),
+        std::env::var("SD_TEST_EMBEDDING"),
+    ) else {
+        eprintln!("SKIP a_prompt_without_the_trigger_is_unaffected");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let mut cfg = tiny_config(22);
+    cfg.steps = 2;
+    cfg.prompt = "a painting of a cat".into();
+
+    let plain = Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+    let without = plain.run(&cfg).expect("plain");
+    drop(plain);
+
+    let with = Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev)
+        .expect("loading pipeline")
+        .with_embedding(std::path::Path::new(&emb))
+        .expect("loading the embedding");
+    let with_out = with.run(&cfg).expect("with an unused embedding");
+
+    let a = without.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = with_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(a, b, "an unused embedding changed the result");
+}
+
+#[test]
+fn an_embedding_of_the_wrong_width_is_refused() {
+    let _heavy = heavy();
+    // 1024-wide is SD 2.x's; in an SD 1.5 prompt it would otherwise surface as
+    // a shape error from inside the transformer.
+    let (Ok(dir), Ok(emb)) = (
+        std::env::var("SD_TEST_MODEL_DIR"),
+        std::env::var("SD_TEST_EMBEDDING_WRONG_WIDTH"),
+    ) else {
+        eprintln!("SKIP an_embedding_of_the_wrong_width_is_refused");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let stem = std::path::Path::new(&emb)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap()
+        .to_string();
+    let mut cfg = tiny_config(23);
+    cfg.steps = 1;
+    cfg.prompt = format!("a cat, {stem}");
+
+    let pipeline = Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev)
+        .expect("loading pipeline")
+        .with_embedding(std::path::Path::new(&emb))
+        .expect("loading is fine; using it is not");
+    assert!(pipeline.run(&cfg).is_err(), "wrong width was accepted");
 }
