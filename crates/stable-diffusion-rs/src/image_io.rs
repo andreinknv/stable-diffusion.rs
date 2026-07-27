@@ -89,6 +89,28 @@ pub fn load_mask<P: AsRef<std::path::Path>>(
     Tensor::from_vec(data, (1, 1, height as usize, width as usize), device)
 }
 
+/// Read an image at its native size into `[1, 3, h, w]` in `[0, 1]`.
+///
+/// Two differences from [`load_image`], both deliberate. **No resize**: an
+/// upscaler's input size is the thing being scaled, so resizing first would
+/// throw away exactly what it is for. And **`[0, 1]`, not `[-1, 1]`**:
+/// Real-ESRGAN was trained on the unsigned range, and handing it signed values
+/// returns a washed-out image with no error to notice.
+pub fn load_rgb_unit<P: AsRef<std::path::Path>>(
+    path: P,
+    device: &sd_tensor::Device,
+) -> Result<Tensor> {
+    let img = image::open(path.as_ref())
+        .map_err(|e| sd_tensor::Error::Msg(format!("failed to read image: {e}")))?
+        .to_rgb8();
+    let (w, h) = img.dimensions();
+    let data: Vec<f32> = img.as_raw().iter().map(|&b| b as f32 / 255.0).collect();
+    Tensor::from_vec(data, (h as usize, w as usize, 3), device)?
+        .permute((2, 0, 1))?
+        .contiguous()?
+        .unsqueeze(0)
+}
+
 /// Composite `generated` over `original` where `mask` is 1, in pixel space.
 ///
 /// The last step of an inpaint, and not cosmetic. Blending in latent space

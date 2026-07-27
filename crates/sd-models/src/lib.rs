@@ -15,6 +15,7 @@
 
 pub mod clip;
 pub mod controlnet;
+pub mod esrgan;
 pub mod flux;
 pub mod sd3;
 pub mod t5;

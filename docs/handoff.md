@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 278 tests, all gates green
+table is in [roadmap.md](roadmap.md). 286 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,41 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**4x upscaling works**, `sdrs upscale --model <esrgan_x4.safetensors>
+--input <img>`, verified against the reference RRDBNet at **1.669e-6**. Real-
+ESRGAN is a pure convolutional network — no attention, no normalisation, no
+diffusion — so it runs after generation and knows nothing about it.
+`assets/esrgan-crab-2048.png` is 512 -> 2048.
+
+**It found a silent-corruption bug in candle's Metal convolution, and the
+boundary is exactly `i32::MAX`.** A 3x3 convolution over `out_h * out_w`
+positions at 64 channels builds an im2col matrix of `out_h * out_w * 64 * 9`
+elements. Past `i32::MAX` the Metal kernel returns a dark, horizontally banded
+image — **no error, no failed command buffer, nothing to catch**. CPU renders
+the same input correctly, which is what identified it as candle's rather than
+this port's.
+
+The threshold was measured, not inferred, and it lands where the arithmetic
+says it should:
+
+```text
+  output 1928 px   2,141,097,984 elements   under i32::MAX   correct
+  output 1936 px   2,158,903,296 elements   over  i32::MAX   corrupt
+  sqrt(i32::MAX / (64*9)) = 1930
+```
+
+`upscale_tiled` splits anything above it, 384 px tiles with 16 px of context,
+and the seam is not visible: the column-to-column jump at the tile boundary is
+0.24 where the largest jump anywhere in the image is 4.43. Against a one-pass
+CPU render, 98.8 % of pixels agree within 16/255 — the rest is high-frequency
+detail where a tile has less context to work with, which is the cost of tiling
+and not a defect.
+
+`upscale_in_tiles(image, tile, pad)` takes both explicitly so the tiling is
+testable without a 2000 px image: give every tile a padding larger than the
+image and the result must be **exactly** the one-pass result, which is what
+pins the crop offsets and the stitching order.
 
 **SD 2.x renders**, `sdrs txt2img --model <sd21-dir>`, verified against
 diffusers at **3.696e-5** on the UNet output with all twelve skips and the mid

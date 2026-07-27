@@ -229,6 +229,27 @@ enum Command {
         output: String,
     },
 
+    /// Upscale an image 4x with Real-ESRGAN.
+    ///
+    /// Runs after generation and knows nothing about it, so it works on any
+    /// image — generated here or not.
+    #[command(name = "upscale")]
+    Upscale {
+        /// The Real-ESRGAN x4 weights as .safetensors.
+        ///
+        /// The published release is a pickled `.pth`; convert it with
+        /// `python3 xtask/golden/dump_reference.py esrgan --output tests/golden`,
+        /// which writes `tests/golden/esrgan/esrgan_x4.safetensors`.
+        #[arg(long)]
+        model: String,
+
+        #[arg(long)]
+        input: String,
+
+        #[arg(long, short, default_value = "upscaled.png")]
+        output: String,
+    },
+
     /// Generate steered by a ControlNet, from an image's Canny edges.
     #[command(name = "controlnet")]
     ControlNet {
@@ -830,6 +851,39 @@ fn main() -> Result<()> {
                 .context("running SD 3")?;
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             tracing::info!(elapsed = ?t1.elapsed(), output = %output, "done");
+        }
+
+        Command::Upscale {
+            model,
+            input,
+            output,
+        } => {
+            // [0, 1], not [-1, 1]: Real-ESRGAN was trained on the unsigned
+            // range, unlike everything else here.
+            let tensor = sd::image_io::load_rgb_unit(&input, &dev)
+                .with_context(|| format!("reading {input}"))?;
+            let (_, _, h, w) = tensor.dims4()?;
+
+            tracing::info!(
+                from = format!("{w}x{h}"),
+                to = format!("{}x{}", w * 4, h * 4),
+                "upscaling"
+            );
+            let started = std::time::Instant::now();
+            let vb = sd::loader::safetensors_var_builder(
+                &[Path::new(&model)],
+                sd_tensor::DType::F32,
+                &dev,
+            )
+            .with_context(|| format!("loading Real-ESRGAN from {model}"))?;
+            let net = sd::models::esrgan::RealEsrgan::new(vb).context("building Real-ESRGAN")?;
+            let out = net.upscale_tiled(&tensor).context("upscaling")?;
+
+            // Back to the [-1, 1] convention save_png expects.
+            let signed = ((out * 2.0)? - 1.0)?;
+            sd::image_io::save_png(&signed, &output)
+                .with_context(|| format!("writing {output}"))?;
+            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
         }
 
         Command::ControlNet {
