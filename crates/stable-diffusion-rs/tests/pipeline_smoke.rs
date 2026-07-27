@@ -11,7 +11,7 @@
 use stable_diffusion_rs::pipeline::{sigma_to_timestep, SamplerKind, Txt2ImgConfig};
 use stable_diffusion_rs::sample::{sigmas_for_steps, Schedule};
 use stable_diffusion_rs::tensor::rng::SeededRng;
-use stable_diffusion_rs::tensor::{Device, Tensor};
+use stable_diffusion_rs::tensor::{DType, Device, Tensor};
 
 #[test]
 fn config_defaults_are_sane() {
@@ -262,4 +262,175 @@ fn sdxl_end_to_end_produces_finite_image_in_range() {
     let values = img.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     assert!(values.iter().all(|v| v.is_finite()), "SDXL produced NaN");
     eprintln!("sdxl ok: {:?}", img.dims());
+}
+
+// -- latent in/out, and determinism ---------------------------------------
+
+/// A small config for the tests below. 128px and 2 steps: these assert
+/// *equality between runs*, which does not need a converged image.
+#[cfg(test)]
+fn tiny_config(seed: u64) -> stable_diffusion_rs::pipeline::Txt2ImgConfig {
+    stable_diffusion_rs::pipeline::Txt2ImgConfig {
+        prompt: "a crab".into(),
+        negative_prompt: String::new(),
+        width: 128,
+        height: 128,
+        steps: 2,
+        cfg_scale: 7.5,
+        seed,
+        sampler: Default::default(),
+    }
+}
+
+#[test]
+fn supplying_the_initial_latent_reproduces_the_seeded_run_exactly() {
+    // The contract that makes `initial_latent` useful: it must be the *same*
+    // latent the seeded path would have drawn, so a caller can take it,
+    // perturb it, and know that an unperturbed round trip changes nothing.
+    // Bit-identical, not close — anything less would hide a divergence in the
+    // sampler's own noise sequence, which is the part that is easy to get
+    // wrong when the initial draw is skipped.
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP supplying_the_initial_latent_reproduces_the_seeded_run_exactly");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+    let cfg = tiny_config(7);
+
+    let seeded = pipeline.run(&cfg).expect("seeded run");
+    let start = pipeline.initial_latent(&cfg).expect("initial latent");
+    let (explicit, _) = pipeline
+        .run_with_latent(&cfg, Some(&start), &mut |_| {})
+        .expect("explicit run");
+
+    let a = seeded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = explicit.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(a, b, "initial_latent must reproduce the seeded run exactly");
+}
+
+#[test]
+fn a_different_initial_latent_gives_a_different_image() {
+    // The other half: if the supplied latent were quietly ignored, the test
+    // above would still pass. This one fails in that case.
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP a_different_initial_latent_gives_a_different_image");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+    let cfg = tiny_config(7);
+
+    let mine = pipeline
+        .initial_latent(&tiny_config(1234))
+        .expect("other latent");
+    let (image, _) = pipeline
+        .run_with_latent(&cfg, Some(&mine), &mut |_| {})
+        .expect("explicit run");
+    let seeded = pipeline.run(&cfg).expect("seeded run");
+
+    let a = seeded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = image.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_ne!(a, b, "the supplied latent was ignored");
+}
+
+#[test]
+fn generation_is_deterministic_across_runs() {
+    // Same seed and parameters must give byte-identical output. Callers record
+    // generation parameters as provenance and promise their users the asset can
+    // be reproduced later, so this is a guarantee rather than an accident —
+    // and an accident is what it would be without a test, since summation
+    // order is the sort of thing that changes under a dependency bump.
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP generation_is_deterministic_across_runs");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+    let cfg = tiny_config(99);
+
+    let first = pipeline.run(&cfg).expect("first run");
+    let second = pipeline.run(&cfg).expect("second run");
+    let a = first.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = second.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(a, b, "two runs of the same seed diverged");
+
+    // And across pipeline instances, which is the case that would catch a
+    // load path that is not bit-stable.
+    let reloaded =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("reloading pipeline");
+    let third = reloaded.run(&cfg).expect("third run");
+    let c = third.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(a, c, "a reloaded pipeline diverged from the first");
+}
+
+#[test]
+fn control_maps_must_match_the_attached_controlnets() {
+    // With several ControlNets bound, a caller passing the wrong number of
+    // maps would otherwise get them zipped to the shorter list — every shape
+    // still valid, the wrong ControlNet reading the wrong hint, and a
+    // plausible image out. Refused instead.
+    let (Ok(dir), Ok(cnet)) = (
+        std::env::var("SD_TEST_MODEL_DIR"),
+        std::env::var("SD_TEST_CONTROLNET"),
+    ) else {
+        eprintln!("SKIP control_maps_must_match_the_attached_controlnets");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::{Control, ControlConfig, Txt2ImgPipeline};
+    let dev = Device::Cpu;
+    let pipeline = Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev)
+        .expect("loading pipeline")
+        .with_controlnet(std::path::Path::new(&cnet))
+        .expect("attaching a ControlNet");
+    assert_eq!(pipeline.controlnet_count(), 1);
+
+    let base = tiny_config(1);
+    let hint = Tensor::zeros((1, 3, base.height, base.width), DType::F32, &dev).unwrap();
+
+    // Two maps for one ControlNet.
+    let too_many = ControlConfig {
+        base: base.clone(),
+        controls: vec![
+            Control {
+                hint: hint.clone(),
+                scale: 1.0,
+            },
+            Control {
+                hint: hint.clone(),
+                scale: 1.0,
+            },
+        ],
+    };
+    assert!(
+        pipeline.run_control(&too_many).is_err(),
+        "two maps for one net"
+    );
+
+    // And none at all.
+    let none = ControlConfig {
+        base: base.clone(),
+        controls: Vec::new(),
+    };
+    assert!(pipeline.run_control(&none).is_err(), "no maps for one net");
+
+    // A latent-resolution map, which is the other easy mistake: control maps
+    // are at pixel resolution.
+    let latent_sized = ControlConfig {
+        base,
+        controls: vec![Control {
+            hint: Tensor::zeros((1, 3, 16, 16), DType::F32, &dev).unwrap(),
+            scale: 1.0,
+        }],
+    };
+    assert!(
+        pipeline.run_control(&latent_sized).is_err(),
+        "latent-sized map"
+    );
 }

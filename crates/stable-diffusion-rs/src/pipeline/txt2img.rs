@@ -254,23 +254,35 @@ pub struct Img2ImgConfig {
 #[derive(Debug, Clone)]
 pub struct ControlConfig {
     pub base: Txt2ImgConfig,
-    /// The control map as `[1, 3, height, width]` in `[0, 1]` at **pixel**
-    /// resolution — a Canny edge map, a depth map, a pose skeleton.
+    /// One control map per attached ControlNet, in the order they were
+    /// attached, each with its own strength.
     ///
+    /// A `Vec` because one is frequently not enough — pose for a figure plus
+    /// depth or edges for the scene is a common pairing, and swapping models
+    /// between generations is the alternative. The corrections are summed
+    /// before the UNet sees them, which is what diffusers does.
+    ///
+    /// Each map is `[1, 3, height, width]` in `[0, 1]` at **pixel** resolution.
     /// A prepared tensor rather than a path, because what counts as a control
     /// map depends on which ControlNet is loaded and this crate cannot check
-    /// the two agree. [`crate::canny`] makes one for the canny models.
+    /// the two agree — a caller with a pose skeleton it generated itself
+    /// should not have to push it back through a detector.
+    /// [`crate::canny`] makes one for the canny models.
+    pub controls: Vec<Control>,
+}
+
+/// One control map and its strength.
+#[derive(Debug, Clone)]
+pub struct Control {
     pub hint: Tensor,
-    /// How strongly the control applies. 1.0 is the published strength; 0.0 is
-    /// exactly an uncontrolled run.
+    /// 1.0 is the published strength; 0.0 contributes exactly nothing.
     pub scale: f64,
 }
 
-/// A control map and its strength, for one run.
-struct Hint<'a> {
-    /// `[2, 3, h, w]`, already doubled for the guidance batch.
-    hint: &'a Tensor,
-    scale: f64,
+/// The control maps for one run, already doubled for the guidance batch.
+struct Hints {
+    /// `[2, 3, h, w]` each, paired with its strength, in ControlNet order.
+    maps: Vec<(Tensor, f64)>,
 }
 
 /// A loaded SD 1.5 pipeline.
@@ -282,8 +294,8 @@ pub struct Txt2ImgPipeline {
     vae_encoder: AutoencoderKlEncoder,
     schedule: Schedule,
     device: Device,
-    /// Optional spatial conditioning, attached by [`Txt2ImgPipeline::with_controlnet`].
-    controlnet: Option<ControlNet>,
+    /// Spatial conditioning, in attachment order. Empty is the common case.
+    controlnets: Vec<ControlNet>,
     /// What the UNet's output means. See [`Prediction`].
     prediction: Prediction,
 }
@@ -502,7 +514,7 @@ impl Txt2ImgPipeline {
             vae_encoder,
             schedule: Schedule::sd15(),
             device: device.clone(),
-            controlnet: None,
+            controlnets: Vec::new(),
             prediction,
         })
     }
@@ -563,7 +575,7 @@ impl Txt2ImgPipeline {
             vae_encoder,
             schedule: Schedule::sd15(),
             device: device.clone(),
-            controlnet: None,
+            controlnets: Vec::new(),
             prediction: Prediction::Epsilon,
         })
     }
@@ -583,7 +595,8 @@ impl Txt2ImgPipeline {
             return Err(PipelineError::MissingFile(path.to_path_buf()));
         }
         let vb = sd_loader::safetensors_var_builder(&[path], DType::F32, &self.device)?;
-        self.controlnet = Some(ControlNet::new(&UNetConfig::sd15(), vb)?);
+        self.controlnets
+            .push(ControlNet::new(&UNetConfig::sd15(), vb)?);
         Ok(self)
     }
 
@@ -632,9 +645,15 @@ impl Txt2ImgPipeline {
         self.decode(latent)
     }
 
-    /// Whether a ControlNet is attached.
+    /// How many ControlNets are attached.
+    ///
+    /// [`ControlConfig::controls`] must have exactly this many entries.
+    pub fn controlnet_count(&self) -> usize {
+        self.controlnets.len()
+    }
+
     pub fn has_controlnet(&self) -> bool {
-        self.controlnet.is_some()
+        !self.controlnets.is_empty()
     }
 
     /// Generate under spatial control. Returns `[1, 3, height, width]`.
@@ -648,8 +667,15 @@ impl Txt2ImgPipeline {
         cfg: &ControlConfig,
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
-        if self.controlnet.is_none() {
+        if self.controlnets.is_empty() {
             return Err(PipelineError::NoControlNet);
+        }
+        if cfg.controls.len() != self.controlnets.len() {
+            return Err(PipelineError::Tensor(sd_tensor::Error::Msg(format!(
+                "{} control maps for {} attached ControlNets — each needs its own",
+                cfg.controls.len(),
+                self.controlnets.len()
+            ))));
         }
         let base = &cfg.base;
         if base.width % 8 != 0 {
@@ -661,27 +687,36 @@ impl Txt2ImgPipeline {
         if base.steps == 0 {
             return Err(PipelineError::NoSteps);
         }
-        let (hh, hw) = {
-            let d = cfg.hint.dims4()?;
-            (d.2, d.3)
-        };
-        if hh != base.height || hw != base.width {
-            return Err(PipelineError::Tensor(sd_tensor::Error::Msg(format!(
-                "control map is {hh}x{hw}, expected {}x{} — it is at pixel resolution, \
-                 not latent",
-                base.height, base.width
-            ))));
+        for (i, control) in cfg.controls.iter().enumerate() {
+            let d = control.hint.dims4()?;
+            if d.2 != base.height || d.3 != base.width {
+                return Err(PipelineError::Tensor(sd_tensor::Error::Msg(format!(
+                    "control map {i} is {}x{}, expected {}x{} — control maps are at \
+                     pixel resolution, not latent",
+                    d.2, d.3, base.height, base.width
+                ))));
+            }
         }
 
         let cond = self.encode(&base.prompt)?;
         let uncond = self.encode(&base.negative_prompt)?;
         let context = Tensor::cat(&[&uncond, &cond], 0)?;
 
-        // The hint is doubled to match the guidance batch. Both halves get the
-        // same control: guidance contrasts the *prompts*, and giving the
+        // Each hint is doubled to match the guidance batch. Both halves get
+        // the same control: guidance contrasts the *prompts*, and giving the
         // unconditional half no control would make the contrast partly about
         // the control map instead.
-        let hint = Tensor::cat(&[&cfg.hint, &cfg.hint], 0)?.to_dtype(self.unet.dtype())?;
+        let dtype = self.unet.dtype();
+        let maps = cfg
+            .controls
+            .iter()
+            .map(|c| {
+                Ok((
+                    Tensor::cat(&[&c.hint, &c.hint], 0)?.to_dtype(dtype)?,
+                    c.scale,
+                ))
+            })
+            .collect::<Result<Vec<_>, PipelineError>>()?;
 
         let mut rng = SeededRng::new(base.seed);
         let (lh, lw) = (base.height / 8, base.width / 8);
@@ -695,10 +730,7 @@ impl Txt2ImgPipeline {
             &context,
             &mut rng,
             None,
-            Some(Hint {
-                hint: &hint,
-                scale: cfg.scale,
-            }),
+            Some(Hints { maps }),
             progress,
         )?;
         self.decode(&latent)
@@ -722,6 +754,46 @@ impl Txt2ImgPipeline {
         cfg: &Txt2ImgConfig,
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
+        self.run_with_latent(cfg, None, progress)
+            .map(|(image, _)| image)
+    }
+
+    /// The latent a config would start from, without generating anything.
+    ///
+    /// Exposed so a caller can perturb it. Frame-to-frame coherence methods
+    /// are almost all about controlling the *noise* rather than the seed —
+    /// a shared initial latent across frames, correlated rather than
+    /// independent noise, interpolation between keyframes — and none of them
+    /// are reachable through a seed alone.
+    ///
+    /// Already scaled by the first sigma, so it is ready to hand back to
+    /// [`Self::run_with_latent`] unchanged.
+    pub fn initial_latent(&self, cfg: &Txt2ImgConfig) -> Result<Tensor, PipelineError> {
+        let (lh, lw) = (cfg.height / 8, cfg.width / 8);
+        let sigmas = self.sigmas_for(cfg.sampler, cfg.steps);
+        let mut rng = SeededRng::new(cfg.seed);
+        Ok((rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?)
+    }
+
+    /// Generate from an explicit starting latent, returning the final one too.
+    ///
+    /// `latent` of `None` draws from the seed, which is exactly what
+    /// [`Self::run_with_progress`] does — passing
+    /// [`Self::initial_latent`]'s result is equivalent to passing `None`, and
+    /// there is a test that says so.
+    ///
+    /// The returned latent is the *denoised* one, before decoding, so it can
+    /// be carried into the next frame or re-decoded at another size.
+    ///
+    /// Note the seed still drives the sampler's per-step noise even when the
+    /// initial latent is supplied: an ancestral sampler draws every step, and
+    /// two frames sharing an initial latent but not a seed will still diverge.
+    pub fn run_with_latent(
+        &self,
+        cfg: &Txt2ImgConfig,
+        latent: Option<&Tensor>,
+        progress: ProgressFn<'_>,
+    ) -> Result<(Tensor, Tensor), PipelineError> {
         if cfg.width % 8 != 0 {
             return Err(PipelineError::NotMultipleOfEight("width", cfg.width));
         }
@@ -747,8 +819,25 @@ impl Txt2ImgPipeline {
         // give every step identical noise.
         let mut rng = SeededRng::new(cfg.seed);
         // Scaled by the first sigma — unit-variance noise gives washed-out
-        // output.
-        let latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+        // output. Drawn even when `latent` is supplied, so that the sampler's
+        // subsequent draws land in the same sequence either way and a
+        // caller-supplied `initial_latent` reproduces the seeded run exactly.
+        let drawn = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+        let latent = match latent {
+            Some(given) => {
+                if given.dims() != drawn.dims() {
+                    return Err(PipelineError::Tensor(sd_tensor::Error::Msg(format!(
+                        "latent is {:?}, expected {:?} for {}x{}",
+                        given.dims(),
+                        drawn.dims(),
+                        cfg.width,
+                        cfg.height
+                    ))));
+                }
+                given.to_device(&self.device)?
+            }
+            None => drawn,
+        };
 
         let latent = self.denoise(cfg, latent, &sigmas, &context, &mut rng, progress)?;
 
@@ -756,7 +845,8 @@ impl Txt2ImgPipeline {
         // through to a whole-image decode for latents that already fit — so
         // 512px output is bit-identical to before. Above that it tiles, which
         // is what keeps a 1024px decode inside GPU memory.
-        self.decode(&latent)
+        let image = self.decode(&latent)?;
+        Ok((image, latent))
     }
 
     /// Generate inside a mask, leaving everything else alone.
@@ -892,7 +982,7 @@ impl Txt2ImgPipeline {
         context: &Tensor,
         rng: &mut SeededRng,
         keep: Option<Keep<'_>>,
-        control: Option<Hint<'_>>,
+        control: Option<Hints>,
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
@@ -912,15 +1002,39 @@ impl Txt2ImgPipeline {
             let t = sigma_to_timestep(&self.schedule, sigma);
             let timestep = Tensor::new(&[t as f32, t as f32], &self.device)?;
 
-            let out = match (&self.controlnet, &control) {
-                (Some(net), Some(h)) => {
-                    // The ControlNet sees the same scaled latent and timestep
+            let out = match &control {
+                Some(hints) if !self.controlnets.is_empty() => {
+                    // Each ControlNet sees the same scaled latent and timestep
                     // the UNet does. Feeding it the unscaled latent is a
                     // natural mistake that produces corrections of plausible
                     // magnitude for the wrong noise level.
-                    let c = net.forward(&latent_in, &timestep, context, h.hint, h.scale)?;
-                    self.unet
-                        .forward_controlled(&latent_in, &timestep, context, &c.down, &c.mid)?
+                    //
+                    // Several ControlNets **sum**, which is what diffusers
+                    // does: they were each trained against the same frozen
+                    // base, so their corrections are independent additions to
+                    // it rather than alternatives to choose between.
+                    let mut total: Option<sd_models::controlnet::Control> = None;
+                    for (net, (hint, scale)) in self.controlnets.iter().zip(&hints.maps) {
+                        let c = net.forward(&latent_in, &timestep, context, hint, *scale)?;
+                        total = Some(match total {
+                            None => c,
+                            Some(acc) => sd_models::controlnet::Control {
+                                down: acc
+                                    .down
+                                    .iter()
+                                    .zip(&c.down)
+                                    .map(|(a, b)| a + b)
+                                    .collect::<sd_tensor::Result<Vec<_>>>()?,
+                                mid: (acc.mid + c.mid)?,
+                            },
+                        });
+                    }
+                    match total {
+                        Some(c) => self
+                            .unet
+                            .forward_controlled(&latent_in, &timestep, context, &c.down, &c.mid)?,
+                        None => self.unet.forward(&latent_in, &timestep, context)?,
+                    }
                 }
                 _ => self.unet.forward(&latent_in, &timestep, context)?,
             };

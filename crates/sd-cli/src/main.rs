@@ -943,8 +943,10 @@ fn main() -> Result<()> {
                     seed,
                     sampler: parse_sampler(&sampler)?,
                 },
-                hint,
-                scale: control_scale,
+                controls: vec![sd::pipeline::Control {
+                    hint,
+                    scale: control_scale,
+                }],
             };
             tracing::info!(model = %model, controlnet = %controlnet, scale = control_scale, "controlnet");
             let started = std::time::Instant::now();

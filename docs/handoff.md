@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 286 tests, all gates green
+table is in [roadmap.md](roadmap.md). 290 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,31 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**Explicit latent in and out**, `initial_latent` and `run_with_latent`, which
+is what makes frame-to-frame coherence reachable by a caller: shared initial
+latents across frames, correlated noise, interpolation between keyframes,
+carrying a latent forward. None of that is expressible through a seed.
+
+Two tests hold it together. `initial_latent` fed back to `run_with_latent`
+must reproduce the seeded run **bit-identically** — so the initial draw still
+happens even when a latent is supplied, keeping the sampler's own noise
+sequence aligned — and a *different* latent must produce a different image,
+which is the test that fails if the argument is quietly ignored.
+
+**Determinism is now a tested guarantee**, not an assumption: same seed and
+parameters give byte-identical output across runs *and across pipeline
+instances*, the second of which is what would catch a load path that is not
+bit-stable.
+
+**Several ControlNets can be bound at once.** `ControlConfig::controls` is a
+`Vec<Control>`, one map and strength per attached net, and the corrections are
+summed before the UNet sees them — which is what diffusers does, and is
+correct because each was trained against the same frozen base, so they are
+independent additions rather than alternatives. Pose for a figure plus depth
+for the scene is the motivating pairing. A count mismatch is refused rather
+than zipped to the shorter list, which would otherwise hand the wrong net the
+wrong hint at shapes that stay valid.
 
 **4x upscaling works**, `sdrs upscale --model <esrgan_x4.safetensors>
 --input <img>`, verified against the reference RRDBNet at **1.669e-6**. Real-
