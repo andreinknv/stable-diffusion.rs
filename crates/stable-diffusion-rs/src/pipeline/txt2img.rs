@@ -216,6 +216,18 @@ pub struct ControlConfig {
     pub scale: f64,
 }
 
+/// Whichever decoder the pipeline is using.
+///
+/// An enum rather than two `Option` fields so that "exactly one decoder" is a
+/// property of the type. With two options the compiler demands a branch for
+/// "neither", which cannot happen and would have to be an error nobody can
+/// trigger.
+#[derive(Debug)]
+enum Decoder {
+    Vae(Box<AutoencoderKlDecoder>),
+    Tiny(Box<TinyDecoder>),
+}
+
 /// A control map and its strength, for one run.
 struct Hint<'a> {
     /// `[2, 3, h, w]`, already doubled for the guidance batch.
@@ -228,14 +240,12 @@ pub struct Txt2ImgPipeline {
     tokenizer: ClipTokenizer,
     text_encoder: ClipTextEncoder,
     unet: UNet2DConditionModel,
-    vae: AutoencoderKlDecoder,
+    decoder: Decoder,
     vae_encoder: AutoencoderKlEncoder,
     schedule: Schedule,
     device: Device,
     /// Optional spatial conditioning, attached by [`Txt2ImgPipeline::with_controlnet`].
     controlnet: Option<ControlNet>,
-    /// Optional tiny decoder, attached by [`Txt2ImgPipeline::with_taesd`].
-    tiny: Option<TinyDecoder>,
 }
 
 impl std::fmt::Debug for Txt2ImgPipeline {
@@ -405,12 +415,11 @@ impl Txt2ImgPipeline {
             tokenizer,
             text_encoder,
             unet,
-            vae,
+            decoder: Decoder::Vae(Box::new(vae)),
             vae_encoder,
             schedule: Schedule::sd15(),
             device: device.clone(),
             controlnet: None,
-            tiny: None,
         })
     }
 
@@ -464,12 +473,11 @@ impl Txt2ImgPipeline {
             tokenizer,
             text_encoder,
             unet,
-            vae,
+            decoder: Decoder::Vae(Box::new(vae)),
             vae_encoder,
             schedule: Schedule::sd15(),
             device: device.clone(),
             controlnet: None,
-            tiny: None,
         })
     }
 
@@ -507,7 +515,14 @@ impl Txt2ImgPipeline {
             return Err(PipelineError::MissingFile(path.to_path_buf()));
         }
         let vb = sd_loader::safetensors_var_builder(&[path], DType::F32, &self.device)?;
-        self.tiny = Some(TinyDecoder::new(4, 3, vb)?);
+        let tiny = TinyDecoder::new(4, 3, vb)?;
+
+        // Replacing rather than adding: the VAE decoder's 189 MB is dropped
+        // here, and on Metal a drop alone frees nothing — candle pools its
+        // buffers and returns them only inside `drop_unused_buffers`, which
+        // runs on synchronise. The same reason `run_releasing` exists.
+        self.decoder = Decoder::Tiny(Box::new(tiny));
+        self.device.synchronize()?;
         Ok(self)
     }
 
@@ -518,9 +533,9 @@ impl Txt2ImgPipeline {
     /// is a single branch here rather than a scaling the caller has to get
     /// right.
     fn decode(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
-        match &self.tiny {
-            Some(tiny) => Ok(tiny.decode(latent)?),
-            None => Ok(self.vae.decode_tiled(latent)?),
+        match &self.decoder {
+            Decoder::Tiny(tiny) => Ok(tiny.decode(latent)?),
+            Decoder::Vae(vae) => Ok(vae.decode_tiled(latent)?),
         }
     }
 

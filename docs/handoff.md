@@ -167,14 +167,29 @@ error if missed.
 where decode is a large fraction of the run rather than lost in it. At twenty
 steps that is about 7 % of a 125 s run, and **below run-to-run variance** — the
 first 20-step pair suggested a 25 s saving and the second suggested none. The
-one-step figure reproduces in both directions and is the one to trust. It is
-also a lower bound on the compute saved, since the TAESD run loads *more*
-weights: `with_taesd` adds the tiny decoder without dropping the VAE.
+one-step figure reproduces in both directions and is the one to trust.
 
-That last point is the open end. **The memory win is not realised yet** —
-5 MB against 330 only pays if the VAE decoder is never built, and the pipeline
-builds it unconditionally. Making it optional is a small refactor and is what
-would turn this from a speed tweak into the low-memory decode path.
+**The memory win is 7x, and it is the activations, not the weights.** An
+earlier note here said the win was unrealised because `with_taesd` kept the
+VAE resident. That was wrong twice over: the 189 MB of VAE decoder weights is
+now dropped (`Decoder` is an enum, so attaching TAESD *replaces* rather than
+adds, with a synchronise because a drop alone frees nothing on Metal) — and
+that 189 MB was never the interesting number anyway. Decoding is:
+
+```text
+  latent edge   output      VAE            TAESD
+  64            512 px      3.43 GB        0.49 GB     7.0x
+  128           1024 px     3.22 GB *      1.71 GB
+```
+
+`* tiled.` `decode_tiled` splits anything above a 64-latent edge, so the VAE
+holds ~3.4 GB at any size by **seaming the image** instead. TAESD does 1024 in
+one pass. Reproduce with
+`cargo run --release -p stable-diffusion-rs --example decode_peak -- taesd 64`.
+
+Measuring this end to end is what hid it: `sdrs`'s peak RSS is dominated by
+the UNet's 3.4 GB, so the two decoders looked 0.14 GB apart — which is only
+the weights. The decode had to be isolated before the real number appeared.
 
 Output agreement with the VAE is mean 18.9/255, max 214 — TAESD is genuinely
 lossy, which is the trade, not a defect.
@@ -299,10 +314,6 @@ profiling it.
 
 Ported, verified and wired up (see above). Two ends left loose, neither large:
 
-- **Never building the VAE decoder.** The 5 MB-against-330 win needs
-  `Txt2ImgPipeline::vae` to be optional, not merely unused — `with_taesd`
-  currently adds the tiny decoder on top of a VAE that is still resident, so
-  the memory saving is zero today. The speed saving is real (8-11 s at 512).
 - **SDXL.** Same architecture, different weights (`taesdxl`); `--taesd`
   refuses it rather than loading weights that would silently mismatch. Flux and
   SD 3 have their own progress callbacks and no previews yet — `Progress` is
