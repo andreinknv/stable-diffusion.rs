@@ -675,6 +675,7 @@ fn main() -> Result<()> {
                 cfg_scale,
                 seed,
                 sampler: parse_sampler(&sampler)?,
+                cancel: None,
             };
 
             // Held for the whole generation: the mode is read by every
@@ -966,6 +967,7 @@ fn main() -> Result<()> {
                     cfg_scale,
                     seed,
                     sampler: parse_sampler(&sampler)?,
+                    cancel: None,
                 },
                 controls: vec![sd::pipeline::Control {
                     hint,
@@ -1019,6 +1021,7 @@ fn main() -> Result<()> {
                         cfg_scale,
                         seed,
                         sampler: parse_sampler(&sampler)?,
+                        cancel: None,
                     },
                     init_image: std::path::PathBuf::from(&init_image),
                     strength: Strength::new(strength),
@@ -1069,6 +1072,7 @@ fn main() -> Result<()> {
                     cfg_scale,
                     seed,
                     sampler: parse_sampler(&sampler)?,
+                    cancel: None,
                 },
                 init_image: std::path::PathBuf::from(&init_image),
                 strength: Strength::new(strength),

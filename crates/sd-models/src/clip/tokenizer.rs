@@ -118,6 +118,37 @@ impl ClipTokenizer {
     pub fn max_length(&self) -> usize {
         self.max_length
     }
+
+    /// How many *content* tokens a prompt costs, excluding BOS and EOS.
+    ///
+    /// Exposed because the counts are unintuitive and a caller cannot budget
+    /// without them. CLIP's BPE splits digits one at a time, so `"16-bit"` is
+    /// four tokens and `"32x32"` is five, and every comma is its own token.
+    ///
+    /// Compare against [`Self::content_capacity`]: above it the prompt is
+    /// **truncated, not chunked** — this implementation keeps the first
+    /// `capacity` tokens and ends the sequence with EOS, so anything past the
+    /// limit is discarded rather than encoded in a second window. That is a
+    /// real difference from `stable-diffusion.cpp`, which chunks; a term past
+    /// the boundary is dropped here rather than detached.
+    pub fn content_token_count(&self, text: &str) -> Result<usize, TokenizeError> {
+        let encoding = self
+            .inner
+            .encode(text, true)
+            .map_err(|e| TokenizeError::Encode(e.to_string()))?;
+        // `encode` with specials adds BOS and EOS around the content.
+        Ok(encoding.get_ids().len().saturating_sub(2))
+    }
+
+    /// Content tokens that fit before truncation: `max_length - 2`.
+    pub fn content_capacity(&self) -> usize {
+        self.max_length.saturating_sub(2)
+    }
+
+    /// Whether this prompt will be truncated.
+    pub fn will_truncate(&self, text: &str) -> Result<bool, TokenizeError> {
+        Ok(self.content_token_count(text)? > self.content_capacity())
+    }
 }
 
 /// Force `ids` to exactly `max_length`.

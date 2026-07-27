@@ -279,6 +279,7 @@ fn tiny_config(seed: u64) -> stable_diffusion_rs::pipeline::Txt2ImgConfig {
         cfg_scale: 7.5,
         seed,
         sampler: Default::default(),
+        cancel: None,
     }
 }
 
@@ -363,6 +364,13 @@ fn generation_is_deterministic_across_runs() {
 
     // And across pipeline instances, which is the case that would catch a
     // load path that is not bit-stable.
+    //
+    // The first pipeline is dropped before the second loads. Holding both is
+    // 12 GB, and with the rest of this file running in parallel the memory
+    // guard refuses the second — correctly. An earlier version of this test
+    // did exactly that and looked like a determinism failure, which it was
+    // not.
+    drop(pipeline);
     let reloaded =
         Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("reloading pipeline");
     let third = reloaded.run(&cfg).expect("third run");
@@ -433,4 +441,118 @@ fn control_maps_must_match_the_attached_controlnets() {
         pipeline.run_control(&latent_sized).is_err(),
         "latent-sized map"
     );
+}
+
+#[test]
+fn one_conditioning_selected_every_step_is_the_ordinary_run() {
+    // The equivalence that makes `run_conditioned` safe to reach for: a
+    // single-entry set with a constant selector must reproduce the plain run
+    // bit-identically. Anything less would mean the conditioned path takes a
+    // different code route, and the two would drift apart silently.
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP one_conditioning_selected_every_step_is_the_ordinary_run");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+    let cfg = tiny_config(3);
+
+    let plain = pipeline.run(&cfg).expect("plain run");
+    let cond = pipeline
+        .encode_conditioning(&cfg.prompt, &cfg.negative_prompt)
+        .expect("encode");
+    let (conditioned, _) = pipeline
+        .run_conditioned(&cfg, &[cond], &mut |_, _| 0, None, &mut |_| {})
+        .expect("conditioned run");
+
+    let a = plain.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = conditioned.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(a, b, "the conditioned path diverged from the plain one");
+}
+
+#[test]
+fn gating_the_negative_prompt_to_a_window_changes_the_image() {
+    // The technique the hook exists for: a negative applied only during part
+    // of the schedule. If the selector were ignored this would be identical to
+    // applying it throughout, so this is the test that proves per-step
+    // conditioning actually reaches the model.
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP gating_the_negative_prompt_to_a_window_changes_the_image");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+    let mut cfg = tiny_config(5);
+    cfg.steps = 4;
+
+    let with_negative = pipeline
+        .encode_conditioning(&cfg.prompt, "red")
+        .expect("encode");
+    let without = pipeline
+        .encode_conditioning(&cfg.prompt, "")
+        .expect("encode");
+
+    // Negative on for the whole run.
+    let (always, _) = pipeline
+        .run_conditioned(
+            &cfg,
+            std::slice::from_ref(&with_negative),
+            &mut |_, _| 0,
+            None,
+            &mut |_| {},
+        )
+        .expect("always");
+    // Negative only in the middle of the schedule.
+    let (windowed, _) = pipeline
+        .run_conditioned(
+            &cfg,
+            &[without, with_negative],
+            &mut |step, total| usize::from(step * 4 > total && step * 4 <= total * 3),
+            None,
+            &mut |_| {},
+        )
+        .expect("windowed");
+
+    let a = always.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = windowed.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_ne!(a, b, "the per-step selector was ignored");
+}
+
+#[test]
+fn a_cancelled_run_stops_and_says_where() {
+    use stable_diffusion_rs::pipeline::{Cancel, PipelineError, Txt2ImgPipeline};
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP a_cancelled_run_stops_and_says_where");
+        return;
+    };
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+    let mut cfg = tiny_config(11);
+    cfg.steps = 6;
+    let cancel = Cancel::new();
+    cfg.cancel = Some(cancel.clone());
+
+    // Cancel from the progress callback, which is where a GUI would do it.
+    let err = pipeline
+        .run_with_progress(&cfg, &mut |p| {
+            if p.step == 2 {
+                cancel.cancel();
+            }
+        })
+        .expect_err("should have been cancelled");
+
+    match err {
+        PipelineError::Cancelled { completed, total } => {
+            // Checked at the top of the step, so cancelling during step 2
+            // stops before step 3 runs.
+            assert_eq!(completed, 2);
+            assert_eq!(total, 6);
+        }
+        other => panic!("expected Cancelled, got {other}"),
+    }
 }

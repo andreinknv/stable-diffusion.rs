@@ -15,6 +15,49 @@ use sd_sample::{
 use sd_tensor::rng::SeededRng;
 use sd_tensor::{DType, Device, Tensor};
 
+/// A cancellation token, shared with whatever wants to stop a generation.
+///
+/// A token rather than a callback return value, so the ordinary
+/// [`ProgressFn`] stays a plain `FnMut` and callers who never cancel write
+/// nothing. Checked once per step: a step is not interruptible internally, so
+/// cancelling costs at most one step of latency.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the generation to stop. Safe to call from any thread.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A prompt pair, encoded once.
+///
+/// Encoding is not free and does not change between frames, so a caller
+/// generating a sequence should do it once and reuse it — which also removes
+/// a class of bug where re-encoding produces marginally different conditioning
+/// per frame.
+#[derive(Debug, Clone)]
+pub struct Conditioning {
+    /// `[2, 77, d]`: unconditional first, then conditional.
+    context: Tensor,
+}
+
+impl Conditioning {
+    /// The raw `[2, 77, d]` tensor, unconditional row first.
+    pub fn context(&self) -> &Tensor {
+        &self.context
+    }
+}
+
 /// What the model's output means.
 ///
 /// SD 1.5, SDXL and SD 2.x's 512 "base" checkpoints predict the noise. SD 2.1's
@@ -87,6 +130,8 @@ pub struct Txt2ImgConfig {
     pub cfg_scale: f64,
     pub seed: u64,
     pub sampler: SamplerKind,
+    /// Set to stop the run early. `None` means it cannot be cancelled.
+    pub cancel: Option<Cancel>,
 }
 
 impl Default for Txt2ImgConfig {
@@ -100,6 +145,7 @@ impl Default for Txt2ImgConfig {
             cfg_scale: 7.5,
             seed: 0,
             sampler: SamplerKind::default(),
+            cancel: None,
         }
     }
 }
@@ -150,6 +196,8 @@ pub enum PipelineError {
          the control image and return an ordinary generation."
     )]
     NoControlNet,
+    #[error("cancelled after {completed} of {total} steps")]
+    Cancelled { completed: usize, total: usize },
     #[error("tensor: {0}")]
     Tensor(#[from] sd_tensor::Error),
 }
@@ -758,6 +806,56 @@ impl Txt2ImgPipeline {
             .map(|(image, _)| image)
     }
 
+    /// Encode a prompt pair once, for reuse across a sequence.
+    ///
+    /// Uncond first, then cond — the order the guidance split in the sampling
+    /// loop expects. Reversing exactly one of the two inverts guidance and
+    /// produces the opposite of the prompt, which is a confusing symptom to
+    /// debug from the image, so the pair is built here rather than by callers.
+    pub fn encode_conditioning(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+    ) -> Result<Conditioning, PipelineError> {
+        let cond = self.encode(prompt)?;
+        let uncond = self.encode(negative_prompt)?;
+        Ok(Conditioning {
+            context: Tensor::cat(&[&uncond, &cond], 0)?,
+        })
+    }
+
+    /// Generate with the conditioning chosen per step.
+    ///
+    /// `select` is handed `(step, total)` — 1-based step — and returns an index
+    /// into `conditioning`. Out-of-range indices are clamped to the last entry
+    /// rather than erroring mid-run, since a run is expensive and the
+    /// alternative is losing it to an off-by-one in a caller's schedule.
+    ///
+    /// This is what makes a published class of technique reachable. Gating a
+    /// negative prompt to a middle window of the schedule improves
+    /// object-removal success from 65.1 % to 80.4 % (Ban et al., ECCV 2024,
+    /// arXiv:2406.02965); the same work finds a negative applied only in the
+    /// first few steps can *generate* the thing it names. Neither is
+    /// expressible with one fixed conditioning.
+    ///
+    /// A single-entry slice with `|_, _| 0` is exactly
+    /// [`Self::run_with_latent`], and there is a test that says so.
+    pub fn run_conditioned(
+        &self,
+        cfg: &Txt2ImgConfig,
+        conditioning: &[Conditioning],
+        select: &mut dyn FnMut(usize, usize) -> usize,
+        latent: Option<&Tensor>,
+        progress: ProgressFn<'_>,
+    ) -> Result<(Tensor, Tensor), PipelineError> {
+        if conditioning.is_empty() {
+            return Err(PipelineError::Tensor(sd_tensor::Error::Msg(
+                "run_conditioned needs at least one conditioning".to_string(),
+            )));
+        }
+        self.generate(cfg, Some((conditioning, select)), latent, progress)
+    }
+
     /// The latent a config would start from, without generating anything.
     ///
     /// Exposed so a caller can perturb it. Frame-to-frame coherence methods
@@ -794,6 +892,17 @@ impl Txt2ImgPipeline {
         latent: Option<&Tensor>,
         progress: ProgressFn<'_>,
     ) -> Result<(Tensor, Tensor), PipelineError> {
+        self.generate(cfg, None, latent, progress)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn generate(
+        &self,
+        cfg: &Txt2ImgConfig,
+        conditioning: Option<(&[Conditioning], &mut dyn FnMut(usize, usize) -> usize)>,
+        latent: Option<&Tensor>,
+        progress: ProgressFn<'_>,
+    ) -> Result<(Tensor, Tensor), PipelineError> {
         if cfg.width % 8 != 0 {
             return Err(PipelineError::NotMultipleOfEight("width", cfg.width));
         }
@@ -804,12 +913,22 @@ impl Txt2ImgPipeline {
             return Err(PipelineError::NoSteps);
         }
 
-        // Uncond first. This order and the split below must agree; reversing
-        // exactly one of them inverts guidance and produces the opposite of
-        // the prompt, which is a confusing symptom to debug from the image.
-        let cond = self.encode(&cfg.prompt)?;
-        let uncond = self.encode(&cfg.negative_prompt)?;
-        let context = Tensor::cat(&[&uncond, &cond], 0)?;
+        // Either the config's own prompts, encoded here, or a caller-supplied
+        // set chosen per step.
+        let (contexts, select): (Vec<Tensor>, Option<&mut dyn FnMut(usize, usize) -> usize>) =
+            match conditioning {
+                Some((set, select)) => (
+                    set.iter().map(|c| c.context.clone()).collect(),
+                    Some(select),
+                ),
+                None => (
+                    vec![
+                        self.encode_conditioning(&cfg.prompt, &cfg.negative_prompt)?
+                            .context,
+                    ],
+                    None,
+                ),
+            };
 
         let sigmas = self.sigmas_for(cfg.sampler, cfg.steps);
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
@@ -839,7 +958,8 @@ impl Txt2ImgPipeline {
             None => drawn,
         };
 
-        let latent = self.denoise(cfg, latent, &sigmas, &context, &mut rng, progress)?;
+        let latent =
+            self.denoise_selecting(cfg, latent, &sigmas, &contexts, select, &mut rng, progress)?;
 
         // `decode_tiled` applies the scaling factor, like `decode`, and falls
         // through to a whole-image decode for latents that already fit — so
@@ -972,14 +1092,50 @@ impl Txt2ImgPipeline {
         self.denoise_controlled(cfg, latent, sigmas, context, rng, keep, None, progress)
     }
 
+    /// [`Self::denoise`], choosing the conditioning per step.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_selecting(
+        &self,
+        cfg: &Txt2ImgConfig,
+        latent: Tensor,
+        sigmas: &[f64],
+        contexts: &[Tensor],
+        select: Option<&mut dyn FnMut(usize, usize) -> usize>,
+        rng: &mut SeededRng,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        self.denoise_inner(
+            cfg, latent, sigmas, contexts, select, rng, None, None, progress,
+        )
+    }
+
     /// [`Self::denoise_keeping`], optionally under a ControlNet.
     #[allow(clippy::too_many_arguments)]
     fn denoise_controlled(
         &self,
         cfg: &Txt2ImgConfig,
-        mut latent: Tensor,
+        latent: Tensor,
         sigmas: &[f64],
         context: &Tensor,
+        rng: &mut SeededRng,
+        keep: Option<Keep<'_>>,
+        control: Option<Hints>,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let contexts = [context.clone()];
+        self.denoise_inner(
+            cfg, latent, sigmas, &contexts, None, rng, keep, control, progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_inner(
+        &self,
+        cfg: &Txt2ImgConfig,
+        mut latent: Tensor,
+        sigmas: &[f64],
+        contexts: &[Tensor],
+        mut select: Option<&mut dyn FnMut(usize, usize) -> usize>,
         rng: &mut SeededRng,
         keep: Option<Keep<'_>>,
         control: Option<Hints>,
@@ -990,6 +1146,15 @@ impl Txt2ImgPipeline {
         let mut dpm = DpmSolverPlusPlus2M::new();
 
         for i in 0..steps {
+            // Checked before the work, so a cancel between steps costs nothing
+            // and the error names how far it got — a caller showing progress
+            // wants to know whether it was step 1 or step 19.
+            if cfg.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                return Err(PipelineError::Cancelled {
+                    completed: i,
+                    total: steps,
+                });
+            }
             let sigma = sigmas[i];
             let sigma_next = sigmas[i + 1];
 
@@ -998,6 +1163,14 @@ impl Txt2ImgPipeline {
             // k-diffusion input scaling. Omitting it gives noisy, oversaturated
             // results.
             let latent_in = (latent_in / (sigma * sigma + 1.0).sqrt())?;
+
+            // Clamped rather than checked: a run is expensive, and losing one
+            // to an off-by-one in a caller's schedule is a worse outcome than
+            // silently reusing the last entry.
+            let context = match select.as_mut() {
+                Some(pick) => &contexts[pick(i + 1, steps).min(contexts.len() - 1)],
+                None => &contexts[0],
+            };
 
             let t = sigma_to_timestep(&self.schedule, sigma);
             let timestep = Tensor::new(&[t as f32, t as f32], &self.device)?;

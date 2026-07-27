@@ -226,3 +226,44 @@ fn json_bracketed_value<'a>(raw: &'a str, key: &str) -> &'a str {
     }
     panic!("unterminated array for {needle}");
 }
+
+#[test]
+fn token_counts_are_reported_and_are_unintuitive() {
+    // The counts callers cannot guess. Every one of these is a real budgeting
+    // surprise: BPE splits digits singly, and punctuation is not free.
+    let Some(tok) = tokenizer() else { return };
+
+    assert_eq!(tok.content_token_count("cat").unwrap(), 1);
+    // Digits one at a time: 1, 6, -, bit.
+    assert_eq!(tok.content_token_count("16-bit").unwrap(), 4);
+    // 3, 2, x, 3, 2.
+    assert_eq!(tok.content_token_count("32x32").unwrap(), 5);
+    // Commas count.
+    assert_eq!(
+        tok.content_token_count("a cat, a dog").unwrap(),
+        tok.content_token_count("a cat a dog").unwrap() + 1
+    );
+}
+
+#[test]
+fn over_limit_prompts_truncate_rather_than_chunk() {
+    // The behaviour a caller has to know to budget: past the limit, tokens are
+    // *discarded*, not encoded into a second window. Getting this wrong the
+    // other way — assuming chunking — means believing a trailing qualifier
+    // still applies when it does not.
+    let Some(tok) = tokenizer() else { return };
+
+    assert_eq!(tok.content_capacity(), 75, "77 minus BOS and EOS");
+    let short = "a cat";
+    assert!(!tok.will_truncate(short).unwrap());
+
+    let long = "cat ".repeat(100);
+    assert!(tok.will_truncate(&long).unwrap());
+    let ids = tok.encode(&long).unwrap();
+    assert_eq!(ids.len(), 77, "always exactly the context length");
+    assert_eq!(
+        *ids.last().unwrap(),
+        tok.eos_token_id(),
+        "truncation still ends in EOS"
+    );
+}

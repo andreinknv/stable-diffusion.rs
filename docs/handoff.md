@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 290 tests, all gates green
+table is in [roadmap.md](roadmap.md). 298 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,32 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**Cancellation, a per-step conditioning hook, and prompt-budget queries** —
+the remaining asks from the integration issue.
+
+`Cancel` is a token on the config rather than a callback return value, so the
+ordinary `ProgressFn` stays a plain `FnMut` and callers who never cancel write
+nothing. Checked at the top of each step, and the error names how far it got.
+
+`run_conditioned` takes a slice of pre-encoded `Conditioning` and a
+`(step, total) -> index` selector. That covers two asks at once: encode once
+and reuse across a sequence, and *vary* the conditioning per step. The
+motivating result is gating a negative prompt to a middle window of the
+schedule — 65.1 % to 80.4 % on object removal (Ban et al., ECCV 2024) — which
+is not expressible with one fixed conditioning. A single-entry slice with a
+constant selector is bit-identical to the plain run, and there is a test that
+says so; a second test gates a negative to a window and asserts the image
+*changes*, which is what fails if the selector is ignored.
+
+`ClipTokenizer::content_token_count`, `content_capacity` and `will_truncate`
+answer the budgeting question. The counts are unintuitive and now pinned:
+`"16-bit"` is **four** tokens and `"32x32"` is **five**, because CLIP's BPE
+splits digits singly, and every comma costs one. Over the limit this
+implementation **truncates, not chunks** — a term past the boundary is
+discarded rather than encoded into a second window, which is a real difference
+from `stable-diffusion.cpp` and is now tested rather than left to be
+discovered.
 
 **Explicit latent in and out**, `initial_latent` and `run_with_latent`, which
 is what makes frame-to-frame coherence reachable by a caller: shared initial
