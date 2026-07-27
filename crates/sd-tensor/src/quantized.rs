@@ -22,6 +22,55 @@ use candle_core::Module;
 
 use crate::{Result, Tensor};
 
+/// Copy a tensor into a fresh buffer if it starts partway into someone else's.
+///
+/// **This works around a real miscomputation, not a style preference.**
+/// candle 0.11's Metal quantised matmul passes the activation buffer to the
+/// kernel without adding the layout's `start_offset`, so a tensor that is a
+/// view into the middle of a larger allocation is read *from the beginning of
+/// that allocation*. No error is raised: the shapes are right, the arithmetic
+/// runs, and the answer is the product of the wrong rows.
+///
+/// The trap is that `contiguous()` does not save you. `narrow` along anything
+/// but the last axis of a contiguous tensor produces a layout candle considers
+/// contiguous — the elements *are* consecutive, they merely start late — so
+/// `contiguous()` is a no-op and the offset survives it. `force_contiguous`
+/// is the one that always copies.
+///
+/// Flux hit this in every double-stream block. Attention runs on the text and
+/// image tokens joined, then splits them again:
+///
+/// ```text
+///   txt_attn = attn.narrow(1, 0, 512)          offset 0     -> correct
+///   img_attn = attn.narrow(1, 512, 1024)       offset 512*3072 -> read the text rows
+/// ```
+///
+/// Every image-attention projection in all 19 blocks was therefore computed
+/// from the text half. The rendered image was a flat orange field. Localising
+/// it took a bisection down to one op because every *isolated* check passes —
+/// the op is correct whenever its input happens to own its buffer, which is
+/// what a freshly constructed test tensor always does.
+///
+/// Gated on the device because the CPU backend honours the offset correctly
+/// and the copy is pure cost there. CUDA is untested here and is included with
+/// the non-CPU backends deliberately: an unnecessary copy is cheap, and a
+/// silently wrong matmul is what this function exists to prevent.
+fn without_storage_offset(xs: &Tensor) -> Result<Tensor> {
+    if xs.device().is_cpu() {
+        return Ok(xs.clone());
+    }
+    // Scoped: `storage_and_layout` holds a read lock that `force_contiguous`
+    // would deadlock against.
+    let offset = {
+        let (_storage, layout) = xs.storage_and_layout();
+        layout.start_offset()
+    };
+    if offset == 0 {
+        return Ok(xs.clone());
+    }
+    xs.force_contiguous()
+}
+
 /// A linear layer whose weight stays in its quantised form.
 ///
 /// Construct from a [`QTensor`] read out of a GGUF file. The weight is
@@ -50,7 +99,8 @@ impl QLinear {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let out = self.weight.forward(xs)?;
+        let xs = without_storage_offset(xs)?;
+        let out = self.weight.forward(&xs)?;
         match &self.bias {
             // Broadcast: the bias is [out], the activation [.., out].
             Some(b) => out.broadcast_add(b),
@@ -94,6 +144,62 @@ mod tests {
     /// SD 1.5's 320-channel blocks do not get this luxury.
     fn weight(dev: &Device) -> Tensor {
         Tensor::rand(-1f32, 1f32, (512, 256), dev).unwrap()
+    }
+
+    #[test]
+    fn a_narrowed_activation_gives_the_same_answer_as_its_own_copy() {
+        // The Flux/Metal corruption in one assertion. `narrow` along anything
+        // but the last axis yields a layout candle calls contiguous — the
+        // elements are consecutive, they just start late — so `contiguous()`
+        // is a no-op and the tensor keeps a non-zero `start_offset`. candle
+        // 0.11's Metal quantised matmul does not add that offset, so it reads
+        // from the beginning of the buffer and returns the product of the
+        // wrong rows, with no error anywhere. See `without_storage_offset`.
+        //
+        // On a CPU runner both sides take the same path and this only pins the
+        // contract. It bites on `--features metal`, and `--example
+        // metal_check` runs the same comparison across devices.
+        let dev = Device::Cpu;
+        let w = weight(&dev);
+        let q = QLinear::new(
+            Arc::new(QTensor::quantize(&w, GgmlDType::Q8_0).unwrap()),
+            None,
+        )
+        .unwrap();
+
+        let big = Tensor::rand(-1f32, 1f32, (1, 12, 256), &dev).unwrap();
+        // Offset deliberately non-zero: rows 4..12 start 4*256 elements in.
+        let view = big.narrow(1, 4, 8).unwrap().contiguous().unwrap();
+        let copied = view.force_contiguous().unwrap();
+
+        // The premise: these hold the same numbers.
+        let diff = (&view - &copied)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            diff, 0.0,
+            "the two inputs must be the same tensor of values"
+        );
+
+        let from_view = q.forward(&view).unwrap();
+        let from_copy = q.forward(&copied).unwrap();
+        let out_diff = (&from_view - &from_copy)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            out_diff, 0.0,
+            "a quantised matmul must not depend on where its input sits in memory"
+        );
     }
 
     #[test]

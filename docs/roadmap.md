@@ -305,31 +305,63 @@ still earns its place: it bounds the allocation, and it is what SD 1.5's
 40- and 160-wide heads use, along with any masked shape, since the kernel
 wants a `[batch, heads, seq_q, seq_k]` mask and `causal_mask` is `[1, 1, s, s]`.
 
-### Metal end to end: fast, and currently **wrong**
+### ~~Metal end to end: fast, and currently wrong~~ — fixed
 
-Flux schnell at 512x512, 4 steps: **22.7 s on Metal against 166.1 s on CPU**,
-a 7.3x speedup, with memory never dropping below 82% free. The image it
-produces is garbage — a flat orange field with a corrupted strip along the
-top. Speed is worthless without that, so **Metal is not usable for the
-diffusion models yet** and the CPU timings elsewhere in this document remain
-the honest ones.
+Flux schnell at 512x512, 4 steps: **20.8 s on Metal against 159.3 s on CPU**,
+a 7.7x speedup, and the image is now the same crab the CPU renders. It used to
+be a flat orange field with a corrupted strip along the top.
 
-Not yet localised. `--example metal_check` compares CPU against Metal per
-operation and everything it covers agrees:
+**Root cause: candle 0.11's Metal quantised matmul ignores the activation's
+`start_offset`.** A tensor that is a view into the middle of a larger buffer is
+read *from the beginning of that buffer*. Nothing errors — the shapes are
+right, the kernel runs, and the answer is the product of the wrong rows.
 
-| op | agreement |
-|---|---|
-| fused attention (Flux-shaped) | 1.9e-7 |
-| QLinear Q4_K / Q5_K / Q8_0 | within quantisation noise |
-| QLinear F16, plain matmul | exact |
+The trap that makes it survive review is that **`contiguous()` does not save
+you**. `narrow` along anything but the last axis of a contiguous tensor yields
+a layout candle already calls contiguous — the elements are consecutive, they
+merely start late — so `contiguous()` is a no-op and the offset persists.
+`force_contiguous()` is the one that always copies.
 
-So the fault is in composition, or in an op that check does not cover — the
-VAE's convolutions, the norms, or RoPE. Worth remembering that Metal has
-produced exactly this shape of failure here before: a 1024 decode returned
-noise because candle never checks the Metal command buffer unless something
-synchronises, and the real error (`kIOGPUCommandBufferCallbackErrorOutOfMemory`)
-was invisible until a synchronize was forced. Extending `metal_check` op by
-op is the way in.
+Flux hit it in every double-stream block. Attention runs on the text and image
+tokens joined, then splits them apart again:
+
+```text
+  txt_attn = attn.narrow(1, 0, 512)        offset 0          -> correct
+  img_attn = attn.narrow(1, 512, 1024)     offset 512*3072   -> read the text rows
+```
+
+So all 19 blocks projected the text half of the attention output in place of
+the image half. The fix is `sd_tensor::quantized::without_storage_offset`,
+applied inside `QLinear::forward` — one place, because the seam is where every
+quantised matmul in the workspace passes.
+
+**Why the per-op check missed it for three sessions.** `--example metal_check`
+compared freshly built tensors, and a fresh tensor always owns its buffer at
+offset 0. The op is correct exactly when tested and wrong exactly when used.
+Every isolated check passed — attention at 1.9e-7 across every sequence
+length, QLinear at every row count and quantisation type, norms, RoPE, trig,
+`cat`/`narrow`, weight loading, dequantisation to 1e-8 — while the composed
+model was 50% wrong. `metal_check` now includes an offset case, and it fails
+loudly when the workaround is removed.
+
+**What actually localised it**, in order, each step halving the space:
+
+1. Cross-decode each device's latent on *both* devices — the VAE agreed to
+   4e-5 both ways, so the decode was innocent and the latent was already bad.
+2. Compare the loop's inputs — noise bit-identical, CLIP pooled 1e-5, T5 2%.
+3. Feed the transformer *identical* inputs on both devices — 50% divergence,
+   so the transformer alone was enough.
+4. Dump every intermediate against a **dense f32 reference built from the same
+   weights**, not against the other device. That is what made it readable:
+   Metal tracked full precision better than CPU (≤0.12%) up to the attention
+   output and then jumped to 36% at one projection.
+5. Recompute that projection in numpy from Metal's *own* dumped input — 36%
+   off, so the op was wrong rather than its input.
+6. Compare against the product of the buffer's first rows — matched to 1.6e-2.
+
+Step 4 is the transferable one. CPU-vs-Metal conflates two error sources and
+reads as noise; against a full-precision reference the culprit is a single
+line in a table.
 
 ### CPU flash attention: a short-sequence win, not a general one
 
@@ -422,6 +454,16 @@ clearly available twice:
 
 ## Upstream contributions worth making
 
+- **candle: the Metal quantised matmul ignores `start_offset`.** This is a
+  silent wrong-answer bug, not a performance note: any quantised model that
+  feeds a `narrow`ed activation to a linear layer gets the product of the
+  wrong rows, with correct shapes and no error. It cost this project three
+  sessions of a corrupted Flux. We work around it in `QLinear::forward`
+  (`without_storage_offset`), but the fix belongs in candle's Metal backend —
+  add the layout offset when binding the activation buffer, as the CPU backend
+  already does. A reproducer is four lines: quantise any weight, `narrow` an
+  activation off dim 0, and compare against `force_contiguous()` of the same
+  view. `--example metal_check` contains it.
 - **candle: drop the `onig` C dependency.** One-line feature swap, verified to
   build and pass every test. See [native-deps.md](native-deps.md). Better
   still: make `tokenizers` optional in `candle-core` and feature-gate

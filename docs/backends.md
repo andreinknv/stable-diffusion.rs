@@ -280,6 +280,23 @@ Metal took 14.3 s against CPU's 27.5 s for that run. **That is one run on a
 machine with other work on it, not a benchmark** — see the spread warning
 above before quoting it.
 
+### The quantised models needed a workaround first
+
+SD 1.5 and SDXL hold dense weights, so the above held for them all along.
+**Flux did not**, and the reason is worth knowing before writing any new
+Metal-facing code: candle 0.11's Metal quantised matmul ignores the
+activation's `start_offset`, reading a view into the middle of a buffer from
+the *start* of that buffer. Flux rendered a flat orange field for three
+sessions because every double-stream block projects
+`attn.narrow(1, 512, 1024)`, and `contiguous()` does not move a narrow off
+dim 0 — candle already calls that layout contiguous.
+
+`sd_tensor::quantized::without_storage_offset` copies such an activation
+before the matmul, inside `QLinear::forward`. Flux schnell at 512x512, 4 steps
+now renders correctly on Metal in **20.8 s against 159.3 s on CPU**. See
+[roadmap.md](roadmap.md) for how it was localised and why every per-op check
+passed while it was broken.
+
 ## The VAE decode at 1024 does not fit in GPU memory
 
 A 1024px decode needs more GPU memory than a 36 GiB Mac has, and until

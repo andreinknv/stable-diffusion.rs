@@ -74,5 +74,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &a.to_device(&m)?.matmul(&b.to_device(&m)?)?,
         &a.matmul(&b)?,
     );
+
+    // 4. A quantised matmul on a tensor that does not own its buffer.
+    //
+    // This is the one that mattered, and everything above passed while it was
+    // broken. candle 0.11's Metal quantised matmul ignored the activation's
+    // `start_offset`, so a view into the middle of a larger tensor was read
+    // from the start of it: every double-stream block projected the text half
+    // of the attention output in place of the image half, and Flux rendered a
+    // flat orange field. `sd_tensor::quantized::without_storage_offset` is the
+    // workaround.
+    //
+    // Note the comparison is against the *same layer on the same device* with
+    // the input copied, not against the CPU. A device-vs-device check would
+    // have caught it too, but this form says exactly what is wrong: a matmul
+    // that depends on where its input happens to live.
+    println!("offset-sensitivity (a narrowed activation vs its own copy):");
+    let w = Tensor::rand(-0.1f32, 0.1f32, (1536, 1536), &c)?;
+    for dt in [GgmlDType::Q4K, GgmlDType::Q8_0] {
+        let ql = QLinear::new(Arc::new(QTensor::quantize(&w.to_device(&m)?, dt)?), None)?;
+        // [1, 96, 1536] with the last 64 rows taken: offset 32*1536, and
+        // `contiguous()` will not move it because candle already calls that
+        // layout contiguous.
+        let big = Tensor::rand(-1f32, 1f32, (1, 96, 1536), &m)?;
+        let view = big.narrow(1, 32, 64)?.contiguous()?;
+        let copied = view.force_contiguous()?;
+        cmp(
+            &format!("QLinear {dt:?} view vs copy"),
+            &ql.forward(&view)?,
+            &ql.forward(&copied)?,
+        );
+        // And against the CPU, which honours the offset, as the outer check.
+        let ql_c = QLinear::new(Arc::new(QTensor::quantize(&w, dt)?), None)?;
+        cmp(
+            &format!("QLinear {dt:?} narrowed, metal vs cpu"),
+            &ql.forward(&view)?,
+            &ql_c.forward(&view.to_device(&c)?)?,
+        );
+    }
     Ok(())
 }

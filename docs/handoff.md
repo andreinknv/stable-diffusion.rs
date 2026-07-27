@@ -5,18 +5,19 @@ unstarted item under [Next](#next), and start it.
 
 ## Where things stand
 
-Four architectures render, all **on CPU only**:
+Four architectures render, and **Metal now produces the right image for all of
+them** — the Flux corruption is fixed (see the trap on storage offsets below).
 
 | model | result |
 |---|---|
 | SD 1.5 | 512x512, 20 steps, 113 s — `assets/crab-512-dpmpp2m-seed42.png` |
 | SDXL | 1024x1024, 20 steps, 89 s **on Metal** — `assets/sdxl-crab-1024-metal-f16.png` |
-| Flux schnell (12B) | 512x512, 4 steps, 166 s — `assets/flux-schnell-512-crab.png` |
+| Flux schnell (12B) | 512x512, 4 steps, **20.8 s on Metal**, 159 s CPU — `assets/flux-schnell-512-crab.png` |
 | Flux mini (3.2B) | 512x512, 20 steps, 212 s — `assets/flux-mini-512-crab.png` |
-| SD 3.5 medium | 512x512, 20 steps, 311 s — `assets/sd35-medium-512-crab.png` |
+| SD 3.5 medium | 512x512, 20 steps, 230 s — `assets/sd35-medium-512-crab.png` |
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 230 tests, all gates green
+table is in [roadmap.md](roadmap.md). 231 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -33,21 +34,17 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. Localise the Metal corruption — Metal is 7.3x faster and wrong
+### 1. Re-time everything on Metal, and re-check the other quantised models
 
-Flux schnell on Metal renders in 22.7 s instead of 166 s and produces a flat
-orange field with a corrupted top strip. `--example metal_check` compares CPU
-against Metal per op; everything it covers agrees (fused attention 1.9e-7,
-QLinear within quantisation noise, matmul exact). So it is composition or an
-op that check does not reach.
+Metal is now correct for Flux, which changes what the honest numbers are: the
+timing table above is still mostly CPU. Flux schnell went from 159 s to 20.8 s.
+Re-run SD 3.5 and Flux mini on `--features metal` and update the table.
 
-Extend `metal_check` to the untested ops in this order: the VAE decode
-(convolutions), `PlainLayerNorm`/`RmsNorm`, then RoPE. **Metal has failed in
-this exact shape here before** — a 1024 decode returned noise because candle
-never checks the Metal command buffer unless something synchronises, and the
-real error was invisible until `Decoder::forward` was made to synchronize. Try
-forcing a synchronize after each stage first; it is cheap and it worked last
-time.
+While there: **SD 3.5 and any other quantised model should be re-verified on
+Metal**, since they were never separable from the Flux bug. The fix is in
+`QLinear::forward`, so they get it for free — but "should work" is not
+"verified", and `--example metal_check` now has the offset case that would
+catch a recurrence.
 
 ### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
 
@@ -112,6 +109,36 @@ go NaN around block 10; Flux's transformer NaNs too. Hold weights quantised
 instead (`weights::Source::Quantized`) — activations stay f32 and residency
 drops further than F16 would have. bf16 would fix it but candle's CPU backend
 has no bf16 matmul.
+
+**A tensor that does not own its buffer is a different tensor.** candle 0.11's
+Metal quantised matmul ignores `start_offset`, so a view into the middle of a
+buffer is read from the beginning of it — silently, with correct shapes. Flux
+rendered a flat orange field for three sessions because every block projects
+`attn.narrow(1, 512, 1024)`. **`contiguous()` does not fix this**: a narrow off
+any axis but the last is *already* contiguous by candle's definition — the
+elements are consecutive, they just start late — so it is a no-op.
+`force_contiguous()` always copies. The workaround lives in
+`QLinear::forward`, at the seam, because that is where every quantised matmul
+in the workspace passes.
+
+**Test tensors always own their buffers, which is why per-op checks missed
+it.** `metal_check` built fresh inputs, so it exercised the op in exactly the
+condition where it is correct. Attention agreed to 1.9e-7 at every sequence
+length; QLinear at every row count and quant type; norms, RoPE, trig, cat,
+narrow, weight loading, dequantisation to 1e-8 — all green, while the composed
+model was 50% wrong. When every part passes and the whole fails, suspect
+*provenance*: build the op's input the way the model builds it, not the way a
+test does.
+
+**Bisect against a full-precision reference, not against the other device.**
+CPU-vs-Metal conflates two error sources. CPU's quantised matmul carries
+0.3-1.9% activation-quantisation noise, so a per-layer CPU/Metal table read as
+plausible drift everywhere and pointed at nothing. Dequantising the *same*
+weights into a dense f32 model — only feasible at depth 1, which was enough —
+turned it into one obvious line: Metal tracked truth better than CPU
+(≤0.12%) through the whole block, then jumped to 36% at a single projection.
+Right after that, recomputing that one op in numpy from *Metal's own dumped
+input* proved the op wrong rather than its input.
 
 **Check whether candle already does it.** The roadmap called a hand-written
 fused Metal attention kernel the highest-value work available; candle 0.11
