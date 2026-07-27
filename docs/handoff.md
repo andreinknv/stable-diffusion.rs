@@ -252,7 +252,27 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
+### 1. TAESD — the tiny decoder
+
+`madebyollin/taesd` is a ~5 MB distilled replacement for the VAE decoder. Two
+things it buys, and the second is the one that matters here:
+
+- **Step previews.** Decoding is currently far too slow to show intermediate
+  latents, so a 20-step run is a blank wait. TAESD decodes cheaply enough to
+  preview every step.
+- **A decode that always fits.** `decode_tiled` already degrades gracefully,
+  but a decoder small enough to never need tiling removes the failure mode
+  rather than managing it.
+
+Architecturally it is simple — a stack of 3x3 convolutions and ReLU residual
+blocks, no attention, no GroupNorm — so this is a short port with an easy
+reference (`diffusers.AutoencoderTiny`). The trap to watch: TAESD's latent
+convention is its own (`latent_magnitude = 3`, `latent_shift = 0.5`), *not*
+the SD VAE's `0.18215`, and mixing them gives a washed-out image rather than
+an error. Verify against `AutoencoderTiny.decode` end to end, not just the
+module stack, so the scaling is covered by the test.
+
+### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
 
 `Residency::Streamed` works for **Flux and SD 3.5**, both quantised. Gaps, in
 the order they matter:
@@ -275,8 +295,8 @@ sync interval) but the *benefit* is not. On a discrete card it should take
 VRAM from 6.66 GB to ~192 MB, by construction rather than by measurement. If a
 CUDA machine ever appears, measure this before anything else here.
 
-### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
-answer was no**
+### ~~3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`~~ — done, and the
+answer was no
 
 The three copies are now one, in `ops::rms_norm`, and `PlainLayerNorm`'s two
 copies are one in `ops::plain_layer_norm`. But **candle's fused kernels are
@@ -294,6 +314,13 @@ assumption has now failed twice.
 
 ### Also open
 
+- **ControlNet for SDXL.** The mechanism is architecture-independent —
+  `forward_controlled` takes plain tensors and `ControlNet::new` takes a
+  `UNetConfig` — so this should be config and a checkpoint, not new code. Worth
+  confirming that claim rather than assuming it.
+- **Multiple ControlNets at once.** diffusers sums the corrections from several
+  before applying them. The summing is trivial; the question is whether the
+  API should take a list, and that is worth deciding once rather than twice.
 - `candle_nn::rotary_emb::{rope, rope_i, rope_thd}` — fused RoPE. Flux's
   axis-wise 2x2 form may not map onto it; establish rather than assume.
 - `candle_nn::ops::{layer_norm, pixel_shuffle, pixel_unshuffle}` — the last
