@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 268 tests, all gates green
+table is in [roadmap.md](roadmap.md). 275 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,34 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**TAESD decodes**, `sdrs txt2img --taesd <ckpt>`. About 5 MB of 3x3
+convolutions against the VAE's 330 — no attention, no GroupNorm, no sampling
+head — verified against `diffusers.AutoencoderTiny` at **1.86e-5** decoding
+and **1.24e-5** encoding.
+
+Compared through the public `decode`/`encode` rather than the layer stack, on
+purpose. TAESD's architecture is too simple to get wrong; what is easy to get
+wrong is its *conventions* — its `scaling_factor` is 1.0, so it takes the
+sampler's latent with **no `/ 0.18215`**, and it soft-clamps its input with
+`tanh(x/3)*3` and returns `2x - 1`. Each of those is a plausible image and no
+error if missed.
+
+**The decode is 8-11 s cheaper at 512** on this machine, measured at one step,
+where decode is a large fraction of the run rather than lost in it. At twenty
+steps that is about 7 % of a 125 s run, and **below run-to-run variance** — the
+first 20-step pair suggested a 25 s saving and the second suggested none. The
+one-step figure reproduces in both directions and is the one to trust. It is
+also a lower bound on the compute saved, since the TAESD run loads *more*
+weights: `with_taesd` adds the tiny decoder without dropping the VAE.
+
+That last point is the open end. **The memory win is not realised yet** —
+5 MB against 330 only pays if the VAE decoder is never built, and the pipeline
+builds it unconditionally. Making it optional is a small refactor and is what
+would turn this from a speed tweak into the low-memory decode path.
+
+Output agreement with the VAE is mean 18.9/255, max 214 — TAESD is genuinely
+lossy, which is the trade, not a defect.
 
 **ControlNet works**, `sdrs controlnet --controlnet <ckpt> --init-image X`, for
 SD 1.5. A ControlNet is a copy of the UNet's down and mid stack that reads a
@@ -252,7 +280,21 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. TAESD — the tiny decoder
+### ~~1. TAESD — the tiny decoder~~ — done; previews are the part still open
+
+The port is in and verified (see above). What it was *for* is still missing:
+
+- **Step previews.** The reason to want a cheap decoder is decoding every step,
+  and that needs `ProgressFn` to carry the latent. It is
+  `&mut dyn FnMut(usize, usize, f64)` today; carrying a `&Tensor` means a
+  struct-shaped callback, which touches Flux, SD 3, SDXL and txt2img. Worth
+  designing once rather than bolting a second callback alongside.
+- **Never building the VAE decoder.** The 5 MB-against-330 win needs the field
+  to be optional, not merely unused.
+- **SDXL.** Same architecture, different weights (`taesdxl`); `--taesd` refuses
+  it rather than loading weights that would silently mismatch.
+
+### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
 
 `madebyollin/taesd` is a ~5 MB distilled replacement for the VAE decoder. Two
 things it buys, and the second is the one that matters here:
@@ -272,7 +314,7 @@ the SD VAE's `0.18215`, and mixing them gives a washed-out image rather than
 an error. Verify against `AutoencoderTiny.decode` end to end, not just the
 module stack, so the scaling is covered by the test.
 
-### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
+### 3. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
 
 `Residency::Streamed` works for **Flux and SD 3.5**, both quantised. Gaps, in
 the order they matter:

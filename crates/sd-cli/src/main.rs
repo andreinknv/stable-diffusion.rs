@@ -113,6 +113,13 @@ enum Command {
         /// LoRA strength. 0 is identical to not passing --lora.
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f64,
+
+        /// Decode with TAESD instead of the VAE (a ~5 MB .safetensors).
+        ///
+        /// Much faster and much smaller; lossier, so fine detail softens.
+        /// SD 1.5 only — SDXL needs `taesdxl`, which is not wired up.
+        #[arg(long)]
+        taesd: Option<String>,
     },
 
     /// Generate steered by a ControlNet, from an image's Canny edges.
@@ -286,6 +293,19 @@ enum Command {
     Info,
 }
 
+/// Attach TAESD if asked, so the three txt2img branches share one line.
+fn with_taesd(pipeline: Txt2ImgPipeline, path: Option<&str>) -> anyhow::Result<Txt2ImgPipeline> {
+    match path {
+        Some(p) => {
+            tracing::info!(taesd = %p, "decoding with TAESD");
+            pipeline
+                .with_taesd(Path::new(p))
+                .with_context(|| format!("loading TAESD from {p}"))
+        }
+        None => Ok(pipeline),
+    }
+}
+
 fn parse_sampler(name: &str) -> Result<SamplerKind> {
     match name {
         "euler-a" | "euler_a" | "euler" => Ok(SamplerKind::EulerAncestral),
@@ -422,6 +442,7 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
+            taesd,
         } => {
             let cfg = Txt2ImgConfig {
                 prompt,
@@ -450,11 +471,17 @@ fn main() -> Result<()> {
                     let tok = tokenizer.as_deref().expect("clap requires it with --gguf");
                     let pipeline = Txt2ImgPipeline::load_gguf(Path::new(g), Path::new(tok), &dev)
                         .with_context(|| format!("loading pipeline from {g}"))?;
+                    let pipeline = with_taesd(pipeline, taesd.as_deref())?;
                     pipeline
                         .run_with_progress(&cfg, &mut report)
                         .context("running txt2img from gguf")?
                 }
                 (None, true) => {
+                    if taesd.is_some() {
+                        anyhow::bail!(
+                            "--taesd is SD 1.5 only; SDXL needs the separate `taesdxl` weights"
+                        );
+                    }
                     let m = model.as_deref().context("--model or --gguf is required")?;
                     let pipeline = sd::pipeline::SdxlPipeline::load(Path::new(m), &dev)
                         .with_context(|| format!("loading SDXL pipeline from {m}"))?;
@@ -478,6 +505,7 @@ fn main() -> Result<()> {
                         None => Txt2ImgPipeline::load(Path::new(m), &dev)
                             .with_context(|| format!("loading pipeline from {m}"))?,
                     };
+                    let pipeline = with_taesd(pipeline, taesd.as_deref())?;
                     pipeline
                         .run_with_progress(&cfg, &mut report)
                         .context("running txt2img")?

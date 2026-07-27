@@ -984,6 +984,66 @@ def dump_controlnet(output: pathlib.Path, model_id: str) -> None:
     print(f"linked {link} -> {weights}")
 
 
+def dump_taesd(output: pathlib.Path, model_id: str) -> None:
+    """TAESD, the tiny distilled decoder.
+
+    Both the raw module stack and the wrapped `decode` are dumped. The wrapper
+    is where TAESD's own latent convention lives -- `latent_magnitude = 3`,
+    `latent_shift = 0.5`, and emphatically not the SD VAE's 0.18215 -- and
+    mixing the two conventions gives a washed-out image rather than an error,
+    so the test has to cover the scaling and not just the convolutions.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import AutoencoderTiny
+    from safetensors.torch import save_file
+
+    out = output / "taesd"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id}")
+    tae = AutoencoderTiny.from_pretrained(model_id, torch_dtype=torch.float32)
+    tae.eval()
+
+    gen = torch.Generator().manual_seed(SEED)
+    # The scale a real latent has: the sampler's output, not unit normal.
+    latent = torch.randn(*LATENT_SHAPE, generator=gen)
+    image = torch.rand(1, 3, 256, 256, generator=gen) * 2 - 1
+
+    with torch.no_grad():
+        raw = tae.decoder(latent)
+        decoded = tae.decode(latent).sample
+        encoded_raw = tae.encoder(image)
+        encoded = tae.encode(image).latents
+
+    tensors = {
+        "latent": latent.contiguous(),
+        "decoder_raw": raw.detach().contiguous().clone(),
+        "decoded": decoded.detach().contiguous().clone(),
+        "image": image.contiguous(),
+        "encoder_raw": encoded_raw.detach().contiguous().clone(),
+        "encoded": encoded.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    weights = hf_hub_download(
+        repo_id=model_id, filename="diffusion_pytorch_model.safetensors"
+    )
+    link = out / "taesd.safetensors"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(weights)
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<13} {tuple(v.shape)}  range [{v.min():.3f}, {v.max():.3f}]")
+    print(f"linked {link} -> {weights}")
+    print(f"\nconfig: {dict(tae.config)}")
+
+
 SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
 
 
@@ -1326,6 +1386,10 @@ def main() -> None:
     )
     unet_full.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    tae = sub.add_parser("taesd", help="dump TAESD tiny autoencoder references")
+    tae.add_argument("--model-id", default="madebyollin/taesd")
+    tae.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     cnet = sub.add_parser("controlnet", help="dump ControlNet correction references")
     cnet.add_argument("--model-id", default="lllyasviel/sd-controlnet-canny")
     cnet.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -1351,7 +1415,9 @@ def main() -> None:
     gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
     args = ap.parse_args()
-    if args.component == "controlnet":
+    if args.component == "taesd":
+        dump_taesd(args.output, args.model_id)
+    elif args.component == "controlnet":
         dump_controlnet(args.output, args.model_id)
     elif args.component == "gguf":
         dump_gguf(args.output, args.model_id)

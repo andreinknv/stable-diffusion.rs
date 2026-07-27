@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use sd_models::clip::{ClipTextConfig, ClipTextEncoder, ClipTokenizer};
 use sd_models::controlnet::ControlNet;
 use sd_models::unet::{UNet2DConditionModel, UNetConfig};
-use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, VaeConfig};
+use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, TinyDecoder, VaeConfig};
 use sd_sample::{
     euler_ancestral_step, lcm_sigmas, lcm_step, lcm_timesteps, sigmas_for_steps,
     DpmSolverPlusPlus2M, Schedule,
@@ -208,6 +208,8 @@ pub struct Txt2ImgPipeline {
     device: Device,
     /// Optional spatial conditioning, attached by [`Txt2ImgPipeline::with_controlnet`].
     controlnet: Option<ControlNet>,
+    /// Optional tiny decoder, attached by [`Txt2ImgPipeline::with_taesd`].
+    tiny: Option<TinyDecoder>,
 }
 
 impl std::fmt::Debug for Txt2ImgPipeline {
@@ -382,6 +384,7 @@ impl Txt2ImgPipeline {
             schedule: Schedule::sd15(),
             device: device.clone(),
             controlnet: None,
+            tiny: None,
         })
     }
 
@@ -440,6 +443,7 @@ impl Txt2ImgPipeline {
             schedule: Schedule::sd15(),
             device: device.clone(),
             controlnet: None,
+            tiny: None,
         })
     }
 
@@ -460,6 +464,38 @@ impl Txt2ImgPipeline {
         let vb = sd_loader::safetensors_var_builder(&[path], DType::F32, &self.device)?;
         self.controlnet = Some(ControlNet::new(&UNetConfig::sd15(), vb)?);
         Ok(self)
+    }
+
+    /// Use TAESD instead of the VAE for decoding.
+    ///
+    /// About 5 MB against the VAE's 330, and correspondingly faster. Lossier —
+    /// fine detail is softened — so this is a speed and memory trade, not a
+    /// free win, and it is opt-in for that reason.
+    ///
+    /// Only the *decoder* is replaced. Encoding (img2img, inpainting) still
+    /// goes through the VAE, because a latent produced by TAESD's encoder and
+    /// then denoised is not the same starting point as the VAE's.
+    pub fn with_taesd(mut self, path: impl AsRef<Path>) -> Result<Self, PipelineError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(PipelineError::MissingFile(path.to_path_buf()));
+        }
+        let vb = sd_loader::safetensors_var_builder(&[path], DType::F32, &self.device)?;
+        self.tiny = Some(TinyDecoder::new(4, 3, vb)?);
+        Ok(self)
+    }
+
+    /// Decode a latent with whichever decoder is attached.
+    ///
+    /// TAESD takes the sampler's latent unscaled, where the VAE divides by
+    /// `0.18215` first — each decoder owns its own convention, so the choice
+    /// is a single branch here rather than a scaling the caller has to get
+    /// right.
+    fn decode(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
+        match &self.tiny {
+            Some(tiny) => Ok(tiny.decode(latent)?),
+            None => Ok(self.vae.decode_tiled(latent)?),
+        }
     }
 
     /// Whether a ControlNet is attached.
@@ -531,7 +567,7 @@ impl Txt2ImgPipeline {
             }),
             progress,
         )?;
-        Ok(self.vae.decode_tiled(&latent)?)
+        self.decode(&latent)
     }
 
     /// Encode a prompt to `[1, 77, 768]`.
@@ -586,7 +622,7 @@ impl Txt2ImgPipeline {
         // through to a whole-image decode for latents that already fit — so
         // 512px output is bit-identical to before. Above that it tiles, which
         // is what keeps a 1024px decode inside GPU memory.
-        Ok(self.vae.decode_tiled(&latent)?)
+        self.decode(&latent)
     }
 
     /// Generate inside a mask, leaving everything else alone.
@@ -656,7 +692,7 @@ impl Txt2ImgPipeline {
             }),
             progress,
         )?;
-        let decoded = self.vae.decode_tiled(&latent)?;
+        let decoded = self.decode(&latent)?;
         Ok(crate::image_io::composite(&decoded, &image, &mask_px)?)
     }
 
@@ -836,7 +872,7 @@ impl Txt2ImgPipeline {
         let start = cfg.strength.start_index(base.steps);
         // Strength 0 means "return the input", and there is nothing to run.
         if start >= base.steps {
-            return Ok(self.vae.decode_tiled(&latent)?);
+            return self.decode(&latent);
         }
 
         let mut rng = SeededRng::new(base.seed);
@@ -848,7 +884,7 @@ impl Txt2ImgPipeline {
         let latent = (latent + (noise * sigmas[start])?)?;
 
         let latent = self.denoise(base, latent, &sigmas[start..], &context, &mut rng, progress)?;
-        Ok(self.vae.decode_tiled(&latent)?)
+        self.decode(&latent)
     }
 }
 

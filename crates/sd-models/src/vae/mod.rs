@@ -6,9 +6,11 @@
 
 mod decoder;
 mod encoder;
+mod tiny;
 
 pub use decoder::{Decoder, DecoderConfig};
 pub use encoder::{Encoder, EncoderConfig};
+pub use tiny::{TinyAutoencoder, TinyDecoder, TinyEncoder};
 
 use sd_tensor::nn::{conv2d, Conv2d, Conv2dConfig};
 use sd_tensor::{Result, Tensor, VarBuilder};
