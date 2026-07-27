@@ -395,9 +395,35 @@ rows. Measured against f64 at `[1, 154, 4096]`: 9.695e-7 for ours against
 past a 3e-3 bound that was itself measured. The speed it buys is 2.1x on that
 shape and *negative* — 2.7x slower — at `[1, 77, 768]`.
 
-`candle_nn::ops::layer_norm` is the same shape of question and is listed below
-untried. Measure it the same way before adopting it; the fused-is-better
-assumption has now failed twice.
+**`candle_nn::ops::layer_norm` has now been measured too, and the answer is
+also no — but it is the closest call of the three.** Unlike `rms_norm` it
+breaks no golden bound: swapping `ops::plain_layer_norm` onto it leaves Flux
+and SD 3.5 passing. What it costs is margin, and what it buys is 6 %:
+
+```text
+                       ours        candle fused
+  norm alone, Metal    1.60 ms     0.14 ms        11.3x   (Flux shape)
+  norm alone, CPU      1.44 ms     0.56 ms         2.6x
+  SD 3.5 end to end    25.6 s      24.0 s          1.06x  (3 runs vs 2)
+  SD 3.5 max_abs       5.484e-6    8.345e-6       +52 %
+  Flux max_abs         1.190e-3    1.556e-3       +31 %
+```
+
+11x on the operation is 6 % on the run, because a norm is one cheap op in a
+block dominated by attention and two large matmuls. Half the accuracy margin
+for that is the wrong trade in a project whose product is the verified
+agreement — and the bounds are not arbitrary, they were set from the
+reference's own f32-against-f64 noise floor, so spending margin makes every
+later change more likely to trip. On Metal the accuracy is not even
+measurable: there is no f64 there to compare against.
+
+Reversing this is a four-line change if priorities shift; the numbers are
+here so it need not be re-measured. Note the pattern is *not* "fused is
+always worse" — it is that fused trades accuracy for speed, and all three
+times so far the trade has been bad.
+
+`cargo run --release -p sd-tensor --features metal --example layer_norm_bench`
+reproduces the first two rows.
 
 ### Also open
 
@@ -410,8 +436,8 @@ assumption has now failed twice.
   API should take a list, and that is worth deciding once rather than twice.
 - `candle_nn::rotary_emb::{rope, rope_i, rope_thd}` — fused RoPE. Flux's
   axis-wise 2x2 form may not map onto it; establish rather than assume.
-- `candle_nn::ops::{layer_norm, pixel_shuffle, pixel_unshuffle}` — the last
-  two are patchify/unpatchify by another name.
+- `candle_nn::ops::{pixel_shuffle, pixel_unshuffle}` — patchify/unpatchify by
+  another name.
 - Broaden fused attention to SD 1.5 by materialising `causal_mask` from
   `[1,1,s,s]` to `[b,h,s,s]`. A reshape, not a kernel.
 - A **blocked CPU attention kernel**, tiling over query rows as well as keys.
