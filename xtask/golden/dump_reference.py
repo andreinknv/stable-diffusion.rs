@@ -1202,6 +1202,80 @@ def dump_clip_vision(output: pathlib.Path, model_id: str) -> None:
         print(f"  {k:<8} {tuple(v.shape)}")
 
 
+def dump_ip_adapter(output: pathlib.Path, model_id: str) -> None:
+    """A UNet forward with IP-Adapter attached, plus the projected tokens.
+
+    The point of this reference is the *index mapping*. The checkpoint numbers
+    its entries by diffusers' flat processor order, which is not the order a
+    UNet builds its blocks, and a wrong mapping puts every correction on a
+    differently-sized layer -- which mostly fails to load, but not between the
+    two 1280-wide regions. Only an end-to-end comparison catches that.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import StableDiffusionPipeline
+    from safetensors.torch import save_file
+
+    out = output / "ip_adapter"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print("loading SD 1.5 + ip-adapter_sd15")
+    pipe = StableDiffusionPipeline.from_pretrained(
+        "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float32,
+        safety_checker=None, requires_safety_checker=False,
+    )
+    pipe.load_ip_adapter(model_id, subfolder="models", weight_name="ip-adapter_sd15.safetensors")
+    pipe.set_ip_adapter_scale(1.0)
+    unet = pipe.unet.eval()
+
+    gen = torch.Generator().manual_seed(SEED)
+    sample = torch.randn(1, 4, 32, 32, generator=gen)
+    timestep = torch.tensor([500.0])
+    text = torch.randn(1, 77, 768, generator=gen)
+    # The *raw* CLIP image embedding, 1024 wide. diffusers runs the adapter's
+    # own projection on it, so this reference covers both the projection and
+    # the attention wiring rather than assuming the first is right.
+    # [batch, images, embed]: the projection is written for several reference
+    # images per generation, so it wants the middle axis even for one.
+    image_embeds = torch.randn(1, 1, 1024, generator=gen)
+
+    with torch.no_grad():
+        image_tokens = unet.encoder_hid_proj([image_embeds])[0]
+        out_ip = unet(
+            sample, timestep, encoder_hidden_states=text,
+            added_cond_kwargs={"image_embeds": [image_embeds]},
+        ).sample
+        pipe.set_ip_adapter_scale(0.0)
+        out_zero = unet(
+            sample, timestep, encoder_hidden_states=text,
+            added_cond_kwargs={"image_embeds": [image_embeds]},
+        ).sample
+
+    tensors = {
+        "sample": sample.contiguous(),
+        "timestep": timestep.contiguous(),
+        "text": text.contiguous(),
+        "image_embeds": image_embeds.contiguous(),
+        "image_tokens": image_tokens.detach().contiguous().clone(),
+        "output": out_ip.detach().contiguous().clone(),
+        "output_scale0": out_zero.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    weights = hf_hub_download(repo_id=model_id, filename="models/ip-adapter_sd15.safetensors")
+    link = out / "ip-adapter_sd15.safetensors"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(weights)
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<14} {tuple(v.shape)}")
+
+
 SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
 
 
@@ -1544,6 +1618,10 @@ def main() -> None:
     )
     unet_full.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    ipa = sub.add_parser("ip_adapter", help="dump IP-Adapter UNet references")
+    ipa.add_argument("--model-id", default="h94/IP-Adapter")
+    ipa.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     cv = sub.add_parser("clip_vision", help="dump CLIP vision tower references")
     cv.add_argument("--model-id", default="h94/IP-Adapter")
     cv.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -1581,7 +1659,9 @@ def main() -> None:
     gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
     args = ap.parse_args()
-    if args.component == "clip_vision":
+    if args.component == "ip_adapter":
+        dump_ip_adapter(args.output, args.model_id)
+    elif args.component == "clip_vision":
         dump_clip_vision(args.output, args.model_id)
     elif args.component == "esrgan":
         dump_esrgan(args.output, args.model_id)

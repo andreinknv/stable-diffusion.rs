@@ -27,6 +27,20 @@ pub struct Attention {
     to_out: Linear,
     heads: usize,
     dim_head: usize,
+    /// IP-Adapter's second key/value pair, when one was installed.
+    ip: Option<IpPath>,
+}
+
+/// The image half of a decoupled cross-attention.
+#[derive(Debug)]
+struct IpPath {
+    to_k_ip: Linear,
+    to_v_ip: Linear,
+    /// How many tokens at the *end* of the context are image tokens.
+    ///
+    /// Carried on the context tensor rather than passed separately, so nothing
+    /// between here and the pipeline needed a new parameter.
+    tokens: usize,
 }
 
 impl Attention {
@@ -50,6 +64,22 @@ impl Attention {
             to_out: linear(inner_dim, query_dim, vb.pp("to_out").pp("0"))?,
             heads,
             dim_head,
+            // Only cross-attention takes a slot: the checkpoint has one entry
+            // per cross-attention layer, and consuming one here for a
+            // self-attention would shift every later layer onto the wrong
+            // weights.
+            ip: match cross_dim {
+                Some(_) => super::ip::next_slot()
+                    .map(|(vb_ip, tokens)| -> Result<IpPath> {
+                        Ok(IpPath {
+                            to_k_ip: linear_no_bias(kv_dim, inner_dim, vb_ip.pp("to_k_ip"))?,
+                            to_v_ip: linear_no_bias(kv_dim, inner_dim, vb_ip.pp("to_v_ip"))?,
+                            tokens,
+                        })
+                    })
+                    .transpose()?,
+                None => None,
+            },
         })
     }
 
@@ -67,14 +97,52 @@ impl Attention {
     /// against 256.
     pub fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
         let (b, seq_q, _) = xs.dims3()?;
-        let kv = context.unwrap_or(xs);
+
+        // With an IP-Adapter attached, the trailing `tokens` of the context are
+        // image tokens rather than text. Split rather than concatenate: the
+        // two halves attend *separately* and their outputs are summed, and
+        // attending over the concatenation is a different function that would
+        // look entirely reasonable.
+        let (text_kv, image_kv) = match (&self.ip, context) {
+            (Some(ip), Some(ctx)) if ip.tokens > 0 => {
+                let n = ctx.dim(1)?;
+                if n <= ip.tokens {
+                    return Err(sd_tensor::Error::Msg(format!(
+                        "context has {n} tokens, {} of which should be image tokens",
+                        ip.tokens
+                    )));
+                }
+                (
+                    ctx.narrow(1, 0, n - ip.tokens)?,
+                    Some(ctx.narrow(1, n - ip.tokens, ip.tokens)?),
+                )
+            }
+            (_, Some(ctx)) => (ctx.clone(), None),
+            (_, None) => (xs.clone(), None),
+        };
 
         let q = self.split_heads(&self.to_q.forward(xs)?)?;
-        let k = self.split_heads(&self.to_k.forward(kv)?)?;
-        let v = self.split_heads(&self.to_v.forward(kv)?)?;
+        let k = self.split_heads(&self.to_k.forward(&text_kv)?)?;
+        let v = self.split_heads(&self.to_v.forward(&text_kv)?)?;
 
         // Unmasked: the UNet's transformer attends over everything.
         let out = ops::scaled_dot_product_attention(&q, &k, &v)?;
+
+        let out = match (&self.ip, image_kv) {
+            (Some(ip), Some(image)) => {
+                let scale = super::ip::scale();
+                if scale == 0.0 {
+                    // Exactly the uncontrolled result, not merely close to it.
+                    out
+                } else {
+                    let ik = self.split_heads(&ip.to_k_ip.forward(&image)?)?;
+                    let iv = self.split_heads(&ip.to_v_ip.forward(&image)?)?;
+                    let image_out = ops::scaled_dot_product_attention(&q, &ik, &iv)?;
+                    (out + (image_out * scale)?)?
+                }
+            }
+            _ => out,
+        };
 
         let inner_dim = self.heads * self.dim_head;
         let out = out

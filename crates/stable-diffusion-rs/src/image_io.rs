@@ -111,6 +111,27 @@ pub fn load_rgb_unit<P: AsRef<std::path::Path>>(
         .unsqueeze(0)
 }
 
+/// [`load_rgb_unit`], resized to an exact size.
+///
+/// For CLIP's vision tower, which takes a fixed 224 square. Lanczos, since a
+/// reference photograph is a signal rather than a mask.
+pub fn load_rgb_unit_resized<P: AsRef<std::path::Path>>(
+    path: P,
+    width: u32,
+    height: u32,
+    device: &sd_tensor::Device,
+) -> Result<Tensor> {
+    let img = image::open(path.as_ref())
+        .map_err(|e| sd_tensor::Error::Msg(format!("failed to read image: {e}")))?
+        .resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+        .to_rgb8();
+    let data: Vec<f32> = img.as_raw().iter().map(|&b| b as f32 / 255.0).collect();
+    Tensor::from_vec(data, (height as usize, width as usize, 3), device)?
+        .permute((2, 0, 1))?
+        .contiguous()?
+        .unsqueeze(0)
+}
+
 /// Composite `generated` over `original` where `mask` is 1, in pixel space.
 ///
 /// The last step of an inpaint, and not cosmetic. Blending in latent space

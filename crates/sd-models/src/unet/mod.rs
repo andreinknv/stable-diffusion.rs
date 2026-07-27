@@ -6,6 +6,7 @@
 mod attention;
 mod blocks;
 mod embeddings;
+pub mod ip;
 mod model;
 mod resnet;
 

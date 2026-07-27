@@ -187,6 +187,34 @@ fn conv3x3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
 }
 
 impl UNet2DConditionModel {
+    /// Build with an IP-Adapter's decoupled cross-attention attached.
+    ///
+    /// `ip_vb` should be rooted at `ip_adapter`. The weights are installed for
+    /// the duration of this call and each cross-attention pulls its own as it
+    /// is built — see [`crate::unet::ip`] for why that beats threading a
+    /// parameter through every block type, and for the index mapping, which is
+    /// *not* this UNet's construction order.
+    ///
+    /// Refuses if the entries and the layers do not match exactly. Consuming
+    /// too few would leave the deepest layers unconditioned and still render.
+    pub fn new_with_ip(
+        cfg: &UNetConfig,
+        vb: VarBuilder,
+        ip_vb: VarBuilder,
+        tokens: usize,
+    ) -> Result<Self> {
+        let source = super::ip::IpSource::new(ip_vb, super::ip::IpSource::sd15_order(), tokens);
+        // Safety: the guard drops at the end of this scope, before `ip_vb`'s
+        // borrow ends, so the erased lifetime never escapes.
+        let guard = unsafe { super::ip::install(source) };
+        let built = Self::new(cfg, vb);
+        let complete = super::ip::fully_consumed();
+        drop(guard);
+        let model = built?;
+        complete?;
+        Ok(model)
+    }
+
     pub fn new(cfg: &UNetConfig, vb: VarBuilder) -> Result<Self> {
         let channels = &cfg.block_out_channels;
         let first = channels[0];

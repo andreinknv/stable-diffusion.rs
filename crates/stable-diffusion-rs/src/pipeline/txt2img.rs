@@ -2,8 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use sd_models::clip::{ClipTextConfig, ClipTextEncoder, ClipTokenizer};
+use sd_models::clip::{
+    preprocess, ClipTextConfig, ClipTextEncoder, ClipTokenizer, ClipVisionConfig, ClipVisionEncoder,
+};
 use sd_models::controlnet::ControlNet;
+use sd_models::ip_adapter::{ImageProjModel, NUM_TOKENS};
 use sd_models::unet::{UNet2DConditionModel, UNetConfig};
 use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, TinyDecoder, VaeConfig};
 
@@ -196,6 +199,13 @@ pub enum PipelineError {
          the control image and return an ordinary generation."
     )]
     NoControlNet,
+    #[error(
+        "this pipeline has no IP-Adapter.\n\n\
+         Load one with `Txt2ImgPipeline::load_with_ip_adapter`. The adapter's weights live \
+         inside the UNet's cross-attention layers, so unlike a ControlNet it cannot be \
+         attached after the fact."
+    )]
+    NoIpAdapter,
     #[error("cancelled after {completed} of {total} steps")]
     Cancelled { completed: usize, total: usize },
     #[error("tensor: {0}")]
@@ -346,6 +356,9 @@ pub struct Txt2ImgPipeline {
     controlnets: Vec<ControlNet>,
     /// What the UNet's output means. See [`Prediction`].
     prediction: Prediction,
+    /// The image tower and projection, when an IP-Adapter is attached. The
+    /// adapter's own weights live inside the UNet.
+    ip: Option<(ClipVisionEncoder, ImageProjModel)>,
 }
 
 impl std::fmt::Debug for Txt2ImgPipeline {
@@ -474,10 +487,27 @@ impl Txt2ImgPipeline {
         }
     }
 
+    fn load_inner_with_ip(
+        model_dir: &Path,
+        device: &Device,
+        ip_vb: Option<&sd_tensor::VarBuilder<'_>>,
+    ) -> Result<Self, PipelineError> {
+        Self::load_all(model_dir, device, None, ip_vb)
+    }
+
     fn load_inner(
         model_dir: &Path,
         device: &Device,
         lora: Option<(&sd_loader::Lora, f64)>,
+    ) -> Result<Self, PipelineError> {
+        Self::load_all(model_dir, device, lora, None)
+    }
+
+    fn load_all(
+        model_dir: &Path,
+        device: &Device,
+        lora: Option<(&sd_loader::Lora, f64)>,
+        ip_vb: Option<&sd_tensor::VarBuilder<'_>>,
     ) -> Result<Self, PipelineError> {
         let tokenizer_path = model_dir.join("tokenizer/tokenizer.json");
         if !tokenizer_path.exists() {
@@ -534,7 +564,12 @@ impl Txt2ImgPipeline {
                 vb
             }
         };
-        let unet = UNet2DConditionModel::new(&unet_cfg, vb)?;
+        let unet = match ip_vb {
+            Some(ip) => {
+                UNet2DConditionModel::new_with_ip(&unet_cfg, vb, ip.pp("ip_adapter"), NUM_TOKENS)?
+            }
+            None => UNet2DConditionModel::new(&unet_cfg, vb)?,
+        };
 
         let vb = sd_loader::safetensors_var_builder(&[&vae_path], DType::F32, device)?;
         let vae = AutoencoderKlDecoder::new(&VaeConfig::sd15(), vb).map_err(|source| {
@@ -564,6 +599,7 @@ impl Txt2ImgPipeline {
             device: device.clone(),
             controlnets: Vec::new(),
             prediction,
+            ip: None,
         })
     }
 
@@ -625,6 +661,7 @@ impl Txt2ImgPipeline {
             device: device.clone(),
             controlnets: Vec::new(),
             prediction: Prediction::Epsilon,
+            ip: None,
         })
     }
 
@@ -804,6 +841,68 @@ impl Txt2ImgPipeline {
     ) -> Result<Tensor, PipelineError> {
         self.run_with_latent(cfg, None, progress)
             .map(|(image, _)| image)
+    }
+
+    /// Load with an IP-Adapter attached, conditioning on a reference image.
+    ///
+    /// A separate constructor rather than a builder, because the adapter's
+    /// weights go *inside* the UNet's cross-attention layers and so must be
+    /// present when it is built — unlike a ControlNet, which sits beside it.
+    ///
+    /// `image_encoder_dir` holds CLIP's vision tower (`h94/IP-Adapter`'s
+    /// `models/image_encoder`); `adapter` is `ip-adapter_sd15.safetensors`.
+    pub fn load_with_ip_adapter(
+        model_dir: &Path,
+        device: &Device,
+        adapter: &Path,
+        image_encoder_dir: &Path,
+    ) -> Result<Self, PipelineError> {
+        let adapter = require(adapter.to_path_buf())?;
+        let encoder_weights = require(image_encoder_dir.join("model.safetensors"))?;
+
+        let ip_vb = sd_loader::safetensors_var_builder(&[&adapter], DType::F32, device)?;
+        let mut pipeline = Self::load_inner_with_ip(model_dir, device, Some(&ip_vb))?;
+
+        let vb = sd_loader::safetensors_var_builder(&[&encoder_weights], DType::F32, device)?;
+        let vision = ClipVisionEncoder::new(&ClipVisionConfig::vit_h_14(), vb)?;
+        let proj = ImageProjModel::new(1024, 768, NUM_TOKENS, ip_vb.pp("image_proj"))?;
+        pipeline.ip = Some((vision, proj));
+        Ok(pipeline)
+    }
+
+    /// Whether an IP-Adapter is attached.
+    pub fn has_ip_adapter(&self) -> bool {
+        self.ip.is_some()
+    }
+
+    /// Turn a reference image into the tokens the UNet attends over.
+    ///
+    /// `image` is `[1, 3, h, w]` in `[0, 1]`, resized to the tower's 224 by the
+    /// caller. Returns `[1, 4, 768]`, ready to be appended to a context.
+    pub fn image_tokens(&self, image: &Tensor) -> Result<Tensor, PipelineError> {
+        let (vision, proj) = self.ip.as_ref().ok_or(PipelineError::NoIpAdapter)?;
+        let embeds = vision.image_embeds(&preprocess(image)?)?;
+        Ok(proj.forward(&embeds)?)
+    }
+
+    /// Conditioning that also attends over a reference image.
+    ///
+    /// The image tokens ride on the end of the context; the cross-attention
+    /// layers split them off. That is why no other signature here changed.
+    pub fn encode_conditioning_with_image(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        image: &Tensor,
+    ) -> Result<Conditioning, PipelineError> {
+        let base = self.encode_conditioning(prompt, negative_prompt)?;
+        let tokens = self.image_tokens(image)?;
+        // Both guidance rows get the image, for the same reason both get the
+        // control map: guidance contrasts the prompts.
+        let doubled = Tensor::cat(&[&tokens, &tokens], 0)?;
+        Ok(Conditioning {
+            context: Tensor::cat(&[&base.context, &doubled], 1)?,
+        })
     }
 
     /// Encode a prompt pair once, for reuse across a sequence.

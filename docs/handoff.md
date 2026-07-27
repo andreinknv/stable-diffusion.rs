@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 302 tests, all gates green
+table is in [roadmap.md](roadmap.md). 306 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -135,6 +135,49 @@ Two things make it look broken if missed, both documented on the module:
 guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
+
+**IP-Adapter works**, `sdrs txt2img --ip-adapter <ckpt> --image-encoder <dir>
+--ip-image <img>`, verified against diffusers at **2.267e-6** through the whole
+UNet and **1.016e-6** at scale 0.
+
+The A/B that shows it: same prompt ("a photograph of a castle on a hill"),
+same seed, a crab photograph as reference. `--ip-scale 0` gives a castle;
+`--ip-scale 1` gives a crab on sand — the reference overrides the prompt
+entirely at full strength, which is why published guidance uses 0.5-0.7. Both
+in `assets/`.
+
+**Decoupled cross-attention, not concatenation.** Each of the sixteen cross-
+attention layers gains a second key/value pair and returns
+`attn(text) + scale * attn(image)`, with `to_out` applied once to the sum.
+Appending the image tokens to the text ones is a *different function* —
+attention is not linear in K and V — and a plausible-looking one.
+
+**The image tokens ride on the end of the context tensor** and the attention
+layers split them off. That convention is why nothing between the pipeline and
+the attention needed a new parameter: no block type, no transformer, no UNet
+signature changed.
+
+**The weights reach sixteen layers without sixteen parameters either.** The
+source is installed thread-locally for the duration of
+`UNet2DConditionModel::new_with_ip` and each cross-attention pulls the next
+slot as it is built — construction-scoped, released by a guard, never read
+outside that one call. It refuses if the count does not come out exactly at
+sixteen, because consuming too few would leave the deepest layers
+unconditioned and still render.
+
+**The index order was the risk, and it is pinned.** The checkpoint numbers its
+entries by diffusers' flat processor order — down blocks, up blocks, then
+**mid** — while this UNet builds down, **mid**, up. Entries sit at *odd*
+indices because that list alternates self- and cross-attention. So slot `i`
+maps to key `2 * order[i] + 1` with
+`order = [0..5, 15, 6..14]`. A wrong mapping mostly fails to load, but
+*between the two 1280-wide regions it would not*, and the image would simply
+be wrong — which is why the verification is end-to-end through the UNet rather
+than per module.
+
+The strength is thread-local rather than a process global, unlike
+`conv::seamless`: two threads may want different strengths, and a shared one
+made two tests race.
 
 **CLIP's vision tower is ported and verified** — 1.270e-4 on the sequence,
 3.485e-6 on the pooled vector, against `transformers`. This is IP-Adapter's
@@ -527,22 +570,22 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. Finish IP-Adapter
+### 1. Motion modules (AnimateDiff)
 
-The vision tower is done and verified (above). What remains is the adapter:
+The last item from the animation issue, and the only large one left. Temporal
+attention layers inserted into the UNet, turning "N images that share a seed"
+into "frames of one motion".
 
-- `ImageProjModel` — `Linear(1024 -> 4*768)` then LayerNorm, giving 4 image
-  tokens. Small.
-- **Decoupled cross-attention**, which is the real work. Each of the 16 cross-
-  attention layers gains `to_k_ip`/`to_v_ip`, and the output becomes
-  `attn(text) + scale * attn(image)`. Not a concatenation — attention is not
-  linear in K and V, so appending the image tokens to the text ones is a
-  different function, and a plausible-looking one.
-- Threading the image tokens to those layers. The cheap route is to carry them
-  on the end of the `context` tensor and have `Attention` split off the last
-  `n` tokens, which needs no signature changes anywhere in the block tree.
-- The index mapping above must be verified against a reference rather than
-  trusted, since a wrong order is silent.
+Two things make it less daunting than it looks now. The **installation
+mechanism already exists**: `unet::ip` demonstrates reaching every attention
+layer during construction without threading a parameter, and a motion module
+needs the same shape of wiring. And the **batch axis is the frame axis** —
+temporal attention attends across it — so the change is mostly about giving
+the UNet a notion of frames rather than about new maths.
+
+The trap to expect, by analogy with IP-Adapter: whatever order the checkpoint
+numbers its layers in will not be this UNet's construction order, and it will
+be silent. Verify end to end against a reference, not per module.
 
 ### ~~2. TAESD and step previews~~ — both done
 

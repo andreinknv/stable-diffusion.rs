@@ -17,6 +17,7 @@ pub mod clip;
 pub mod controlnet;
 pub mod esrgan;
 pub mod flux;
+pub mod ip_adapter;
 pub mod sd3;
 pub mod t5;
 pub mod unet;

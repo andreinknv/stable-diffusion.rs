@@ -114,6 +114,26 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f64,
 
+        /// Condition on a reference image (IP-Adapter). Path to
+        /// `ip-adapter_sd15.safetensors`.
+        ///
+        /// Needs --ip-image and --image-encoder. The reference supplies style
+        /// and identity; the prompt still supplies content.
+        #[arg(long)]
+        ip_adapter: Option<String>,
+
+        /// The reference image for --ip-adapter.
+        #[arg(long)]
+        ip_image: Option<String>,
+
+        /// CLIP vision tower directory (h94/IP-Adapter's models/image_encoder).
+        #[arg(long)]
+        image_encoder: Option<String>,
+
+        /// IP-Adapter strength. 0 contributes exactly nothing.
+        #[arg(long, default_value_t = 1.0)]
+        ip_scale: f64,
+
         /// Make the image tile seamlessly, by padding every convolution
         /// circularly so the model never sees an edge.
         ///
@@ -662,6 +682,10 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
+            ip_adapter,
+            ip_image,
+            image_encoder,
+            ip_scale,
             seamless,
             preview_every,
             taesd,
@@ -743,14 +767,54 @@ fn main() -> Result<()> {
                             )
                             .with_context(|| format!("loading {m} with LoRA {l}"))?
                         }
-                        None => Txt2ImgPipeline::load(Path::new(m), &dev)
-                            .with_context(|| format!("loading pipeline from {m}"))?,
+                        None => match (&ip_adapter, &image_encoder) {
+                            (Some(a), Some(e)) => {
+                                tracing::info!(adapter = %a, scale = ip_scale, "IP-Adapter");
+                                Txt2ImgPipeline::load_with_ip_adapter(
+                                    Path::new(m),
+                                    &dev,
+                                    Path::new(a),
+                                    Path::new(e),
+                                )
+                                .with_context(|| format!("loading {m} with IP-Adapter {a}"))?
+                            }
+                            (None, None) => Txt2ImgPipeline::load(Path::new(m), &dev)
+                                .with_context(|| format!("loading pipeline from {m}"))?,
+                            _ => anyhow::bail!(
+                                "--ip-adapter and --image-encoder must be given together"
+                            ),
+                        },
                     };
                     let pipeline = with_taesd(pipeline, taesd.as_deref())?;
                     let mut report = previewing(&pipeline, preview_every, &output);
-                    pipeline
-                        .run_with_progress(&cfg, &mut report)
-                        .context("running txt2img")?
+                    match ip_image.as_deref() {
+                        Some(path) if pipeline.has_ip_adapter() => {
+                            // 224 is the tower's input size; [0, 1] is its range.
+                            let image = sd::image_io::load_rgb_unit_resized(path, 224, 224, &dev)
+                                .with_context(|| format!("reading {path}"))?;
+                            let cond = pipeline
+                                .encode_conditioning_with_image(
+                                    &cfg.prompt,
+                                    &cfg.negative_prompt,
+                                    &image,
+                                )
+                                .context("encoding the reference image")?;
+                            // Held for the run: the strength reaches sixteen
+                            // attention layers and reverts on drop.
+                            let _scale = sd::models::unet::ip::with_scale(ip_scale);
+                            pipeline
+                                .run_conditioned(&cfg, &[cond], &mut |_, _| 0, None, &mut report)
+                                .context("running txt2img with IP-Adapter")?
+                                .0
+                        }
+                        Some(_) => anyhow::bail!("--ip-image needs --ip-adapter"),
+                        None if pipeline.has_ip_adapter() => {
+                            anyhow::bail!("--ip-adapter needs --ip-image")
+                        }
+                        None => pipeline
+                            .run_with_progress(&cfg, &mut report)
+                            .context("running txt2img")?,
+                    }
                 }
             };
 
