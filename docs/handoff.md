@@ -15,24 +15,35 @@ sensible default rather than a broken option.
 | SD 1.5 512, 20 steps | 113 s | **17.5 s** | max 1/255, 98.8% of pixels exact |
 | SDXL 1024, 20 steps | — | **86.5 s** | verified this session; `assets/sdxl-crab-1024-metal-f16.png` |
 | Flux schnell (12B) 512, 4 steps | 159 s | **20.8 s** | mean 9.2/255, same image |
-| SD 3.5 medium 512, 20 steps | 230 s | **25.1 s** † | — |
-| SD 3.5 medium 256, 20 steps | 71.8 s | **9.0 s** | mean 7.0/255, same image |
+| SD 3.5 medium 512, 20 steps | 230 s (dense) | **24.5 s** † | now Q4_K_M by default |
+| SD 3.5 medium 256, 20 steps | 71.8 s (dense) | **9.0 s** | mean 7.0/255, same image |
 | Flux mini (3.2B) 512, 20 steps | 212 s | does not fit ‡ | — |
 
-† **Marginal, not reliable.** That 25.1 s run is real, but SD 3.5 on Metal
-succeeds or fails on how much memory the machine happens to have: loading the
-dense f32 transformer leaves about **1.1 GB free of 36 GB**, and with anything
-else running the job dies in denoise **step 1**. It is not a decode problem.
-An earlier note in this file blamed the VAE decode, because that was where the
-error surfaced — candle queues Metal work and only reports a failed command
-buffer at the next synchronisation point, so the first thing to synchronise
-gets the blame. Synchronising after each step puts it at step 1. Item 1 below
-is the fix.
+† **Now the quantised checkpoint, and reliable.** `sd3_paths_in` prefers
+`sd35-medium-q4_k_m.gguf` (1.79 GB) over the dense `.safetensors` (10.2 GB at
+f32) exactly as Flux's `paths_in` does. Loading drops from 14.7 s to ~4 s, and
+512 renders in 24.5 s on a quiet machine — and, more to the point, it keeps
+working under load, where the dense build died in denoise **step 1** leaving
+1.1 GB free of 36 GB.
+
+That step-1 failure was recorded here for several sessions as a *VAE decode*
+failure, which was wrong: candle queues Metal work and reports a failed
+command buffer only at the next synchronisation point, so the blame lands on
+whatever waits first. See the trap below.
 
 ‡ Flux mini holds dense f32 weights: 12.8 GB for a 3.2B model, against
 schnell's 6.8 GB for 12B held as Q4_K. Quantisation is what makes the *larger*
 model the one that runs — worth remembering before reaching for a dense
-checkpoint, and the same reason SD 3.5 needs item 1.
+checkpoint. Unlike SD 3.5, no quantised flux-mini has been published, so this
+one has no equivalent fix available.
+
+**Quantised is not free on CPU**, and the default now takes that trade
+knowingly: SD 3.5 at 256 on CPU is 93 s quantised against 72 s dense, because
+candle's CPU quantised matmul quantises the activation per call where a dense
+f32 matmul just runs gemm. It is the right default anyway — Metal is 6-9x
+faster than either and the quantised form is what fits there — but if you are
+benchmarking CPU specifically, point `Sd3Paths::transformer` at the
+`.safetensors` and expect the dense numbers.
 
 **The VAE decode now sizes its own tile.** `decode_tiled` picks the largest
 edge from 64 down whose projected peak fits the memory that is actually free,
@@ -49,7 +60,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 233 tests, all gates green
+table is in [roadmap.md](roadmap.md). 235 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -66,23 +77,23 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. An SD 3 GGUF loader — the one thing that would make SD 3.5 fit
+### 1. Model offloading — the general form of every memory problem here
 
-`Sd3Pipeline::load` already branches on a `.gguf` transformer, and
-`tests/golden/sd35/sd35-medium-q4_k_m.gguf` already exists at **1.79 GB
-against the dense checkpoint's 10.2 GB at f32**. The branch does not work:
-it calls `sd_loader::flux_qtensors_from_gguf`, which requires Flux's
-`double_blocks.*` naming and refuses SD 3.5's MMDiT layout outright. Point
-`sd3_paths_in` at the GGUF today and the model stops loading entirely.
+Every pipeline loads all five models onto the device and holds them there for
+the whole run. That is why SD 3.5's load leaves ~1.1 GB free of 36 GB dense,
+and why `run_releasing` — which drops what the decode does not need — buys
+only ~0.7 GB: by then almost everything has already been paid for.
 
-So it needs an SD 3 tensor-name mapping alongside the Flux one. That is the
-whole job, and it is the difference between SD 3.5 running on Metal and not:
-loading the dense form leaves **1.1 GB free on a 36 GB machine**, and the run
-then dies in denoise **step 1**. The golden tests (`golden_sd3`) will catch a
-wrong name mapping immediately, and Flux's quantised path is the template.
+diffusers solves this with `enable_model_cpu_offload` (move each module to the
+GPU as it is needed, back to the CPU after) and `enable_sequential_cpu_offload`
+(the same at submodule granularity, slower and smaller). ComfyUI does its own
+aggressive model management. **This is settled practice we simply do not
+implement**, and it would help every model rather than one — text encoders in
+particular are used once, at the start, and then held for the entire denoise.
 
-Expect roughly the Flux outcome: quantisation is what makes the *larger* model
-the one that runs.
+Worth reading how diffusers structures it before designing anything: the hard
+part is not the moving, it is deciding the granularity and keeping the device
+placement out of every model's forward.
 
 ### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
 

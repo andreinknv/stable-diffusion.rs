@@ -16,7 +16,9 @@ pub mod gguf;
 pub mod ldm;
 pub mod t5_gguf;
 
-pub use flux_gguf::{flux_block_counts, flux_has_guidance, flux_qtensors_from_gguf};
+pub use flux_gguf::{
+    flux_block_counts, flux_has_guidance, flux_qtensors_from_gguf, sd3_qtensors_from_gguf,
+};
 pub use gguf::{
     clip_var_builder_from_gguf, gguf_var_builder, unet_var_builder_from_gguf,
     vae_var_builder_from_gguf, GgufInfo, Layout,

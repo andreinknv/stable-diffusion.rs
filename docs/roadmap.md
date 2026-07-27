@@ -319,7 +319,7 @@ separable from this bug while it stood:
 | SD 1.5 512, 20 steps | 113 s | **17.5 s** | max 1/255, 98.8% of pixels exact |
 | SDXL 1024, 20 steps | — | **86.5 s** | renders correctly |
 | Flux schnell 512, 4 steps | 159 s | **20.8 s** | mean 9.2/255, same image |
-| SD 3.5 medium 512, 20 steps | 230 s | **25.1 s** | marginal — see below |
+| SD 3.5 medium 512, 20 steps | 230 s (dense) | **24.5 s** | now Q4_K_M by default |
 | SD 3.5 medium 256, 20 steps | 71.8 s | **9.0 s** | mean 7.0/255, same image |
 | Flux mini 512, 20 steps | 212 s | does not fit | dense f32, 12.8 GB resident |
 
@@ -337,11 +337,24 @@ the command buffer only when something synchronises, so the failure is
 attributed to whatever waits first, and the decode was simply the first thing
 to wait. A `synchronize()` after each step moves it to step 1.
 
-The fix is not a smaller decode tile — it is the 1.79 GB Q4_K_M GGUF that
-already sits in the fixtures and cannot yet be loaded, because
-`Sd3Pipeline::load` routes a `.gguf` transformer to `flux_qtensors_from_gguf`
-and that loader requires Flux's `double_blocks.*` naming. An SD 3 name mapping
-is the top handoff item.
+The fix was not a smaller decode tile — it was the 1.79 GB Q4_K_M GGUF sitting
+unused in the fixtures. **That turned out to need no name mapping at all**,
+which is worth recording because the handoff predicted otherwise: city96's
+SD 3.5 GGUF carries the original Stability names
+(`joint_blocks.0.context_block.attn.qkv.weight`, `x_embedder`, `pos_embed`,
+`final_layer.linear`) and `sd_models::sd3` already asks for exactly those. The
+Flux GGUF loader does no renaming either — it was rejecting the file purely on
+a `double_blocks.` sentinel check.
+
+So `sd3_qtensors_from_gguf` is `flux_qtensors_from_gguf` with a different
+sentinel, and the two share one body. Reading the tensor names out of the file
+answered in two minutes what had been written up as a mapping project.
+
+SD 3.5 now loads in ~4 s instead of 14.7 s, renders 512 on Metal in 24.5 s,
+and keeps working under memory pressure that killed the dense build. The cost
+is CPU speed — 93 s against 72 s at 256 — because candle's CPU quantised
+matmul quantises the activation per call where a dense f32 matmul just runs
+gemm.
 
 **Root cause: candle 0.11's Metal quantised matmul ignores the activation's
 `start_offset`.** A tensor that is a view into the middle of a larger buffer is

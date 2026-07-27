@@ -53,20 +53,21 @@ pub struct Sd3Paths {
 
 /// Fixture layout used by this repository.
 ///
-/// **Deliberately the dense `.safetensors`, even though a 1.79 GB Q4_K_M GGUF
-/// sits beside it.** `load` below dispatches a `.gguf` transformer to
-/// `flux_qtensors_from_gguf`, which requires Flux's `double_blocks.*` naming
-/// and rejects SD 3.5's MMDiT layout outright. Preferring the quantised file
-/// the way Flux's `paths_in` does therefore breaks the model rather than
-/// shrinking it.
-///
-/// That is worth fixing rather than working around: the dense transformer is
-/// 10.2 GB at f32 against 1.79 GB quantised, and on a 36 GB Mac that is the
-/// difference between SD 3.5 running at 512 on Metal and running out of memory
-/// in the first denoise step. See the handoff.
+/// Prefers the quantised transformer when one is present, exactly as Flux's
+/// `paths_in` does, and for a reason that outweighs the small quantisation
+/// error: the dense checkpoint is 10.2 GB at f32 against 1.79 GB at Q4_K_M,
+/// and on a 36 GB Mac that decides whether SD 3.5 runs on the GPU at all.
+/// Loading the dense form leaves about 1.1 GB free and the run then fails in
+/// the first denoise step.
 pub fn sd3_paths_in(dir: &Path) -> Sd3Paths {
+    let quantised = dir.join("sd35-medium-q4_k_m.gguf");
+    let transformer = if quantised.exists() {
+        quantised
+    } else {
+        dir.join("sd35-medium.safetensors")
+    };
     Sd3Paths {
-        transformer: dir.join("sd35-medium.safetensors"),
+        transformer,
         clip_l: dir.join("clip-l.safetensors"),
         clip_g: dir.join("clip-g.safetensors"),
         clip_tokenizer: dir.join("../flux/clip-tokenizer.json"),
@@ -141,7 +142,7 @@ impl Sd3Pipeline {
         let t5 = T5EncoderModel::from_quantized(&T5Config::xxl(), &weights)?;
 
         let transformer = if paths.transformer.extension().is_some_and(|e| e == "gguf") {
-            let w = sd_loader::flux_qtensors_from_gguf(&paths.transformer, device)?;
+            let w = sd_loader::sd3_qtensors_from_gguf(&paths.transformer, device)?;
             Sd3Transformer::from_quantized(cfg, &w)?
         } else {
             let vb = sd_loader::safetensors_var_builder(&[&paths.transformer], DTYPE, device)?;
