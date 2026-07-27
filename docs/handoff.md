@@ -136,6 +136,52 @@ guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
 
+**SD 2.x renders**, `sdrs txt2img --model <sd21-dir>`, verified against
+diffusers at **3.696e-5** on the UNet output with all twelve skips and the mid
+block inside the same bound SD 1.5 uses. `assets/sd21-crab-512.png`.
+
+Almost all of it was already there. SD 2.x is SD 1.5's block geometry with a
+1024-wide OpenCLIP ViT-H behind it: SDXL-style head counts (`[5, 10, 20, 20]`,
+all 64 wide), `Linear` transformer projections rather than 1x1 convolutions,
+and `ClipActivation::Gelu`. Two things are worth knowing:
+
+**The text encoder has 23 layers, not 24.** SD 2.x conditions on the
+penultimate hidden state, so the conversion to diffusers format drops the last
+layer outright — the shipped checkpoint has 23 and the ordinary "last layer,
+then `final_layer_norm`" path is then exactly right. Reaching for
+`penultimate_hidden_state` here would silently condition on layer 22.
+
+**It is v-prediction, and that is invisible in the weights.** The model outputs
+`v`, not noise, so `x0 = x/(1+sigma^2) - v*sigma/sqrt(1+sigma^2)`. Sampled as
+epsilon it loads, runs, and reports nothing wrong — it just returns saturated
+colour noise. That is measured: forcing the detection to `Epsilon` for this
+checkpoint and rendering the same seed gives no crab at all, where
+v-prediction gives a sharp one.
+
+Both the architecture and the prediction type are **detected, not flagged**.
+The architecture comes from a tensor shape — the cross-attention key
+projection is 768 wide for SD 1.5 and 1024 for SD 2.x — via
+`sd_tensor::tensor_shape`, which reads a safetensors header without loading
+data. The prediction type comes from a substring test on
+`scheduler_config.json`, deliberately: the token is unambiguous and a JSON
+parser for one boolean is not worth a dependency this workspace otherwise does
+without.
+
+**Stock SD 2.x is gated on HuggingFace** — every `stabilityai/stable-diffusion-2*`
+repo 401s, and so do the community mirrors, while unrelated repos return 200.
+The verification above uses `friedrichor/stable-diffusion-2-1-realistic`, an
+open fine-tune with byte-identical architecture and the same v-prediction
+scheduler. Anyone with an accepted licence can point the same dumper at the
+stock checkpoint.
+
+**Flux and SD 3.5 have CLI subcommands**: `sdrs flux --model <dir>` and
+`sdrs sd3 --model <dir>`. `--model` is a *directory* and that was the whole
+design question — Flux needs four checkpoints plus two tokenizers, SD 3 six
+files, and naming each would be flags nobody remembers. `paths_in` and
+`sd3_paths_in` already took a directory, so the answer was sitting in the
+codebase. Both support `--taesd`, `--preview-every` and `--stream`; SD 3 also
+takes `--encoders-on-cpu`.
+
 **Step previews work for all four architectures** — SD 1.5 and SDXL via
 `--preview-every N`, Flux and SD 3.5 via `SD_PREVIEW_EVERY` on their examples.
 This is what the tiny decoder was for: a 20-step run no longer sits blank for

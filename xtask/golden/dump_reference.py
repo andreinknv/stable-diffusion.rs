@@ -831,6 +831,8 @@ def dump_unet_full(output: pathlib.Path, model_id: str) -> None:
     from diffusers import UNet2DConditionModel
     from safetensors.torch import save_file
 
+    # SD 2.x has its own directory: same code path, 1024-wide cross attention
+    # and a different config, so the two sets of tensors are not comparable.
     out = output / "unet_full"
     out.mkdir(parents=True, exist_ok=True)
 
@@ -839,11 +841,15 @@ def dump_unet_full(output: pathlib.Path, model_id: str) -> None:
         model_id, subfolder="unet", torch_dtype=torch.float32
     )
     unet.eval()
+    cross = unet.config.cross_attention_dim
+    if cross != 768:
+        out = output / f"unet_full_cross{cross}"
+        out.mkdir(parents=True, exist_ok=True)
 
     gen = torch.Generator().manual_seed(SEED)
     sample = torch.randn(1, 4, 32, 32, generator=gen)
     timestep = torch.tensor([500.0])
-    context = torch.randn(1, 77, 768, generator=gen)
+    context = torch.randn(1, 77, cross, generator=gen)
 
     # diffusers returns the skip stack from its own down pass, but only
     # internally, so reproduce the push order with hooks instead: conv_in
@@ -1046,6 +1052,102 @@ def dump_taesd(output: pathlib.Path, model_id: str) -> None:
         print(f"  {k:<13} {tuple(v.shape)}  range [{v.min():.3f}, {v.max():.3f}]")
     print(f"linked {link} -> {weights}")
     print(f"\nconfig: {dict(tae.config)}")
+
+
+def dump_esrgan(output: pathlib.Path, model_id: str) -> None:
+    """Real-ESRGAN x4 (RRDBNet), converted from .pth and run once.
+
+    The checkpoint is a pickled torch state dict, not safetensors, so this
+    converts it — that conversion is the only reason the Rust side needs a
+    Python step at all. Weights are stored under `params_ema` in the official
+    release; older mirrors use `params` or a bare dict, so all three are tried.
+    """
+    torch = _require("torch")
+    from safetensors.torch import save_file
+
+    out = output / "esrgan"
+    out.mkdir(parents=True, exist_ok=True)
+
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    print(f"loading {model_id}")
+    src = hf_hub_download(repo_id=model_id, filename="RealESRGAN_x4.pth")
+    blob = torch.load(src, map_location="cpu", weights_only=True)
+    state = blob.get("params_ema", blob.get("params", blob))
+    state = {k: v.contiguous().float() for k, v in state.items()}
+    save_file(state, str(out / "esrgan_x4.safetensors"))
+
+    # A small input: 4x of 64 is 256, which is enough to see the upsampling
+    # and small enough to commit alongside the other references.
+    gen = torch.Generator().manual_seed(SEED)
+    image = torch.rand(1, 3, 64, 64, generator=gen)
+
+    # Rebuild the architecture here rather than importing basicsr, which drags
+    # in a large dependency for forty lines of convolutions.
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class RDB(nn.Module):
+        def __init__(self, nf=64, gc=32):
+            super().__init__()
+            self.conv1 = nn.Conv2d(nf, gc, 3, 1, 1)
+            self.conv2 = nn.Conv2d(nf + gc, gc, 3, 1, 1)
+            self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, 1, 1)
+            self.conv4 = nn.Conv2d(nf + 3 * gc, gc, 3, 1, 1)
+            self.conv5 = nn.Conv2d(nf + 4 * gc, nf, 3, 1, 1)
+            self.lrelu = nn.LeakyReLU(0.2, True)
+
+        def forward(self, x):
+            x1 = self.lrelu(self.conv1(x))
+            x2 = self.lrelu(self.conv2(torch.cat((x, x1), 1)))
+            x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))
+            x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))
+            x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
+            return x5 * 0.2 + x
+
+    class RRDB(nn.Module):
+        def __init__(self, nf=64, gc=32):
+            super().__init__()
+            self.rdb1, self.rdb2, self.rdb3 = RDB(nf, gc), RDB(nf, gc), RDB(nf, gc)
+
+        def forward(self, x):
+            return self.rdb3(self.rdb2(self.rdb1(x))) * 0.2 + x
+
+    class RRDBNet(nn.Module):
+        def __init__(self, nf=64, nb=23, gc=32):
+            super().__init__()
+            self.conv_first = nn.Conv2d(3, nf, 3, 1, 1)
+            self.body = nn.Sequential(*[RRDB(nf, gc) for _ in range(nb)])
+            self.conv_body = nn.Conv2d(nf, nf, 3, 1, 1)
+            self.conv_up1 = nn.Conv2d(nf, nf, 3, 1, 1)
+            self.conv_up2 = nn.Conv2d(nf, nf, 3, 1, 1)
+            self.conv_hr = nn.Conv2d(nf, nf, 3, 1, 1)
+            self.conv_last = nn.Conv2d(nf, 3, 3, 1, 1)
+            self.lrelu = nn.LeakyReLU(0.2, True)
+
+        def forward(self, x):
+            feat = self.conv_first(x)
+            feat = feat + self.conv_body(self.body(feat))
+            feat = self.lrelu(self.conv_up1(F.interpolate(feat, scale_factor=2, mode="nearest")))
+            feat = self.lrelu(self.conv_up2(F.interpolate(feat, scale_factor=2, mode="nearest")))
+            return self.conv_last(self.lrelu(self.conv_hr(feat)))
+
+    net = RRDBNet()
+    net.load_state_dict(state)
+    net.eval()
+    with torch.no_grad():
+        result = net(image)
+
+    tensors = {
+        "image": image.contiguous(),
+        "output": result.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<8} {tuple(v.shape)}  range [{v.min():.3f}, {v.max():.3f}]")
+    print(f"converted {len(state)} tensors -> {out / 'esrgan_x4.safetensors'}")
 
 
 SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
@@ -1390,6 +1492,10 @@ def main() -> None:
     )
     unet_full.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    esr = sub.add_parser("esrgan", help="dump Real-ESRGAN x4 references")
+    esr.add_argument("--model-id", default="ai-forever/Real-ESRGAN")
+    esr.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     tae = sub.add_parser("taesd", help="dump TAESD tiny autoencoder references")
     tae.add_argument("--model-id", default="madebyollin/taesd")
     tae.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -1419,7 +1525,9 @@ def main() -> None:
     gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
     args = ap.parse_args()
-    if args.component == "taesd":
+    if args.component == "esrgan":
+        dump_esrgan(args.output, args.model_id)
+    elif args.component == "taesd":
         dump_taesd(args.output, args.model_id)
     elif args.component == "controlnet":
         dump_controlnet(args.output, args.model_id)

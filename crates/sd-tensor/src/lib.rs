@@ -25,6 +25,26 @@ pub use candle_core::{
 };
 pub use candle_nn::VarBuilder;
 
+/// Read one tensor's shape from a safetensors file without loading any data.
+///
+/// For deciding *which* model a checkpoint is before building it. The
+/// alternative is parsing `config.json`, which means a JSON dependency and
+/// trusting a file that need not be present — a `.safetensors` always carries
+/// its own shapes, and they are the thing that has to match.
+///
+/// `Ok(None)` means the file is readable and has no such tensor, which is the
+/// answer a caller probing for an architecture wants; only an unreadable or
+/// malformed file is an error.
+pub fn tensor_shape(path: &std::path::Path, name: &str) -> Result<Option<Vec<usize>>> {
+    // Safety: candle's own loader mmaps these files the same way.
+    let mapped = unsafe { candle_core::safetensors::MmapedSafetensors::new(path)? };
+    Ok(mapped
+        .tensors()
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, view)| view.shape().to_vec()))
+}
+
 /// Layers we build models out of. Re-exported so model crates never name candle.
 pub mod nn {
     pub use candle_nn::{

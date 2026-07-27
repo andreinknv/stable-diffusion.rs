@@ -82,6 +82,31 @@ impl ClipTextConfig {
         }
     }
 
+    /// SD 2.x's text encoder: OpenCLIP ViT-H/14.
+    ///
+    /// **23 layers, not 24**, and that is not a typo. SD 2.x conditions on the
+    /// *penultimate* hidden state, so the conversion to diffusers format drops
+    /// the final layer outright — the shipped checkpoint has 23 and the normal
+    /// "last layer, then `final_layer_norm`" path is then exactly right.
+    /// Building 24 here would fail to load, which is the good direction, but
+    /// reaching for [`ClipTextEncoder::penultimate_hidden_state`] instead would
+    /// silently condition on layer 22.
+    pub fn sd2() -> Self {
+        Self {
+            vocab_size: 49408,
+            hidden_size: 1024,
+            intermediate_size: 4096,
+            num_hidden_layers: 23,
+            num_attention_heads: 16,
+            max_position_embeddings: 77,
+            layer_norm_eps: 1e-5,
+            // OpenCLIP activates with plain gelu; only OpenAI's CLIP uses the
+            // quick approximation.
+            activation: ClipActivation::Gelu,
+            projection_dim: None,
+        }
+    }
+
     /// SDXL's second text encoder, and SD 3's: OpenCLIP ViT-bigG.
     ///
     /// Bigger in every dimension, and it activates with plain `gelu`.

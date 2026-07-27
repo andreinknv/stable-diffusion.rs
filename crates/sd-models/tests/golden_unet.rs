@@ -329,3 +329,70 @@ fn a_quantised_ldm_unet_runs_through_the_name_map() {
         "the prediction is not the reference's: correlation {corr:.4} ({c})"
     );
 }
+
+// -- SD 2.x ---------------------------------------------------------------
+
+fn sd2_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/unet_full_cross1024")
+}
+
+#[test]
+fn config_sd2_is_sd15_geometry_with_a_wider_text_encoder() {
+    let cfg = UNetConfig::sd2();
+    // The block geometry is SD 1.5's exactly.
+    assert_eq!(
+        cfg.block_out_channels,
+        UNetConfig::sd15().block_out_channels
+    );
+    assert_eq!(cfg.layers_per_block, 2);
+    assert_eq!(cfg.down_block_has_attention, vec![true, true, true, false]);
+    // What differs: a 1024-wide text encoder, SDXL-style head counts (all 64
+    // wide), and Linear rather than 1x1-conv projections.
+    assert_eq!(cfg.cross_attention_dim, 1024);
+    assert_eq!(cfg.attention_head_dim, vec![5, 10, 20, 20]);
+    for (c, h) in cfg.block_out_channels.iter().zip(&cfg.attention_head_dim) {
+        assert_eq!(c / h, 64, "every head is 64 wide");
+    }
+    assert!(cfg.use_linear_projection);
+    // No micro-conditioning: that is SDXL's alone.
+    assert!(cfg.addition.is_none());
+    // The skip stack is unchanged, so the up blocks are too.
+    assert_eq!(cfg.skip_channels(), UNetConfig::sd15().skip_channels());
+}
+
+#[test]
+fn sd2_matches_diffusers_skip_for_skip() {
+    let dev = Device::Cpu;
+    let path = sd2_dir().join("reference.safetensors");
+    if !path.exists() {
+        eprintln!(
+            "SKIP: no SD 2.x reference. Generate it with:\n\n    \
+             python3 xtask/golden/dump_reference.py unet_full \
+             --model-id friedrichor/stable-diffusion-2-1-realistic --output tests/golden\n"
+        );
+        return;
+    }
+    let refs = sd_tensor::safetensors::load(&path, &dev).expect("loading reference");
+    let weights = sd2_dir().join("unet.safetensors");
+    if !weights.exists() {
+        eprintln!("SKIP: no SD 2.x unet.safetensors");
+        return;
+    }
+    let vb = sd_loader::safetensors_var_builder(&[&weights], DType::F32, &dev).expect("weights");
+    let unet = UNet2DConditionModel::new(&UNetConfig::sd2(), vb).expect("building SD 2 UNet");
+
+    let (out, skips, mid) = unet
+        .forward_with_skips(&refs["sample"], &refs["timestep"], &refs["context"], None)
+        .expect("forward");
+
+    for (i, got) in skips.iter().enumerate() {
+        let key = format!("down_{i:02}");
+        let excess = testing::allclose_excess(got, &refs[&key], UNET_RTOL).expect("compare");
+        assert!(excess <= UNET_ATOL, "{key}: excess {excess:.3e}");
+    }
+    let excess = testing::allclose_excess(&mid, &refs["mid_output"], UNET_RTOL).expect("compare");
+    assert!(excess <= UNET_ATOL, "mid_output: excess {excess:.3e}");
+    let excess = testing::allclose_excess(&out, &refs["output"], UNET_RTOL).expect("compare");
+    assert!(excess <= UNET_ATOL, "output: excess {excess:.3e}");
+    println!("sd2 output excess {excess:.3e}");
+}

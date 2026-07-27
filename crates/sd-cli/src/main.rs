@@ -131,6 +131,104 @@ enum Command {
         taesd: Option<String>,
     },
 
+    /// Generate with Flux (schnell, dev, or flux-mini).
+    ///
+    /// `--model` is a *directory*, not a file. Flux needs four checkpoints —
+    /// transformer, T5, CLIP-L and VAE — plus two tokenizers, and naming each
+    /// on the command line would be six flags nobody can remember. The layout
+    /// is the one `paths_in` expects; run `sdrs flux --model <dir>` and any
+    /// missing file is named in the error.
+    #[command(name = "flux")]
+    Flux {
+        #[arg(long)]
+        model: String,
+
+        #[arg(long)]
+        prompt: String,
+
+        #[arg(long, default_value_t = 4)]
+        steps: usize,
+
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        /// Distilled guidance, *not* a CFG weight. Ignored by schnell, which
+        /// has none; 3.5 is what dev is distilled around.
+        #[arg(long, default_value_t = 3.5)]
+        guidance: f64,
+
+        /// Keep the transformer's blocks in host memory, copying each in as
+        /// it is reached. For a device too small to hold the model.
+        #[arg(long)]
+        stream: bool,
+
+        /// Decode with `madebyollin/taef1` — 16-channel, not `taesd`.
+        #[arg(long)]
+        taesd: Option<String>,
+
+        #[arg(long)]
+        preview_every: Option<usize>,
+
+        #[arg(long, short, default_value = "flux.png")]
+        output: String,
+    },
+
+    /// Generate with SD 3.x.
+    ///
+    /// `--model` is a directory, for the same reason as `flux`: SD 3 needs six
+    /// files. Note `sd3_paths_in` looks for the shared CLIP tokenizer and T5
+    /// alongside in `../flux`, since both architectures use them.
+    #[command(name = "sd3")]
+    Sd3 {
+        #[arg(long)]
+        model: String,
+
+        #[arg(long)]
+        prompt: String,
+
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+
+        #[arg(long, default_value_t = 4.5)]
+        cfg_scale: f64,
+
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        /// Run the three text encoders on the CPU. They execute once and then
+        /// hold more memory than the transformer does.
+        #[arg(long)]
+        encoders_on_cpu: bool,
+
+        #[arg(long)]
+        stream: bool,
+
+        /// Decode with `madebyollin/taesd3` — 16-channel, not `taesd`.
+        #[arg(long)]
+        taesd: Option<String>,
+
+        #[arg(long)]
+        preview_every: Option<usize>,
+
+        #[arg(long, short, default_value = "sd3.png")]
+        output: String,
+    },
+
     /// Generate steered by a ControlNet, from an image's Canny edges.
     #[command(name = "controlnet")]
     ControlNet {
@@ -354,6 +452,23 @@ where
             Err(e) => tracing::warn!(step = p.step, error = %e, "preview failed"),
         }
     }
+}
+
+/// The progress callback for Flux and SD 3.
+///
+/// Generic over the pipeline because the two share no trait and the only thing
+/// wanted from either is `preview`; a trait for one method would be more
+/// machinery than the duplication it removes.
+fn flow_progress<'a, P, F>(
+    pipeline: &'a P,
+    every: Option<usize>,
+    output: &'a str,
+    preview: F,
+) -> impl FnMut(sd::pipeline::Progress) + 'a
+where
+    F: Fn(&'a P, &sd_tensor::Tensor) -> Result<sd_tensor::Tensor, sd::pipeline::PipelineError> + 'a,
+{
+    previewing_with(move |t| preview(pipeline, t), every, output)
 }
 
 /// Where a step preview is written: `out.png` -> `out-preview-005.png`.
@@ -595,6 +710,126 @@ fn main() -> Result<()> {
 
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             println!("wrote {output} in {:.1?}", started.elapsed());
+        }
+
+        Command::Flux {
+            model,
+            prompt,
+            steps,
+            width,
+            height,
+            seed,
+            guidance,
+            stream,
+            taesd,
+            preview_every,
+            output,
+        } => {
+            use sd::pipeline::{FluxConfigRun, FluxPipeline, Placement};
+            let paths = sd::pipeline::paths_in(Path::new(&model));
+            // Read the geometry from the checkpoint rather than assuming:
+            // schnell and dev are 19/38 blocks, flux-mini 5/10.
+            let cfg_model = if paths.transformer.extension().is_some_and(|e| e == "gguf") {
+                let (d, sgl) = sd::loader::flux_block_counts(&paths.transformer)?;
+                let guidance = sd::loader::flux_has_guidance(&paths.transformer)?;
+                tracing::info!(double = d, single = sgl, guidance, "checkpoint geometry");
+                sd::models::flux::FluxConfig {
+                    depth: d,
+                    depth_single_blocks: sgl,
+                    guidance_embed: guidance,
+                    ..sd::models::flux::FluxConfig::mini()
+                }
+            } else {
+                sd::models::flux::FluxConfig::mini()
+            };
+            let mut placement = Placement::on(&dev);
+            if stream {
+                placement = placement.with_streamed_diffusion();
+            }
+            let started = std::time::Instant::now();
+            let pipe = FluxPipeline::load_with_placement(&paths, &cfg_model, &placement)
+                .with_context(|| format!("loading Flux from {model}"))?;
+            let pipe = match taesd.as_deref() {
+                Some(p) => pipe
+                    .with_taesd(Path::new(p))
+                    .with_context(|| format!("loading TAESD from {p}"))?,
+                None => pipe,
+            };
+            tracing::info!(elapsed = ?started.elapsed(), "loaded");
+
+            let cfg = FluxConfigRun {
+                prompt,
+                width,
+                height,
+                steps,
+                guidance,
+                seed,
+            };
+            let t1 = std::time::Instant::now();
+            let mut report = flow_progress(&pipe, preview_every, &output, |p, t| p.preview(t));
+            let img = pipe
+                .run_with_progress(&cfg, &mut report)
+                .context("running Flux")?;
+            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
+            tracing::info!(elapsed = ?t1.elapsed(), output = %output, "done");
+        }
+
+        Command::Sd3 {
+            model,
+            prompt,
+            negative_prompt,
+            steps,
+            width,
+            height,
+            cfg_scale,
+            seed,
+            encoders_on_cpu,
+            stream,
+            taesd,
+            preview_every,
+            output,
+        } => {
+            use sd::pipeline::{Placement, Sd3Pipeline, Sd3RunConfig};
+            let paths = sd::pipeline::sd3_paths_in(Path::new(&model));
+            let mut placement = if encoders_on_cpu {
+                Placement::on(&dev).with_text_encoders_on(&sd_tensor::Device::Cpu)
+            } else {
+                Placement::on(&dev)
+            };
+            if stream {
+                placement = placement.with_streamed_diffusion();
+            }
+            let started = std::time::Instant::now();
+            let pipe = Sd3Pipeline::load_with_placement(
+                &paths,
+                &sd::models::sd3::Sd3Config::medium_35(),
+                &placement,
+            )
+            .with_context(|| format!("loading SD 3 from {model}"))?;
+            let pipe = match taesd.as_deref() {
+                Some(p) => pipe
+                    .with_taesd(Path::new(p))
+                    .with_context(|| format!("loading TAESD from {p}"))?,
+                None => pipe,
+            };
+            tracing::info!(elapsed = ?started.elapsed(), "loaded");
+
+            let cfg = Sd3RunConfig {
+                prompt,
+                negative_prompt,
+                width,
+                height,
+                steps,
+                cfg_scale,
+                seed,
+            };
+            let t1 = std::time::Instant::now();
+            let mut report = flow_progress(&pipe, preview_every, &output, |p, t| p.preview(t));
+            let img = pipe
+                .run_with_progress(&cfg, &mut report)
+                .context("running SD 3")?;
+            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
+            tracing::info!(elapsed = ?t1.elapsed(), output = %output, "done");
         }
 
         Command::ControlNet {

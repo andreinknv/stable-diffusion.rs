@@ -69,6 +69,23 @@ impl UNetConfig {
         }
     }
 
+    /// SD 2.x.
+    ///
+    /// SD 1.5's block geometry with a wider text encoder behind it: the cross
+    /// attention takes 1024 rather than 768, the head counts are SDXL-style
+    /// (`[5, 10, 20, 20]`, all 64 wide), and the spatial transformers project
+    /// with `Linear` as SDXL's do rather than SD 1.5's 1x1 convolutions. That
+    /// last one changes the stored weights' rank, so getting it wrong fails to
+    /// load rather than running wrong.
+    pub fn sd2() -> Self {
+        Self {
+            attention_head_dim: vec![5, 10, 20, 20],
+            cross_attention_dim: 1024,
+            use_linear_projection: true,
+            ..Self::sd15()
+        }
+    }
+
     /// SDXL base.
     ///
     /// Three blocks rather than four, attention on the *last two* rather than

@@ -15,6 +15,54 @@ use sd_sample::{
 use sd_tensor::rng::SeededRng;
 use sd_tensor::{DType, Device, Tensor};
 
+/// What the model's output means.
+///
+/// SD 1.5, SDXL and SD 2.x's 512 "base" checkpoints predict the noise. SD 2.1's
+/// 768 checkpoints — and fine-tunes derived from them — predict `v` instead,
+/// and the two are **not distinguishable from the weights**: a v-prediction
+/// model run as epsilon loads and samples with no error anywhere, and returns
+/// saturated colour noise — measured, not guessed; see
+/// `assets/sd21-crab-512.png` for what the same seed produces when it is
+/// right. The checkpoint's `scheduler_config.json` carries `prediction_type`;
+/// this mirrors it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Prediction {
+    /// The model outputs noise. `x0 = x - sigma*eps`.
+    #[default]
+    Epsilon,
+    /// The model outputs `v`. See [`Prediction::denoise`] for the algebra.
+    V,
+}
+
+impl Prediction {
+    /// Recover the `x0` estimate from a model output.
+    ///
+    /// For `v`, diffusers computes
+    /// `sqrt(alpha)*sample - sqrt(beta)*output` against the **scaled** input
+    /// `x / sqrt(1+sigma^2)`, with `alpha = 1/(1+sigma^2)`. Substituting gives
+    /// the form below in terms of the unscaled latent this crate carries:
+    ///
+    /// ```text
+    ///   x0 = x/(1 + sigma^2)  -  v * sigma/sqrt(1 + sigma^2)
+    /// ```
+    ///
+    /// At `sigma = 0` that is the identity, as it must be.
+    pub fn denoise(
+        self,
+        latent: &Tensor,
+        output: &Tensor,
+        sigma: f64,
+    ) -> Result<Tensor, PipelineError> {
+        match self {
+            Prediction::Epsilon => Ok((latent - (output * sigma)?)?),
+            Prediction::V => {
+                let s2 = sigma * sigma + 1.0;
+                Ok(((latent / s2)? - (output * (sigma / s2.sqrt()))?)?)
+            }
+        }
+    }
+}
+
 /// Which sampler to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SamplerKind {
@@ -236,6 +284,8 @@ pub struct Txt2ImgPipeline {
     device: Device,
     /// Optional spatial conditioning, attached by [`Txt2ImgPipeline::with_controlnet`].
     controlnet: Option<ControlNet>,
+    /// What the UNet's output means. See [`Prediction`].
+    prediction: Prediction,
 }
 
 impl std::fmt::Debug for Txt2ImgPipeline {
@@ -324,6 +374,46 @@ impl Txt2ImgPipeline {
         Self::load_inner(model_dir, device, None)
     }
 
+    /// Which SD variant a checkpoint is, read from the weights themselves.
+    ///
+    /// The cross-attention key projection's input width is the text encoder's
+    /// output width, and it is the one number that separates these two: 768 for
+    /// SD 1.5, 1024 for SD 2.x. Reading it from a tensor shape rather than from
+    /// `config.json` means no JSON dependency and no trusting a file that need
+    /// not be present — and a checkpoint always carries its own shapes.
+    ///
+    /// Falls back to SD 1.5 when the tensor is absent, which keeps every
+    /// existing checkpoint loading exactly as before.
+    fn detect_variant(unet_path: &Path) -> (UNetConfig, ClipTextConfig) {
+        const CROSS_KEY: &str = "down_blocks.0.attentions.0.transformer_blocks.0.attn2.to_k.weight";
+        match sd_tensor::tensor_shape(unet_path, CROSS_KEY) {
+            Ok(Some(shape)) if shape.last() == Some(&1024) => {
+                (UNetConfig::sd2(), ClipTextConfig::sd2())
+            }
+            _ => (UNetConfig::sd15(), ClipTextConfig::sd15()),
+        }
+    }
+
+    /// Whether the checkpoint's scheduler asks for v-prediction.
+    ///
+    /// A substring test on `scheduler_config.json`, deliberately: the file is
+    /// small, the token is unambiguous, and a JSON parser for one boolean is
+    /// not worth a dependency the rest of this workspace does without. Absent
+    /// file means epsilon, which is right for every checkpoint that predates
+    /// the option.
+    ///
+    /// It matters because the two are **indistinguishable from the weights** —
+    /// a v-prediction model sampled as epsilon renders saturated colour noise
+    /// and reports nothing wrong. That was checked by forcing this function to
+    /// return `Epsilon` for an SD 2.1 checkpoint, not assumed.
+    fn detect_prediction(model_dir: &Path) -> Prediction {
+        let path = model_dir.join("scheduler/scheduler_config.json");
+        match std::fs::read_to_string(path) {
+            Ok(text) if text.contains("v_prediction") => Prediction::V,
+            _ => Prediction::Epsilon,
+        }
+    }
+
     fn load_inner(
         model_dir: &Path,
         device: &Device,
@@ -354,10 +444,13 @@ impl Txt2ImgPipeline {
             &format!("loading the pipeline from {}", model_dir.display()),
         )?;
 
+        let (unet_cfg, clip_cfg) = Self::detect_variant(&unet_path);
+        let prediction = Self::detect_prediction(model_dir);
+
         let tokenizer = ClipTokenizer::from_file(&tokenizer_path)?;
 
         let vb = sd_loader::safetensors_var_builder(&[&text_encoder_path], DType::F32, device)?;
-        let text_encoder = ClipTextEncoder::new(&ClipTextConfig::sd15(), vb)?;
+        let text_encoder = ClipTextEncoder::new(&clip_cfg, vb)?;
 
         let vb = match lora {
             None => sd_loader::safetensors_var_builder(&[&unet_path], DType::F32, device)?,
@@ -381,7 +474,7 @@ impl Txt2ImgPipeline {
                 vb
             }
         };
-        let unet = UNet2DConditionModel::new(&UNetConfig::sd15(), vb)?;
+        let unet = UNet2DConditionModel::new(&unet_cfg, vb)?;
 
         let vb = sd_loader::safetensors_var_builder(&[&vae_path], DType::F32, device)?;
         let vae = AutoencoderKlDecoder::new(&VaeConfig::sd15(), vb).map_err(|source| {
@@ -410,6 +503,7 @@ impl Txt2ImgPipeline {
             schedule: Schedule::sd15(),
             device: device.clone(),
             controlnet: None,
+            prediction,
         })
     }
 
@@ -442,6 +536,8 @@ impl Txt2ImgPipeline {
         let text_encoder = ClipTextEncoder::new(&ClipTextConfig::sd15(), vb)?;
 
         let vb = sd_loader::unet_var_builder_from_gguf(gguf, DType::F32, device)?;
+        // GGUF checkpoints in this layout are SD 1.5; stable-diffusion.cpp
+        // writes no metadata at all, so there is nothing to detect from.
         let unet = UNet2DConditionModel::new(&UNetConfig::sd15(), vb)?;
 
         let vb = sd_loader::vae_var_builder_from_gguf(gguf, DType::F32, device)?;
@@ -468,6 +564,7 @@ impl Txt2ImgPipeline {
             schedule: Schedule::sd15(),
             device: device.clone(),
             controlnet: None,
+            prediction: Prediction::Epsilon,
         })
     }
 
@@ -832,7 +929,7 @@ impl Txt2ImgPipeline {
             let noise_pred = (&out_uncond + ((out_cond - &out_uncond)? * cfg.cfg_scale)?)?;
 
             // The UNet predicts noise; the samplers want x0.
-            let denoised = (&latent - (&noise_pred * sigma)?)?;
+            let denoised = self.prediction.denoise(&latent, &noise_pred, sigma)?;
 
             latent = match cfg.sampler {
                 SamplerKind::EulerAncestral => {
