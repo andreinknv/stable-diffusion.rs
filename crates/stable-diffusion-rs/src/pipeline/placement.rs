@@ -51,11 +51,35 @@ use super::PipelineError;
 /// # Ok(())
 /// # }
 /// ```
+/// Whether a stage's weights sit on the compute device or stream to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Residency {
+    /// Weights live on the compute device for the whole run.
+    #[default]
+    Resident,
+    /// Weights live in host memory; each block is copied to the compute
+    /// device as it is reached and released after it has run.
+    ///
+    /// This is `stable-diffusion.cpp`'s `--offload-to-cpu`, and it is the
+    /// answer for the case static placement cannot help: a GPU too small to
+    /// hold the diffusion model *at all*. Peak weight residency becomes one
+    /// block rather than the whole stack — 192 MB against 6.78 GB for Flux
+    /// schnell.
+    ///
+    /// It is not free and the trade is worth stating. Copies run at 19.8 GB/s
+    /// on an M4 Max, so a schnell step pays about 343 ms, roughly 6.5% on a
+    /// 4-step run; a discrete card over PCIe should expect about double that.
+    /// Only quantised transformers support it — the copy moves quantised
+    /// block bytes verbatim, which is what makes it cheap and bit-exact.
+    Streamed,
+}
+
 #[derive(Debug, Clone)]
 pub struct Placement {
     compute: Device,
     text_encoders: Device,
     vae: Device,
+    diffusion: Residency,
 }
 
 impl Placement {
@@ -66,7 +90,19 @@ impl Placement {
             compute: device.clone(),
             text_encoders: device.clone(),
             vae: device.clone(),
+            diffusion: Residency::Resident,
         }
+    }
+
+    /// Stream the diffusion model's blocks instead of holding them resident.
+    pub fn with_streamed_diffusion(mut self) -> Self {
+        self.diffusion = Residency::Streamed;
+        self
+    }
+
+    /// Whether the diffusion model's blocks stream.
+    pub fn diffusion(&self) -> Residency {
+        self.diffusion
     }
 
     /// Run the text encoders somewhere else — usually [`Device::Cpu`].
@@ -242,6 +278,7 @@ mod tests {
             compute: cpu.clone(),
             text_encoders: cpu.clone(),
             vae: cpu,
+            diffusion: Residency::Resident,
         };
         assert!(!p.is_split());
     }

@@ -528,6 +528,34 @@ impl LastLayer {
 }
 
 /// The Flux transformer.
+/// One block's weights, copied to `device` and still quantised.
+///
+/// Selected by name prefix, which is exact rather than a guess: GGUF names are
+/// `double_blocks.<i>.<...>`, and the trailing dot is what stops
+/// `double_blocks.1` from also matching `double_blocks.10`.
+fn block_weights(
+    all: &QuantizedWeights,
+    path: &str,
+    device: &sd_tensor::Device,
+) -> Result<QuantizedWeights> {
+    let prefix = format!("{path}.");
+    let mut out = QuantizedWeights::new();
+    for (name, weight) in all.iter() {
+        if name.starts_with(&prefix) {
+            out.insert(
+                name.clone(),
+                sd_tensor::quantized::to_device(weight, device)?,
+            );
+        }
+    }
+    if out.is_empty() {
+        return Err(sd_tensor::Error::Msg(format!(
+            "no quantised weights under {prefix}"
+        )));
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 pub struct FluxTransformer {
     img_in: Proj,
@@ -535,10 +563,43 @@ pub struct FluxTransformer {
     time_in: MlpEmbedder,
     vector_in: MlpEmbedder,
     guidance_in: Option<MlpEmbedder>,
-    double_blocks: Vec<DoubleStreamBlock>,
-    single_blocks: Vec<SingleStreamBlock>,
+    blocks: Blocks,
     final_layer: LastLayer,
     cfg: FluxConfig,
+}
+
+/// Where the transformer's blocks keep their weights.
+///
+/// The blocks are all of it — 6.78 GB of a 6.8 GB quantised schnell — so this
+/// is the only part worth streaming. The embedders and the output head are a
+/// few hundred MB and stay put.
+#[derive(Debug)]
+enum Blocks {
+    /// Built once, resident on the compute device for the whole run.
+    Resident {
+        double: Vec<DoubleStreamBlock>,
+        single: Vec<SingleStreamBlock>,
+    },
+    /// Weights held in host memory; each block is copied to the compute
+    /// device as it is reached and released after it has run.
+    ///
+    /// **What this buys, and what it costs.** Peak weight residency on the
+    /// accelerator drops from the whole transformer to one block — 6.78 GB to
+    /// 192 MB for schnell — which is the difference between a 12 GB card
+    /// running Flux and not running it. Measured on an M4 Max the copy runs at
+    /// 19.8 GB/s, so a schnell step pays 19 double blocks at 9.68 ms plus 38
+    /// single at 4.18 ms, about 343 ms per step, or roughly 6.5% on a 4-step
+    /// run. A discrete card over PCIe should expect around double that and the
+    /// same conclusion.
+    ///
+    /// Only the quantised path can do this. `quantized::to_device` copies the
+    /// quantised block bytes verbatim, so it is cheap and bit-exact; a dense
+    /// checkpoint would have to move 4x the bytes, and there is no lossless
+    /// route for it that is any cheaper.
+    Streamed {
+        weights: QuantizedWeights,
+        device: sd_tensor::Device,
+    },
 }
 
 impl FluxTransformer {
@@ -556,7 +617,61 @@ impl FluxTransformer {
         Self::from_source(cfg, Source::Quantized(weights))
     }
 
+    /// Build with the blocks streamed rather than resident.
+    ///
+    /// `weights` stay wherever the caller loaded them — host memory is the
+    /// point — and each block is copied to `device` as it is reached. See
+    /// [`Blocks::Streamed`] for what that costs and buys.
+    ///
+    /// Everything outside the blocks is built resident on `device`: the
+    /// embedders and output head are a few hundred MB against the blocks'
+    /// 6.78 GB, and they are touched every step, so streaming them would be
+    /// all cost.
+    pub fn from_quantized_streaming(
+        cfg: &FluxConfig,
+        weights: &QuantizedWeights,
+        device: &sd_tensor::Device,
+    ) -> Result<Self> {
+        // The embedders and output head run every step, so they are moved to
+        // the device once and stay. The blocks are the 6.78 GB and are what
+        // stays behind.
+        let mut resident = QuantizedWeights::new();
+        for (name, weight) in weights.iter() {
+            if !name.starts_with("double_blocks.") && !name.starts_with("single_blocks.") {
+                resident.insert(
+                    name.clone(),
+                    sd_tensor::quantized::to_device(weight, device)?,
+                );
+            }
+        }
+        Self::from_source_with_blocks(
+            cfg,
+            Source::Quantized(&resident),
+            Blocks::Streamed {
+                weights: weights.clone(),
+                device: device.clone(),
+            },
+        )
+    }
+
     fn from_source(cfg: &FluxConfig, src: Source) -> Result<Self> {
+        let blocks = Blocks::Resident {
+            double: (0..cfg.depth)
+                .map(|i| DoubleStreamBlock::new(cfg, src, &format!("double_blocks.{i}")))
+                .collect::<Result<Vec<_>>>()?,
+            single: (0..cfg.depth_single_blocks)
+                .map(|i| SingleStreamBlock::new(cfg, src, &format!("single_blocks.{i}")))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        Self::from_source_with_blocks(cfg, src, blocks)
+    }
+
+    /// Everything but the blocks, which the caller supplies.
+    ///
+    /// Split out so the streaming constructor can build the embedders and the
+    /// output head from device-resident weights while the blocks stay in host
+    /// memory — the two halves genuinely live in different places.
+    fn from_source_with_blocks(cfg: &FluxConfig, src: Source, blocks: Blocks) -> Result<Self> {
         cfg.validate()?;
         let h = cfg.hidden_size;
         Ok(Self {
@@ -569,25 +684,27 @@ impl FluxTransformer {
             } else {
                 None
             },
-            double_blocks: (0..cfg.depth)
-                .map(|i| DoubleStreamBlock::new(cfg, src, &format!("double_blocks.{i}")))
-                .collect::<Result<Vec<_>>>()?,
-            single_blocks: (0..cfg.depth_single_blocks)
-                .map(|i| SingleStreamBlock::new(cfg, src, &format!("single_blocks.{i}")))
-                .collect::<Result<Vec<_>>>()?,
+            blocks,
             final_layer: LastLayer::new(cfg, src, "final_layer")?,
             cfg: cfg.clone(),
         })
     }
 
-    /// Weight bytes held by the quantised projections. Zero when dense.
+    /// Weight bytes held *on the compute device* by the quantised projections.
+    ///
+    /// Zero when dense, and — deliberately — excludes streamed blocks, whose
+    /// weights are in host memory and only ever one block at a time on the
+    /// device. Reporting them here would say the opposite of what streaming
+    /// achieves.
     pub fn resident_bytes(&self) -> usize {
-        let block: usize = self
-            .double_blocks
-            .iter()
-            .map(|b| b.resident_bytes())
-            .chain(self.single_blocks.iter().map(|b| b.resident_bytes()))
-            .sum();
+        let block: usize = match &self.blocks {
+            Blocks::Resident { double, single } => double
+                .iter()
+                .map(|b| b.resident_bytes())
+                .chain(single.iter().map(|b| b.resident_bytes()))
+                .sum(),
+            Blocks::Streamed { .. } => 0,
+        };
         block + self.img_in.resident_bytes() + self.txt_in.resident_bytes()
     }
 
@@ -653,18 +770,49 @@ impl FluxTransformer {
         let pe = rope::embed_nd(&ids, &self.cfg.axes_dim, self.cfg.theta)?;
 
         let mut txt = txt;
-        for block in &self.double_blocks {
-            let (i, t) = block.forward(&img, &txt, &vec, &pe)?;
-            img = i;
-            txt = t;
+        match &self.blocks {
+            Blocks::Resident { double, .. } => {
+                for block in double {
+                    let (i, t) = block.forward(&img, &txt, &vec, &pe)?;
+                    img = i;
+                    txt = t;
+                }
+            }
+            Blocks::Streamed { weights, device } => {
+                for i in 0..self.cfg.depth {
+                    let path = format!("double_blocks.{i}");
+                    let resident = block_weights(weights, &path, device)?;
+                    let block =
+                        DoubleStreamBlock::new(&self.cfg, Source::Quantized(&resident), &path)?;
+                    let (a, t) = block.forward(&img, &txt, &vec, &pe)?;
+                    img = a;
+                    txt = t;
+                    // `block` and `resident` drop here, releasing the device
+                    // copy before the next one is made — which is the whole
+                    // point, so it is worth not moving this line.
+                }
+            }
         }
 
         // The single-stream half runs on the concatenation, then the text
         // half is dropped — it has done its work as context by this point.
         let txt_len = txt.dim(1)?;
         let mut xs = Tensor::cat(&[&txt, &img], 1)?.contiguous()?;
-        for block in &self.single_blocks {
-            xs = block.forward(&xs, &vec, &pe)?;
+        match &self.blocks {
+            Blocks::Resident { single, .. } => {
+                for block in single {
+                    xs = block.forward(&xs, &vec, &pe)?;
+                }
+            }
+            Blocks::Streamed { weights, device } => {
+                for i in 0..self.cfg.depth_single_blocks {
+                    let path = format!("single_blocks.{i}");
+                    let resident = block_weights(weights, &path, device)?;
+                    let block =
+                        SingleStreamBlock::new(&self.cfg, Source::Quantized(&resident), &path)?;
+                    xs = block.forward(&xs, &vec, &pe)?;
+                }
+            }
         }
         let img = xs.narrow(1, txt_len, xs.dim(1)? - txt_len)?.contiguous()?;
 
@@ -706,6 +854,57 @@ pub fn unpack_latents(tokens: &Tensor, h: usize, w: usize) -> Result<Tensor> {
         .reshape((b, h / 2, w / 2, c, 2, 2))?
         .permute((0, 3, 1, 4, 2, 5))?
         .reshape((b, c, h, w))
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use sd_tensor::gguf::{GgmlDType, QTensor};
+    use sd_tensor::Device;
+    use std::sync::Arc;
+
+    fn fake(name: &str, weights: &mut QuantizedWeights) {
+        let t = Tensor::zeros((256, 256), DType::F32, &Device::Cpu).unwrap();
+        let q = QTensor::quantize(&t, GgmlDType::Q4K).unwrap();
+        weights.insert(name.to_string(), Arc::new(q));
+    }
+
+    #[test]
+    fn a_block_selects_its_own_weights_and_not_a_longer_numbered_sibling() {
+        // `double_blocks.1` must not sweep up `double_blocks.10..19`, which is
+        // what a prefix match without the trailing dot does. Flux schnell has
+        // 19 double and 38 single blocks, so every single-digit index has
+        // two-digit siblings and the bug would be silent: the block would
+        // simply be built from whichever duplicate name won.
+        let mut all = QuantizedWeights::new();
+        for i in [1usize, 10, 11, 19] {
+            fake(&format!("double_blocks.{i}.img_attn.qkv.weight"), &mut all);
+            fake(&format!("double_blocks.{i}.img_mlp.0.weight"), &mut all);
+        }
+        let one = block_weights(&all, "double_blocks.1", &Device::Cpu).unwrap();
+        assert_eq!(
+            one.len(),
+            2,
+            "block 1 has two weights, not block 10's as well"
+        );
+        assert!(one.keys().all(|k| k.starts_with("double_blocks.1.")));
+
+        let ten = block_weights(&all, "double_blocks.10", &Device::Cpu).unwrap();
+        assert_eq!(ten.len(), 2);
+        assert!(ten.keys().all(|k| k.starts_with("double_blocks.10.")));
+    }
+
+    #[test]
+    fn a_missing_block_is_an_error_rather_than_an_empty_one() {
+        // Silently returning nothing would build a block whose every weight
+        // lookup fails later, reported as a missing tensor deep in the model
+        // rather than as the wrong index here.
+        let mut all = QuantizedWeights::new();
+        fake("double_blocks.0.img_attn.qkv.weight", &mut all);
+        let err = block_weights(&all, "double_blocks.7", &Device::Cpu)
+            .expect_err("block 7 does not exist");
+        assert!(err.to_string().contains("double_blocks.7."), "{err}");
+    }
 }
 
 #[cfg(test)]

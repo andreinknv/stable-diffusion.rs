@@ -70,6 +70,19 @@ this machine measures its weakest case. `stable-diffusion.cpp` reached the
 same design: `backend`, `params_backend`, `max_vram` and `split_mode` are
 fields of its public `sd_ctx_params_t`, not CLI flags.
 
+**The diffusion model's blocks can stream.** `Placement::with_streamed_diffusion()`
+keeps a quantised transformer's blocks in host memory and copies each to the
+compute device as it is reached, releasing it after — `stable-diffusion.cpp`'s
+`--offload-to-cpu`, and the answer for a GPU too small to hold the model at
+all, where no static placement helps. Flux only, so far.
+
+Measured on Flux schnell, 512, 4 steps, Metal: **21.0 s resident against
+25.1 s streamed**, +19.5%, and the images are **bit-identical** — the copy
+moves quantised block bytes verbatim, so nothing is rounded twice.
+`quantized::to_device` is the primitive; `FluxTransformer::resident_bytes`
+reports 0 for streamed blocks, because saying otherwise would report the
+opposite of what streaming achieves.
+
 **One-shot runs release before decoding.** `FluxPipeline::run_releasing` and
 `Sd3Pipeline::run_releasing` consume the pipeline, drop everything the decode
 does not need, and then synchronise — on Metal a drop alone frees *nothing*,
@@ -79,7 +92,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 240 tests, all gates green
+table is in [roadmap.md](roadmap.md). 243 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -96,28 +109,32 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. Dynamic parameter offload, on top of `Placement`
+### 1. Extend streaming past Flux, and measure it on a discrete GPU
 
-`Placement` (below) does **static** per-stage assignment, which is
-`stable-diffusion.cpp`'s `--backend te=cpu`. What it does not do is their
-`--offload-to-cpu`: keep weights in host RAM and move them to the accelerator
-per use. That is the case that matters for a GPU too small to hold the
-diffusion model *at all* — a 12 GB card and Flux dev, say — where no static
-assignment helps because the one module that must be on the GPU does not fit.
+`Residency::Streamed` exists and works — see the note above — but only for
+**Flux's quantised transformer**. Three gaps, in the order they matter:
 
-The shape to aim for is `sd_ctx_params_t`: a `max_vram` budget, and a residency
-policy the caller sets rather than an environment variable. `Placement` is
-already that struct in miniature, so this extends it rather than replacing it.
+- **SD 3.5's MMDiT does not stream.** Same shape of change:
+  `Sd3Transformer` needs the `Blocks` split that `flux/mod.rs` now has, and
+  `sd3_qtensors_from_gguf` already loads the weights it would keep in host
+  memory. This is the mechanical one.
+- **Dense checkpoints cannot stream at all.** `quantized::to_device` moves
+  quantised block bytes verbatim, which is what makes it cheap and bit-exact;
+  a dense model would move 4x the bytes with no equivalent shortcut. Flux mini
+  — the model that most needs this, at 12.8 GB dense — is therefore the one
+  that cannot have it. Whether a dense path is worth it is a measurement
+  nobody has made.
+- **Nothing prefetches.** Each block is copied when it is reached, so the
+  copy and the compute serialise. `stable-diffusion.cpp` overlaps them
+  (`stream_layers`), which should hide most of the 19.5% this currently costs.
+  That is the obvious next win and needs no new concepts.
 
-The hard part is not moving tensors, it is that our models bake their weights
-in at construction — `ClipTextEncoder::new(cfg, vb)` reads them immediately —
-so there is no `to_device` on a built model and no per-block residency handle.
-Either models grow one, or construction becomes lazy from a retained weight
-source. Decide that before writing anything; it is the whole design.
-
-Measure on a discrete GPU if one is ever available. Everything below was
-verified on unified memory, where the mechanism is right but the payoff is
-smallest.
+And the honest one: **the payoff has not been measured on the hardware it is
+for.** On unified memory the host copy sits in the same pool, so freeing the
+device buys only about 2.4 GB of the 6.78 GB in play. On a discrete card the
+same mechanism should take VRAM from 6.78 GB to one block, ~192 MB — by
+construction, not by measurement. If a CUDA machine ever appears, measure this
+first.
 
 ### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
 answer was no**

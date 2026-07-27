@@ -31,8 +31,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         FluxConfig::mini()
     };
-    let pipe = FluxPipeline::load(&paths, &cfg, &dev)?;
+    // SD_STREAM_DIFFUSION=1 keeps the transformer's blocks in host memory and
+    // copies each to the accelerator as it is reached.
+    let mut placement = stable_diffusion_rs::pipeline::Placement::on(&dev);
+    if std::env::var("SD_STREAM_DIFFUSION").is_ok() {
+        placement = placement.with_streamed_diffusion();
+    }
+    eprintln!("diffusion residency: {:?}", placement.diffusion());
+    let pipe = FluxPipeline::load_with_placement(&paths, &cfg, &placement)?;
     eprintln!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
+    if let Some(b) = sd_tensor::sysmem::available_bytes() {
+        eprintln!("available after load: {:.2} GB", b as f64 / 1e9);
+    }
 
     let cfg = FluxConfigRun {
         prompt,

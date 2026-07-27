@@ -17,10 +17,10 @@
 
 use std::sync::Arc;
 
-use candle_core::quantized::{QMatMul, QTensor};
+use candle_core::quantized::{QMatMul, QStorage, QTensor};
 use candle_core::Module;
 
-use crate::{Result, Tensor};
+use crate::{Device, Result, Tensor};
 
 /// Copy a tensor into a fresh buffer if it starts partway into someone else's.
 ///
@@ -128,6 +128,30 @@ impl std::fmt::Debug for QLinear {
     }
 }
 
+/// Move a quantised weight to another device, still quantised.
+///
+/// The enabling primitive for streaming weights: a model too large to sit on
+/// an accelerator can keep its blocks in host memory and copy each one across
+/// as it is needed. Without this the only route between devices is
+/// `dequantize` and re-`quantize`, which is both far more expensive and
+/// **lossy** — requantising already-quantised values rounds them a second
+/// time.
+///
+/// This copies the quantised block bytes verbatim and rebuilds the tensor
+/// around them, so the result is bit-identical to the source. That also makes
+/// it cheap in the way that matters: a Flux block moves about 120 MB rather
+/// than the 1 GB it would occupy dequantised.
+///
+/// Returns the input untouched when it is already on `device`, so callers can
+/// use it unconditionally.
+pub fn to_device(weight: &Arc<QTensor>, device: &Device) -> Result<Arc<QTensor>> {
+    if crate::device::same(&weight.device(), device) {
+        return Ok(weight.clone());
+    }
+    let storage = QStorage::from_data(weight.data()?, device, weight.dtype())?;
+    Ok(Arc::new(QTensor::new(storage, weight.shape().clone())?))
+}
+
 /// What the same weight would cost dequantised, for comparison.
 pub fn dequantised_bytes(weight: &QTensor) -> usize {
     weight.shape().elem_count() * std::mem::size_of::<f32>()
@@ -144,6 +168,44 @@ mod tests {
     /// SD 1.5's 320-channel blocks do not get this luxury.
     fn weight(dev: &Device) -> Tensor {
         Tensor::rand(-1f32, 1f32, (512, 256), dev).unwrap()
+    }
+
+    #[test]
+    fn moving_a_quantised_weight_between_devices_is_lossless() {
+        // The whole point of moving block bytes rather than dequantising and
+        // requantising: the second route rounds already-rounded values and
+        // would drift a little more on every hop. CPU-to-CPU is the only trip
+        // a test runner can make, and it still exercises the copy path when
+        // the devices differ; when they do not, the tensor must come back
+        // untouched rather than be rebuilt.
+        let dev = Device::Cpu;
+        let w = weight(&dev);
+        let q = Arc::new(QTensor::quantize(&w, GgmlDType::Q4K).unwrap());
+
+        let same = to_device(&q, &Device::Cpu).unwrap();
+        assert!(Arc::ptr_eq(&q, &same), "a no-op move must not copy");
+
+        // Rebuild through the byte path explicitly and check it is identical.
+        let rebuilt = Arc::new(
+            QTensor::new(
+                QStorage::from_data(q.data().unwrap(), &dev, q.dtype()).unwrap(),
+                q.shape().clone(),
+            )
+            .unwrap(),
+        );
+        let a = q.dequantize(&dev).unwrap();
+        let b = rebuilt.dequantize(&dev).unwrap();
+        let diff = (&a - &b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(diff, 0.0, "moving quantised bytes must be bit-exact");
+        assert_eq!(rebuilt.dtype(), q.dtype());
+        assert_eq!(rebuilt.shape(), q.shape());
     }
 
     #[test]

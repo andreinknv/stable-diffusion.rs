@@ -166,8 +166,19 @@ impl FluxPipeline {
         // at F32 and 4.9 GB held as Q4_K. safetensors are read dense, since
         // that is the only form they come in.
         let transformer = if paths.transformer.extension().is_some_and(|e| e == "gguf") {
-            let weights = sd_loader::flux_qtensors_from_gguf(&paths.transformer, device)?;
-            FluxTransformer::from_quantized(cfg, &weights)?
+            match placement.diffusion() {
+                // Streamed: load the weights on the *host*, not the compute
+                // device — holding them there is exactly what this avoids.
+                super::Residency::Streamed => {
+                    let weights =
+                        sd_loader::flux_qtensors_from_gguf(&paths.transformer, &Device::Cpu)?;
+                    FluxTransformer::from_quantized_streaming(cfg, &weights, device)?
+                }
+                super::Residency::Resident => {
+                    let weights = sd_loader::flux_qtensors_from_gguf(&paths.transformer, device)?;
+                    FluxTransformer::from_quantized(cfg, &weights)?
+                }
+            }
         } else {
             let vb =
                 sd_loader::safetensors_var_builder(&[&paths.transformer], MODEL_DTYPE, device)?;
