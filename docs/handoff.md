@@ -161,25 +161,33 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. Overlap the block copy with compute
+### ~~1. Overlap the block copy with compute~~ — tried, and it is slower
 
-Now worth doing, and only now. The streamed step used to divide as copy
-354 ms / build 1019 ms / run 244 ms, so prefetching the copy would have hidden
-the smallest third. `Source::QuantizedCached` removed the build entirely —
-**1019 ms to 0** — by dequantising the biases and norm scales once instead of
-per block, and the split is now copy ~220 ms against run ~225 ms.
+Built and reverted. The prefetch itself worked exactly as intended: a
+background thread copying block `i+1` while block `i` computes took the copy
+wait from ~220 ms per step to ~15 ms. The run got *slower* by about the same
+amount, and the whole generation went from **28.5 s to 36.0 s**.
 
-So copy and compute are finally the same size, which is exactly when
-overlapping them pays: it should hide most of the copy.
-`stable-diffusion.cpp` does this as `stream_layers`.
+**The cause is in candle, and it is device-independent.**
+`MetalDevice::allocate_buffer` takes a write lock on a single shared buffer
+pool (`Arc<RwLock<BufferMap>>`). The prefetch thread allocates roughly two
+dozen buffers per block; the compute thread allocates activations constantly.
+They serialise on that lock, so the two never overlap — they take turns with
+extra contention on top.
 
-The obstacle is that the copy must finish before the block that needs it runs,
-while the *release* of the previous block must not outrun the compute still
-using it — and on Metal the release only happens on synchronise. A prefetch
-thread and `SD_STREAM_SYNC_EVERY` are pulling on the same string; work out
-that interaction before writing the thread.
+That matters for whether to revisit this. The obvious reading of the numbers
+is "unified memory shares bandwidth, so a discrete card would be different" —
+but the lock is not a memory-architecture property. It would serialise the
+same way over PCIe.
 
-### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
+So this is not "prefetch does not pay on this machine", it is "prefetch cannot
+pay until allocation stops being globally serialised". Two routes, neither
+small: pre-allocate each block's buffers once and reuse them across steps
+(sidestepping the allocator entirely), or fix the pool upstream. Measure the
+lock before either — this was diagnosed by reading candle's source, not by
+profiling it.
+
+### 1. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
 
 `Residency::Streamed` works for **Flux and SD 3.5**, both quantised. Gaps, in
 the order they matter:
@@ -202,7 +210,7 @@ sync interval) but the *benefit* is not. On a discrete card it should take
 VRAM from 6.66 GB to ~192 MB, by construction rather than by measurement. If a
 CUDA machine ever appears, measure this before anything else here.
 
-### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
+### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm` — **done, and the
 answer was no**
 
 The three copies are now one, in `ops::rms_norm`, and `PlainLayerNorm`'s two
