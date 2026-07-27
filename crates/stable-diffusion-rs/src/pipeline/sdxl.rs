@@ -92,14 +92,12 @@ impl SdxlPipeline {
         let weights = sd_loader::resident_bytes(&[&te_path, &te2_path, &unet_path], MODEL_DTYPE)?
             .saturating_add(sd_loader::resident_bytes(&[&vae_path], VAE_DTYPE)?);
         // Plus the largest single allocation a decode will make. Tiling keeps
-        // this to one tile.
+        // this to one tile — the *active* tile, since lowering it is exactly
+        // how a caller makes a decode fit, and projecting the default here
+        // would refuse loads that the smaller tile allows.
+        let tile = sd_models::vae::tile_latent_edge()?;
         let decode_peak = sd_models::vae::DecoderConfig::from(&VaeConfig::sdxl())
-            .peak_alloc_bytes(
-                1,
-                sd_models::vae::TILE_LATENT_EDGE,
-                sd_models::vae::TILE_LATENT_EDGE,
-                VAE_DTYPE,
-            )
+            .peak_alloc_bytes(1, tile, tile, VAE_DTYPE)
             .unwrap_or(0);
         sd_tensor::sysmem::check_headroom(
             weights.saturating_add(decode_peak),

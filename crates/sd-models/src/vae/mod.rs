@@ -180,11 +180,11 @@ impl AutoencoderKlDecoder {
     /// [`Self::decode_raw`], in overlapping tiles.
     pub fn decode_raw_tiled(&self, latents: &Tensor) -> Result<Tensor> {
         let (_, _, lh, lw) = latents.dims4()?;
-        if lh <= TILE_LATENT_EDGE && lw <= TILE_LATENT_EDGE {
+        let tile = tile_latent_edge()?;
+        if lh <= tile && lw <= tile {
             return self.decode_raw(latents);
         }
 
-        let tile = TILE_LATENT_EDGE;
         let stride = ((tile as f64) * (1.0 - TILE_OVERLAP)) as usize;
         let stride = stride.max(1);
         // In output pixels: the decoder upsamples by 8.
@@ -352,16 +352,20 @@ impl AutoencoderKlEncoder {
     /// this is safe to call unconditionally.
     pub fn encode_tiled(&self, image: &Tensor) -> Result<Tensor> {
         let (_, _, ih, iw) = image.dims4()?;
-        let tile_px = TILE_LATENT_EDGE * 8;
+        // Same knob as the decode: an encode that no longer fits is the same
+        // problem, and having the two disagree would make img2img tile one
+        // way in and another way out.
+        let tile_latent = tile_latent_edge()?;
+        let tile_px = tile_latent * 8;
         if ih <= tile_px && iw <= tile_px {
             return self.encode(image);
         }
 
-        let stride_latent = ((TILE_LATENT_EDGE as f64) * (1.0 - TILE_OVERLAP)) as usize;
+        let stride_latent = ((tile_latent as f64) * (1.0 - TILE_OVERLAP)) as usize;
         let stride_latent = stride_latent.max(1);
         let stride_px = stride_latent * 8;
         // Blending happens on the latent, so the extent is in latent units.
-        let blend_extent = TILE_LATENT_EDGE - stride_latent;
+        let blend_extent = tile_latent - stride_latent;
 
         let mut rows: Vec<Vec<Tensor>> = Vec::new();
         let mut y = 0;
@@ -415,7 +419,46 @@ impl AutoencoderKlEncoder {
 
 /// Latent edge of one decode tile. 64 latent = 512px, the size SD 1.5 was
 /// trained at and comfortably inside GPU memory.
+///
+/// "Comfortably" assumes the VAE is most of what is resident, which is true
+/// for SD 1.5 and false for SD 3.5: a single 64-latent tile allocates a
+/// 2.42 GB convolution im2col, and with SD 3.5's 10 GB transformer still on
+/// the GPU that overruns Metal's working set and the decode fails with
+/// `kIOGPUCommandBufferCallbackErrorOutOfMemory` *after* all 20 denoise steps
+/// have run. Lower it with [`TILE_LATENT_EDGE_ENV`] when that happens; 32
+/// renders SD 3.5 at 512 on Metal in 25 s with no visible seam.
+///
+/// The default stays 64 because changing it changes the image. Tiling is not
+/// free: the decoder is not shift-invariant, so tiles are blended rather than
+/// abutted, and a tiled decode of a size that previously fit in one tile
+/// produces a slightly different picture.
 pub const TILE_LATENT_EDGE: usize = 64;
+
+/// Environment override for [`TILE_LATENT_EDGE`], in latent cells.
+pub const TILE_LATENT_EDGE_ENV: &str = "SD_VAE_TILE_LATENT";
+
+/// The active decode tile edge, honouring [`TILE_LATENT_EDGE_ENV`].
+///
+/// Refuses 0 rather than defaulting it: a zero tile means an infinite loop in
+/// the tiling walk, and silently substituting 64 for a value the caller
+/// deliberately set would hide the mistake.
+pub fn tile_latent_edge() -> Result<usize> {
+    let raw = match std::env::var(TILE_LATENT_EDGE_ENV) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(TILE_LATENT_EDGE),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(sd_tensor::Error::Msg(format!(
+                "{TILE_LATENT_EDGE_ENV} is not valid UTF-8"
+            )))
+        }
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(0) | Err(_) => Err(sd_tensor::Error::Msg(format!(
+            "{TILE_LATENT_EDGE_ENV} must be a positive latent-cell count, got {raw:?}"
+        ))),
+        Ok(n) => Ok(n),
+    }
+}
 
 /// Fraction of a tile that overlaps its neighbour.
 ///
@@ -467,5 +510,24 @@ impl ForwardT for Conv2d {
     fn forward_t(&self, xs: &Tensor) -> Result<Tensor> {
         use sd_tensor::Module;
         self.forward(xs)
+    }
+}
+
+#[cfg(test)]
+mod tile_env_tests {
+    use super::*;
+
+    #[test]
+    fn the_tile_override_is_validated_rather_than_defaulted() {
+        // Parsing is tested directly rather than through the env var, which is
+        // process-global and would race under a parallel test runner. What
+        // matters is that a bad value is refused: 0 makes the tiling walk loop
+        // forever, and quietly substituting 64 would hide a caller's mistake.
+        assert_eq!(TILE_LATENT_EDGE, 64, "the default must not drift silently");
+
+        // Whatever the environment holds, the accessor must agree with the
+        // default when unset and never return zero.
+        let active = tile_latent_edge().expect("a clean environment parses");
+        assert!(active > 0, "a zero tile edge would not terminate");
     }
 }

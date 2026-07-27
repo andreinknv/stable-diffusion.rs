@@ -194,13 +194,10 @@ impl Txt2ImgPipeline {
         // run and dominate, so the projection has to include them.
         let weights =
             sd_loader::resident_bytes(&[&text_encoder_path, &unet_path, &vae_path], DType::F32)?;
+        // The *active* tile, not the default: see the note in sdxl.rs.
+        let tile = sd_models::vae::tile_latent_edge()?;
         let decode_peak = sd_models::vae::DecoderConfig::from(&VaeConfig::sd15())
-            .peak_alloc_bytes(
-                1,
-                sd_models::vae::TILE_LATENT_EDGE,
-                sd_models::vae::TILE_LATENT_EDGE,
-                DType::F32,
-            )
+            .peak_alloc_bytes(1, tile, tile, DType::F32)
             .unwrap_or(0);
         sd_tensor::sysmem::check_headroom(
             weights.saturating_add(decode_peak),

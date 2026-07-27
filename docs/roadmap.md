@@ -311,6 +311,23 @@ Flux schnell at 512x512, 4 steps: **20.8 s on Metal against 159.3 s on CPU**,
 a 7.7x speedup, and the image is now the same crab the CPU renders. It used to
 be a flat orange field with a corrupted strip along the top.
 
+Verified across the workspace afterwards, since nothing quantised was
+separable from this bug while it stood:
+
+| model | CPU | Metal | agreement with CPU |
+|---|---|---|---|
+| SD 1.5 512, 20 steps | 113 s | **17.5 s** | max 1/255, 98.8% of pixels exact |
+| SDXL 1024, 20 steps | — | **86.5 s** | renders correctly |
+| Flux schnell 512, 4 steps | 159 s | **20.8 s** | mean 9.2/255, same image |
+| SD 3.5 medium 512, 20 steps | 230 s | **25.1 s** | needs `SD_VAE_TILE_LATENT=32` |
+| SD 3.5 medium 256, 20 steps | 71.8 s | **9.0 s** | mean 7.0/255, same image |
+| Flux mini 512, 20 steps | 212 s | does not fit | dense f32, 12.8 GB resident |
+
+SD 1.5's near-exact agreement and Flux's mean 9.2/255 are both expected: SD 1.5
+is 20 steps through a shallow UNet, Flux is 4 steps through 57 blocks whose CPU
+path carries 0.3-1.9% quantisation noise per layer that Metal does not. Same
+picture either way; not interchangeable as files.
+
 **Root cause: candle 0.11's Metal quantised matmul ignores the activation's
 `start_offset`.** A tensor that is a view into the middle of a larger buffer is
 read *from the beginning of that buffer*. Nothing errors — the shapes are

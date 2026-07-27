@@ -294,8 +294,27 @@ dim 0 — candle already calls that layout contiguous.
 `sd_tensor::quantized::without_storage_offset` copies such an activation
 before the matmul, inside `QLinear::forward`. Flux schnell at 512x512, 4 steps
 now renders correctly on Metal in **20.8 s against 159.3 s on CPU**. See
-[roadmap.md](roadmap.md) for how it was localised and why every per-op check
-passed while it was broken.
+[roadmap.md](roadmap.md) for how it was localised, why every per-op check
+passed while it was broken, and the verification table for the other models.
+
+### What still does not fit on Metal, and the tile knob
+
+Correctness is no longer the constraint; memory is. Two runs die *after* the
+denoise loop completes, in the VAE decode, because the transformer is still
+resident and never used again:
+
+- **SD 3.5 at 512** needs `SD_VAE_TILE_LATENT=32`. At the default 64 the
+  decode is a single 2.42 GB tile and SD 3.5's 10 GB transformer leaves no
+  room. With the smaller tile it renders in 25.1 s, no visible seam.
+- **Flux mini at 512** does not fit at any tile size tried. Its 3.2B
+  parameters are dense f32 — 12.8 GB — against schnell's 6.8 GB for 12B held
+  as Q4_K. Quantisation is what makes the *larger* model the one that runs.
+
+`sd_models::vae::tile_latent_edge` reads that variable and the load-time
+headroom projections in `sdxl.rs` and `txt2img.rs` honour it too, so lowering
+the tile also lowers the bar a load has to clear. The default stays 64 because
+tiling changes the image: the decoder is not shift-invariant, so tiles are
+blended rather than abutted.
 
 ## The VAE decode at 1024 does not fit in GPU memory
 

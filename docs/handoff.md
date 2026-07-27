@@ -5,19 +5,33 @@ unstarted item under [Next](#next), and start it.
 
 ## Where things stand
 
-Four architectures render, and **Metal now produces the right image for all of
-them** — the Flux corruption is fixed (see the trap on storage offsets below).
+Four architectures render, and **Metal now produces the right image for every
+one that fits** — the Flux corruption is fixed (see the trap on storage
+offsets below). Metal is 6-9x faster across the board, so it is now the
+sensible default rather than a broken option.
 
-| model | result |
-|---|---|
-| SD 1.5 | 512x512, 20 steps, 113 s — `assets/crab-512-dpmpp2m-seed42.png` |
-| SDXL | 1024x1024, 20 steps, 89 s **on Metal** — `assets/sdxl-crab-1024-metal-f16.png` |
-| Flux schnell (12B) | 512x512, 4 steps, **20.8 s on Metal**, 159 s CPU — `assets/flux-schnell-512-crab.png` |
-| Flux mini (3.2B) | 512x512, 20 steps, 212 s — `assets/flux-mini-512-crab.png` |
-| SD 3.5 medium | 512x512, 20 steps, 230 s — `assets/sd35-medium-512-crab.png` |
+| model | CPU | Metal | agreement |
+|---|---|---|---|
+| SD 1.5 512, 20 steps | 113 s | **17.5 s** | max 1/255, 98.8% of pixels exact |
+| SDXL 1024, 20 steps | — | **86.5 s** | verified this session; `assets/sdxl-crab-1024-metal-f16.png` |
+| Flux schnell (12B) 512, 4 steps | 159 s | **20.8 s** | mean 9.2/255, same image |
+| SD 3.5 medium 512, 20 steps | 230 s | **25.1 s** † | — |
+| SD 3.5 medium 256, 20 steps | 71.8 s | **9.0 s** | mean 7.0/255, same image |
+| Flux mini (3.2B) 512, 20 steps | 212 s | does not fit ‡ | — |
+
+† needs `SD_VAE_TILE_LATENT=32`. At the default 64 a 512px decode is a single
+2.42 GB tile, and SD 3.5's 10 GB transformer is still resident, so the decode
+overruns Metal's working set — **after all 20 denoise steps have run**. The
+knob is new; see [`tile_latent_edge`](../crates/sd-models/src/vae/mod.rs).
+
+‡ Flux mini holds dense f32 weights: 12.8 GB for a 3.2B model, against
+schnell's 6.8 GB for 12B held as Q4_K. The denoise loop completes and the
+decode does not fit at any tile size tried. Quantisation is what makes the
+*larger* model the one that runs — worth remembering before reaching for a
+dense checkpoint.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 231 tests, all gates green
+table is in [roadmap.md](roadmap.md). 232 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -34,19 +48,31 @@ that is pinned by tests instead.
 
 In the order I would do them, with why.
 
-### 1. Re-time everything on Metal, and re-check the other quantised models
+### 1. Make the decode tile fit itself, instead of needing an env var
 
-Metal is now correct for Flux, which changes what the honest numbers are: the
-timing table above is still mostly CPU. Flux schnell went from 159 s to 20.8 s.
-Re-run SD 3.5 and Flux mini on `--features metal` and update the table.
+`SD_VAE_TILE_LATENT=32` is a workaround, not an answer: a user has no way to
+know they need it until a 20-step run dies at the last moment. The decode's
+peak allocation is computable up front — `DecoderConfig::peak_alloc_bytes`
+already does it — and `sysmem` already knows what is free. Choosing the
+largest tile that fits, once, at decode time would turn "SD 3.5 fails at 512
+on Metal" into "SD 3.5 works".
 
-While there: **SD 3.5 and any other quantised model should be re-verified on
-Metal**, since they were never separable from the Flux bug. The fix is in
-`QLinear::forward`, so they get it for free — but "should work" is not
-"verified", and `--example metal_check` now has the offset case that would
-catch a recurrence.
+Two cautions. Tiling changes the image, so a size that fits whole must still
+be decoded whole — pick the tile *only* when the untiled decode would not fit,
+and keep 64 as the ceiling. And on Metal the number that matters is not free
+system memory but the device's working set, which is smaller; measure rather
+than assume they are the same.
 
-### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
+### 2. Free the transformer before decoding
+
+The same problem from the other end, and it helps every model. During the VAE
+decode the transformer is still resident and is never used again — 10 GB for
+SD 3.5, 12.8 GB for Flux mini. Dropping it first is what would let Flux mini
+render at 512 on Metal at all. This is a pipeline-lifetime change (the models
+are fields of one struct), so it is more invasive than item 1; do it if item 1
+is not enough.
+
+### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
 
 Three hand-written copies exist — `sd-models/src/t5/mod.rs`,
 `flux/mod.rs`, `sd3/mod.rs` — each doing its own f32 upcast. candle ships a
