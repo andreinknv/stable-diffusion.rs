@@ -331,6 +331,70 @@ synchronises, and the real error (`kIOGPUCommandBufferCallbackErrorOutOfMemory`)
 was invisible until a synchronize was forced. Extending `metal_check` op by
 op is the way in.
 
+### CPU flash attention: a short-sequence win, not a general one
+
+candle 0.11's `candle_nn::attention::flash_attn` is now wired in as
+`ops::flash_attention_cpu` and reported as `AttentionPath::FlashCpu`. The
+survey below called it "potentially the largest single win available". It is
+not, and the shape of *why* is the useful part.
+
+The kernel streams one output row at a time under a running softmax maximum,
+so it never materialises the score matrix — but it also gets no register
+blocking across query rows and re-reads the key axis for each one. Against a
+tuned gemm that is a losing trade at large sequences and a winning one at
+small, and the crossover is sharp. Measured across `head_dim`
+{40, 64, 80, 128, 160}, `heads` {8, 12, 20, 24, 64}, batch {1, 2}:
+
+| seq | 64 | 128 | 256 | 512 | 768 | 1024 | 4096 |
+|---|---|---|---|---|---|---|---|
+| h=24, d=128 | 2.9x | 5.5x | 2.4x | 1.2x | 1.0x | 0.9x | 1.0x |
+| h=8, d=40 | 1.5x | 4.6x | 2.4x | 1.1x | 0.7x | 0.6x | 0.5x |
+
+So it is taken only at or below 512 tokens (`ops::DEFAULT_FLASH_CPU_MAX_SEQ`,
+override with `SD_FLASH_CPU_MAX_SEQ`, `0` disables). That covers CLIP and
+SD 1.5/SDXL's two deepest UNet levels, and deliberately excludes SD 3.5
+(1178), Flux (1536+) and the UNet levels that dominate a denoise step.
+
+**T5 is excluded too, and not by the length rule.** Its relative-position bias
+is a full `[batch, heads, n, n]` tensor; the kernel indexes a mask flat as
+`q_pos * seq_k + kv_pos` with no head axis, so `flash_cpu_supported` refuses
+it. This is worth spelling out because the benchmark actively misleads here:
+`--example attention_path` times T5's 154-token shape *unmasked* and reports
+5-8x, and an earlier draft of this section turned that into a claim that
+"every text encoder" benefits. It does not, and no measurement of a shape the
+model never produces could have caught it — reading the caller did.
+`the_real_text_encoder_shapes_take_the_paths_we_think_they_do` in sd-models'
+`api_contract` now pins both halves.
+
+**End to end the effect is below this machine's noise floor**, which is what
+the mechanism predicts: the eligible calls add up to roughly 0.4 s of an
+SD 1.5 generation, and about 13 ms of an SD 3.5 one. SD 1.5 at 512x512, 20
+steps ran 113.3 s with it against 114.4 s without. SD 3.5 was run four times
+alternating:
+
+| | flash off | flash on |
+|---|---|---|
+| pair 1 (off first) | 245.2 s | 216.2 s |
+| pair 2 (on first) | 230.4 s | 228.7 s |
+
+The first pair looks like an 11.8% win and **is not one** — the spread between
+two runs of the *same* configuration (245.2 against 230.4) is larger than the
+difference between configurations, and reversing the order collapses the gap
+to 0.7%. Quoting pair 1 alone would have put a fabricated 12% in this
+document. Images differ by at most 1/255, on 1.0% of pixels for SD 1.5 and
+0.6% for SD 3.5.
+
+The shapes it wins are real but they are not where the time goes — attention
+at 4096 tokens is, and that is the one place this kernel loses. Beating gemm
+there needs a blocked CPU kernel that tiles over query rows as well as keys,
+which is a real kernel rather than a wiring change.
+
+Two things found on the way in, both recorded in the `sd-tensor` doc comments:
+candle dispatches `batch > 1` to a "varlen" kernel whose repacking costs up to
+4.1x more than simply looping the batch-1 kernel, so `flash_attention_cpu`
+loops; and unlike the Metal kernel it accepts `causal_mask`'s `[1, 1, s, s]`
+directly, because it indexes the mask flat.
+
 ### Candle capabilities we are not using
 
 A survey after the fused-attention surprise, since the same mistake was
@@ -339,9 +403,11 @@ clearly available twice:
 - **`candle_nn::ops::rms_norm`** — a fused RMSNorm. We hand-wrote one in
   `t5`, one in `flux` and one in `sd3`. Three copies of an op candle already
   has, each doing its own f32 upcast.
-- **`candle_nn::cpu_flash_attention::run_flash_attn_cpu`** — flash attention
-  for the *CPU* path, which is what every model here actually runs on.
-  Potentially the largest single win available, and entirely unexplored.
+- ~~**`candle_nn::cpu_flash_attention::run_flash_attn_cpu`**~~ — done, and it
+  was **not** "the largest single win available" as this list guessed. See
+  [CPU flash attention](#cpu-flash-attention-a-short-sequence-win-not-a-general-one)
+  below for what it actually bought. Note the entry point named here is a
+  deprecated shim; the live API is `candle_nn::attention::flash_attn`.
 - **`candle_nn::rotary_emb::{rope, rope_i, rope_thd}`** — fused RoPE. Flux's
   axis-wise 2x2 formulation may not map onto it directly, but that is worth
   establishing rather than assuming.

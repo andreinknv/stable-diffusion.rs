@@ -250,14 +250,15 @@ const ATTENTION_SHAPES: [(usize, usize, usize, usize, usize); 4] = [
 
 #[test]
 fn attention_dispatch_reports_which_implementation_ran() -> Result<()> {
-    // These tests run on CPU, and candle 0.11's fused SDPA is Metal-only, so
-    // every shape here must report Naive. That assertion is the point: without
-    // it, `attention_dispatch_agrees_with_the_naive_reference` below would be
-    // comparing the naive path against itself and passing regardless.
+    // Every shape here is shorter than `DEFAULT_FLASH_CPU_MAX_SEQ`, so on a
+    // CPU runner they all take candle's CPU flash kernel. That assertion is
+    // the point: it is what makes
+    // `attention_dispatch_agrees_with_the_naive_reference` below a real
+    // comparison rather than the naive path checked against itself.
     //
-    // If a future candle gains a CPU kernel this test fails, which is the
-    // correct outcome — it means the agreement test has become meaningful and
-    // this expectation needs revisiting, not that anything is broken.
+    // This previously expected `Naive`, with a note that a future candle
+    // gaining a CPU kernel would fail it and that failing would be correct.
+    // That is what happened.
     let dev = Device::Cpu;
     for (b, h, sq, sk, d) in ATTENTION_SHAPES {
         let q = Tensor::zeros((b, h, sq, d), DType::F32, &dev)?;
@@ -265,7 +266,7 @@ fn attention_dispatch_reports_which_implementation_ran() -> Result<()> {
         let (_, path) = ops::attention_with_path(&q, &k, &k, None)?;
         assert_eq!(
             path,
-            ops::AttentionPath::Naive,
+            ops::AttentionPath::FlashCpu,
             "shape {b}x{h}x{sq}x{sk}x{d} on CPU"
         );
     }
@@ -278,9 +279,11 @@ fn attention_dispatch_agrees_with_the_naive_reference() -> Result<()> {
     // where available. That is only a safe swap if it computes the same thing,
     // so pin it against the reference on every shape we use.
     //
-    // On a CPU runner both sides are the same code and this only checks
-    // shapes. It earns its keep on a `--features metal` build, where the two
-    // sides can genuinely differ.
+    // Both sides genuinely differ on a CPU runner now: these shapes take
+    // candle's CPU flash kernel, which rebuilds the softmax incrementally
+    // under a running maximum instead of normalising a materialised score
+    // matrix. On a `--features metal` build they differ again, via the Metal
+    // kernel.
     let dev = Device::Cpu;
     for (b, h, sq, sk, d) in ATTENTION_SHAPES {
         let q = Tensor::randn(0f32, 1f32, (b, h, sq, d), &dev)?;
@@ -325,5 +328,43 @@ fn attention_refuses_a_shape_that_would_exhaust_memory() -> Result<()> {
     let err = ops::check_attention_budget(1, 1, seq, seq, DType::F32)
         .expect_err("a 384 latent projects 81 GiB and must be refused");
     assert!(err.to_string().contains("81.0 GiB"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn the_real_text_encoder_shapes_take_the_paths_we_think_they_do() -> Result<()> {
+    // Pin the dispatch for the *masked* shapes the text encoders actually
+    // produce, which the unmasked table above does not cover.
+    //
+    // This exists because a benchmark lied by omission. `--example
+    // attention_path` timed T5's 154-token shape unmasked, found candle's CPU
+    // flash kernel 5-8x faster, and that number went into a roadmap claim that
+    // "every text encoder" benefits. T5 does not: its relative-position bias
+    // is a full `[batch, heads, n, n]` tensor, and the flash kernel indexes a
+    // mask flat as `q_pos * seq_k + kv_pos` with no head axis, so
+    // `flash_cpu_supported` refuses it. CLIP's `[1, 1, s, s]` causal mask does
+    // flatten to what the kernel wants, so CLIP does benefit.
+    //
+    // Both halves are asserted. Getting the T5 half wrong is not a slowdown,
+    // it is a wrong bias applied to every score.
+    let dev = Device::Cpu;
+
+    // T5-XXL at 154 tokens: 64 heads, head_dim 64, per-head position bias.
+    let (b, h, n, d) = (1usize, 64usize, 154usize, 64usize);
+    let q = Tensor::zeros((b, h, n, d), DType::F32, &dev)?;
+    let bias = Tensor::zeros((b, h, n, n), DType::F32, &dev)?;
+    assert!(
+        !ops::flash_cpu_supported(&q, &q, &q, Some(&bias)),
+        "a per-head bias has no flat seq_q x seq_k reading"
+    );
+    let (_, path) = ops::attention_with_path(&q, &q, &q, Some(&bias))?;
+    assert_ne!(path, ops::AttentionPath::FlashCpu, "T5 masked attention");
+
+    // CLIP-L at 77 tokens: 12 heads, head_dim 64, `[1, 1, s, s]` causal mask.
+    let (h, n, d) = (12usize, 77usize, 64usize);
+    let q = Tensor::zeros((b, h, n, d), DType::F32, &dev)?;
+    let mask = ops::causal_mask(n, &dev)?;
+    let (_, path) = ops::attention_with_path(&q, &q, &q, Some(&mask))?;
+    assert_eq!(path, ops::AttentionPath::FlashCpu, "CLIP masked attention");
     Ok(())
 }

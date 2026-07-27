@@ -77,6 +77,9 @@ pub mod ops {
     pub enum AttentionPath {
         /// candle's fused kernel. The score matrix is never materialised.
         Fused,
+        /// candle's CPU flash kernel — see [`flash_attention_cpu`]. Also never
+        /// materialises the score matrix.
+        FlashCpu,
         /// [`chunked_attention`]: the score matrix exists one tile at a time.
         Chunked,
         /// [`naive_attention`], bounded by [`check_attention_budget`]. Also
@@ -406,6 +409,257 @@ pub mod ops {
         Ok((Tensor::cat(&out, D::Minus2)?, AttentionPath::Chunked))
     }
 
+    /// Whether candle's CPU flash kernel can serve this call.
+    ///
+    /// Checked up front rather than discovered from an `Err`, because the
+    /// kernel reads `q`/`k` through raw strides with no fallback for a
+    /// non-unit last stride: a shape it cannot handle is not always a shape it
+    /// refuses. Everything below is a real constraint of the kernel, sourced
+    /// from `candle_nn::attention::cpu_flash`:
+    ///
+    /// - **f32 only.** The kernel accumulates in f32 and always returns f32,
+    ///   so any other input dtype would silently change the output's. That
+    ///   costs nothing here: CPU activations are f32 throughout — see the F16
+    ///   note in docs/roadmap.md.
+    /// - **Matching head counts.** It supports grouped-query attention by
+    ///   `heads / kv_heads`, which is integer division: an unequal split would
+    ///   round rather than fail. No model here uses GQA.
+    /// - **Matching head dims.** It takes `head_dim` from `q` and uses it to
+    ///   index `v`, so a `v` with a different width reads out of its row.
+    /// - **A mask whose last two axes are exactly `[seq_q, seq_k]`, with every
+    ///   leading axis 1.** The kernel indexes the mask flat as
+    ///   `q_pos * seq_k + kv_pos`, taking `seq_k` from `k` and never looking
+    ///   at the mask's own shape; [`causal_mask`]'s `[1, 1, s, s]` flattens to
+    ///   exactly that. This is checked per axis rather than by element count
+    ///   on purpose: `seq_q * seq_k` is symmetric, so a transposed mask has
+    ///   the right count and the wrong layout, and would be read
+    ///   row-for-column without erroring. A mask that varies per batch element
+    ///   or per head is rejected for the same reason — T5's
+    ///   `[batch, heads, n, n]` relative-position bias is the live example.
+    pub fn flash_cpu_supported(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> bool {
+        let (Ok((b, h, seq_q, d)), Ok(kd), Ok(vd)) = (q.dims4(), k.dims4(), v.dims4()) else {
+            return false;
+        };
+        // The kernel reads CPU storage directly and errors on anything else.
+        if !q.device().is_cpu() || !k.device().is_cpu() || !v.device().is_cpu() {
+            return false;
+        }
+        if q.dtype() != DType::F32 || k.dtype() != DType::F32 || v.dtype() != DType::F32 {
+            return false;
+        }
+        // (batch, heads, head_dim) must agree; only the key axis may differ,
+        // which is what makes cross-attention work.
+        if (kd.0, kd.1, kd.3) != (b, h, d) || (vd.0, vd.1, vd.3) != (b, h, d) || kd.2 != vd.2 {
+            return false;
+        }
+        match mask {
+            None => true,
+            Some(m) => {
+                if m.dtype() != DType::F32 {
+                    return false;
+                }
+                // Check the axes, not the element count. `seq_q * seq_k` is
+                // symmetric, so a transposed `[1, 1, seq_k, seq_q]` mask has
+                // exactly the count a correct one does — it would pass a
+                // count check and then be read row-for-column, silently.
+                let dims = m.dims();
+                let (Some((&last, rest)), true) = (dims.split_last(), dims.len() >= 2) else {
+                    return false;
+                };
+                let (&next_to_last, leading) = rest
+                    .split_last()
+                    .expect("len >= 2 leaves at least one dim after split_last");
+                last == kd.2 && next_to_last == seq_q && leading.iter().all(|&d| d == 1)
+            }
+        }
+    }
+
+    /// Environment override for [`DEFAULT_FLASH_CPU_MAX_SEQ`], in tokens.
+    ///
+    /// `0` disables the CPU flash path entirely, which is the quickest way to
+    /// tell whether a numerical difference came from it.
+    pub const FLASH_CPU_MAX_SEQ_ENV: &str = "SD_FLASH_CPU_MAX_SEQ";
+
+    /// Longest sequence for which the CPU flash kernel beats [`chunked_attention`].
+    ///
+    /// **Flash attention on CPU is not a uniform win, and this constant is
+    /// where that fact lives.** candle's kernel streams one output row at a
+    /// time, so it never materialises the score matrix — but it also gets no
+    /// register blocking across query rows, and it re-reads the whole key axis
+    /// per row. Against that, [`naive_attention`]'s two matmuls run through a
+    /// tuned gemm. Which wins is a question about sequence length: short
+    /// sequences make the gemms too small to amortise their blocking, long
+    /// ones let the gemm pull ahead of the streaming loop.
+    ///
+    /// 512 is where those cross, measured on an M4 Max (16 cores) over
+    /// `head_dim` in {40, 64, 80, 128, 160}, `heads` in {8, 12, 20, 24, 64} and
+    /// batch in {1, 2}. Flash is faster at every configuration at or below it,
+    /// and slower above it at all but one:
+    ///
+    /// ```text
+    ///   seq_q     64    128    256    512    768   1024   4096
+    ///   speedup  2.9x   5.5x   2.4x   1.2x   1.0x   0.9x   1.0x   (h=24, d=128, b=1)
+    ///            1.5x   4.6x   2.4x   1.1x   0.7x   0.6x   0.5x   (h=8,  d=40,  b=1)
+    /// ```
+    ///
+    /// The top row is not monotone, and the exception is real rather than
+    /// noise: at `head_dim = 128` flash sags to 0.85x around 1024 and then
+    /// climbs back, reaching 1.15-1.24x at Flux's 4608. Two mechanisms are
+    /// competing — gemm blocking, which favours long sequences, and score
+    /// matrix traffic, which eventually punishes them. Capturing that second
+    /// crossing would take a rule with two disjoint intervals fitted to one
+    /// `head_dim` on one machine, so this does not try; the shape it would
+    /// win, Flux at 1024 on CPU, is not one anyone runs.
+    ///
+    /// Which real shapes the limit covers: CLIP at 77 tokens, and SD 1.5 and
+    /// SDXL's UNet blocks at the 16x16 and 8x8 levels. Which it excludes:
+    /// SD 3.5 (1178) and Flux (1536+) joint attention, and the UNet's two
+    /// largest levels — the shapes that dominate a denoise step, and where the
+    /// streaming kernel loses by up to 2x.
+    ///
+    /// **T5 is not on that list, despite its 154 tokens sitting well under the
+    /// limit.** Its relative-position bias is a full `[batch, heads, n, n]`
+    /// tensor, and the kernel indexes a mask flat with no head axis, so
+    /// [`flash_cpu_supported`] refuses it. `--example attention_path` times
+    /// T5's shape *unmasked* and reports 5-8x, which is not a speedup anything
+    /// here can collect; the dispatch is pinned by
+    /// `the_real_text_encoder_shapes_take_the_paths_we_think_they_do` in
+    /// sd-models' `api_contract` so the two cannot drift apart again.
+    ///
+    /// **That distribution caps what this is worth end to end, to roughly
+    /// nothing.** For SD 1.5 the eligible calls total about 0.4 s of a
+    /// generation; for SD 3.5, whose only eligible attention is CLIP-L and
+    /// CLIP-G, about 13 ms. Neither separates from noise: SD 1.5 at 512x512,
+    /// 20 steps ran 113.3 s with this path and 114.4 s without, and four
+    /// alternating SD 3.5 runs gave 245.2 / 216.2 / 228.7 / 230.4 s — a spread
+    /// within one configuration wider than the gap between them. The shapes it
+    /// wins are real; they are not where the time goes. Keep it anyway: it is
+    /// free, it is verified against the naive path, and it removes the score
+    /// matrix from the calls it does serve.
+    ///
+    /// Reproduce with `--example attention_path`, which prints both paths side
+    /// by side. Read the noise note there before trusting a single run: an
+    /// earlier version of that benchmark reported figures 10x apart on
+    /// back-to-back runs of the same binary.
+    pub const DEFAULT_FLASH_CPU_MAX_SEQ: usize = 512;
+
+    /// The active sequence limit, honouring [`FLASH_CPU_MAX_SEQ_ENV`].
+    pub fn flash_cpu_max_seq() -> Result<usize> {
+        match std::env::var(FLASH_CPU_MAX_SEQ_ENV) {
+            Ok(raw) => raw.trim().parse().map_err(|_| {
+                Error::Msg(format!(
+                    "{FLASH_CPU_MAX_SEQ_ENV} must be a token count, got {raw:?}"
+                ))
+            }),
+            Err(std::env::VarError::NotPresent) => Ok(DEFAULT_FLASH_CPU_MAX_SEQ),
+            Err(std::env::VarError::NotUnicode(_)) => Err(Error::Msg(format!(
+                "{FLASH_CPU_MAX_SEQ_ENV} is not valid UTF-8"
+            ))),
+        }
+    }
+
+    /// Whether the CPU flash path is both able to serve this call and faster
+    /// than [`chunked_attention`] at it.
+    ///
+    /// Both axes are bounded, not just `seq_q`. The mechanism is about `seq_q`
+    /// — it sets how much work each gemm gets — and a long query axis against
+    /// a short key axis was measured to lose (0.83x at `seq_q = 4096`,
+    /// `seq_k = 77`). The reverse, a short query axis against a long key axis,
+    /// occurs in none of the five architectures here and so was never
+    /// measured; bounding both keeps the untested case on the tested path.
+    pub fn flash_cpu_preferred(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<bool> {
+        if !flash_cpu_supported(q, k, v, mask) {
+            return Ok(false);
+        }
+        let limit = flash_cpu_max_seq()?;
+        Ok(q.dim(D::Minus2)?.max(k.dim(D::Minus2)?) <= limit)
+    }
+
+    /// Attention through candle's CPU flash kernel.
+    ///
+    /// Like the Metal fused path, the `seq_q x seq_k` score matrix is never
+    /// materialised: each output row streams the key axis under a running
+    /// softmax maximum. So there is no [`check_attention_budget`] call here —
+    /// there is no score matrix to bound, and peak memory is the output, which
+    /// is the size of `v`.
+    ///
+    /// Call [`flash_cpu_supported`] first; this returns an error, or worse a
+    /// wrong answer, on a shape the kernel does not handle. Use
+    /// [`flash_cpu_preferred`] to decide whether it is also the *fast* choice —
+    /// this function does not consult [`DEFAULT_FLASH_CPU_MAX_SEQ`], so that
+    /// the benchmark can time it on shapes the dispatcher would not send here.
+    ///
+    /// **Batches are run one element at a time, deliberately.** candle
+    /// dispatches `batch > 1` to a "varlen" kernel that repacks q, k and v into
+    /// a single packed sequence, and that repack costs more than it saves: at
+    /// batch 2, `heads = 24`, `head_dim = 128` it was 1.6x slower than this
+    /// loop at 320 tokens and 4.1x slower at 1024, and the gap grows with
+    /// sequence length. Looping the batch-1 kernel makes
+    /// batch 2 behave like two batch-1 calls, which is the behaviour
+    /// [`DEFAULT_FLASH_CPU_MAX_SEQ`] is calibrated against. It also lifts
+    /// candle's refusal to combine an explicit mask with `batch > 1`, since
+    /// every call this makes is batch 1.
+    ///
+    /// The kernel's layout is `[batch, seq, heads, head_dim]` where this
+    /// workspace uses `[batch, heads, seq, head_dim]`, so the inputs are
+    /// transposed on the way in. It reads through strides, so the transpose of
+    /// a contiguous tensor is a view and costs nothing; the `contiguous()`
+    /// calls exist to guarantee the unit last stride the kernel assumes, and
+    /// are no-ops when the caller already passes contiguous tensors. That
+    /// transposed view is also the *better* layout for it — one head's keys
+    /// end up contiguous, so the inner loop walks memory forwards. Its output
+    /// is `[batch, heads, seq, head_dim]` already.
+    pub fn flash_attention_cpu(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let batch = q.dim(0)?;
+        if batch == 1 {
+            return flash_attention_cpu_single(q, k, v, mask);
+        }
+        let mut out = Vec::with_capacity(batch);
+        for i in 0..batch {
+            // The mask is shared across the batch: `flash_cpu_supported`
+            // accepts only a `seq_q * seq_k` mask, which by construction has no
+            // batch axis to slice.
+            out.push(flash_attention_cpu_single(
+                &q.narrow(0, i, 1)?,
+                &k.narrow(0, i, 1)?,
+                &v.narrow(0, i, 1)?,
+                mask,
+            )?);
+        }
+        Tensor::cat(&out, 0)
+    }
+
+    /// One batch element through candle's batch-1 CPU flash kernel.
+    fn flash_attention_cpu_single(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        use candle_nn::attention::{flash_attn, AttnMask};
+
+        let dim = q.dim(D::Minus1)?;
+        let scale = (1f64 / (dim as f64).sqrt()) as f32;
+        let qt = q.contiguous()?.transpose(1, 2)?;
+        let kt = k.contiguous()?.transpose(1, 2)?;
+        let vt = v.contiguous()?.transpose(1, 2)?;
+        let attn_mask = match mask {
+            Some(m) => AttnMask::Mask(m.contiguous()?),
+            None => AttnMask::None,
+        };
+        flash_attn::<f32>(&qt, &kt, &vt, scale, attn_mask, None, None)
+    }
+
     /// Attention, plus which implementation served it.
     ///
     /// candle 0.11 implements SDPA for Metal only — its `cpu_fwd` bails
@@ -431,6 +685,13 @@ pub mod ops {
     /// is `[1, 1, s, s]`, so CLIP's masked attention stays on the chunked
     /// path. Reproduce with `--example attention_path`.
     ///
+    /// On CPU there is a second fused option — candle's own CPU flash kernel,
+    /// via [`flash_attention_cpu`]. It is taken only for short sequences,
+    /// because unlike the Metal kernel it is not a uniform win:
+    /// [`DEFAULT_FLASH_CPU_MAX_SEQ`] carries the measurements and the
+    /// reasoning. In practice that means the text encoders and the deeper
+    /// UNet blocks take it and the large image-attention shapes do not.
+    ///
     /// Everything else goes to [`chunked_attention`], which reports `Chunked`
     /// when it actually splits and `Naive` when one chunk already covers the
     /// query axis. A declined fused shape therefore falls back to a path whose
@@ -452,6 +713,9 @@ pub mod ops {
             if let Ok(t) = candle_nn::ops::sdpa(&qc, &kc, &vc, mask, false, scale, 1.0) {
                 return Ok((t, AttentionPath::Fused));
             }
+        }
+        if flash_cpu_preferred(q, k, v, mask)? {
+            return Ok((flash_attention_cpu(q, k, v, mask)?, AttentionPath::FlashCpu));
         }
         chunked_attention_with_path(q, k, v, mask)
     }
@@ -959,13 +1223,171 @@ mod attention_budget_tests {
     }
 
     #[test]
-    fn attention_reports_the_naive_path_off_metal() -> super::Result<()> {
+    fn flash_cpu_agrees_with_the_naive_reference() -> super::Result<()> {
+        // Flash rebuilds the softmax incrementally under a running maximum
+        // instead of normalising a materialised score matrix. That is exact in
+        // exact arithmetic and very close in f32, but it is a different
+        // summation order, so this is the test that says the reordering is
+        // sound. Cross-attention (sq != sk) is included because the kernel
+        // takes its key length from `k` and its head dim from `q`, and mixing
+        // those up is the obvious way to get this wrong.
+        let dev = Device::Cpu;
+        for (b, h, sq, sk, d) in [
+            (1usize, 1, 64usize, 64usize, 8usize),
+            (1, 3, 40, 57, 16),
+            (1, 8, 33, 77, 40),
+            (2, 4, 24, 24, 64),
+        ] {
+            let q = Tensor::randn(0f32, 1f32, (b, h, sq, d), &dev)?;
+            let k = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev)?;
+            let v = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev)?;
+            assert!(
+                flash_cpu_supported(&q, &k, &v, None),
+                "{b},{h},{sq},{sk},{d}"
+            );
+
+            let got = flash_attention_cpu(&q, &k, &v, None)?;
+            let want = naive_attention(&q, &k, &v, None)?;
+            assert_eq!(got.dims(), want.dims());
+            assert_eq!(got.dtype(), want.dtype());
+            super::testing::assert_close(&got, &want, 1e-5, "flash vs naive")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn flash_cpu_takes_a_causal_mask() -> super::Result<()> {
+        // The kernel indexes the mask flat as `q_pos * seq_k + kv_pos`, with no
+        // batch or head axis, and `causal_mask` is `[1, 1, s, s]`. Those agree
+        // only because the leading axes are 1 — if this ever compares equal
+        // while the mask is transposed, the result is a model that attends
+        // forwards in time and still produces plausible text embeddings.
+        let dev = Device::Cpu;
+        let (b, h, s, d) = (1usize, 2usize, 48usize, 16usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let mask = causal_mask(s, &dev)?;
+        assert!(flash_cpu_supported(&q, &k, &v, Some(&mask)));
+
+        let got = flash_attention_cpu(&q, &k, &v, Some(&mask))?;
+        let want = naive_attention(&q, &k, &v, Some(&mask))?;
+        super::testing::assert_close(&got, &want, 1e-5, "flash masked vs naive")?;
+        Ok(())
+    }
+
+    #[test]
+    fn flash_cpu_declines_what_it_cannot_serve() -> super::Result<()> {
+        // Each of these would otherwise be served wrongly rather than refused:
+        // the kernel reads through raw strides and does not validate.
+        let dev = Device::Cpu;
+        let q = Tensor::zeros((1, 4, 16, 32), DType::F32, &dev)?;
+
+        // f16 in, f32 out — the kernel always returns f32.
+        let h = Tensor::zeros((1, 4, 16, 32), DType::F16, &dev)?;
+        assert!(!flash_cpu_supported(&h, &h, &h, None));
+
+        // Fewer kv heads than q heads: candle would treat it as GQA.
+        let gqa = Tensor::zeros((1, 2, 16, 32), DType::F32, &dev)?;
+        assert!(!flash_cpu_supported(&q, &gqa, &gqa, None));
+
+        // A `v` narrower than `q`: the kernel takes head_dim from `q`.
+        let narrow = Tensor::zeros((1, 4, 16, 8), DType::F32, &dev)?;
+        assert!(!flash_cpu_supported(&q, &q, &narrow, None));
+
+        // A mask that is not seq_q x seq_k. A per-batch or per-head mask would
+        // be read as if it were the flat one, silently.
+        let wrong = Tensor::zeros((1, 1, 16, 8), DType::F32, &dev)?;
+        assert!(!flash_cpu_supported(&q, &q, &q, Some(&wrong)));
+        let per_head = Tensor::zeros((1, 4, 16, 16), DType::F32, &dev)?;
+        assert!(!flash_cpu_supported(&q, &q, &q, Some(&per_head)));
+
+        // A *transposed* mask is the dangerous one: `seq_q * seq_k` is
+        // symmetric, so it has exactly the element count a correct mask has.
+        // A guard that counted elements would accept it and the kernel would
+        // read it row-for-column, with no error anywhere.
+        let k = Tensor::zeros((1, 4, 8, 32), DType::F32, &dev)?;
+        let right = Tensor::zeros((1, 1, 16, 8), DType::F32, &dev)?;
+        let flipped = Tensor::zeros((1, 1, 8, 16), DType::F32, &dev)?;
+        assert_eq!(right.elem_count(), flipped.elem_count());
+        assert!(flash_cpu_supported(&q, &k, &k, Some(&right)));
+        assert!(!flash_cpu_supported(&q, &k, &k, Some(&flipped)));
+
+        // Rank below 2 has no seq_q axis to check at all.
+        let flat = Tensor::zeros(16 * 8, DType::F32, &dev)?;
+        assert!(!flash_cpu_supported(&q, &k, &k, Some(&flat)));
+        Ok(())
+    }
+
+    #[test]
+    fn flash_cpu_runs_a_batch_one_element_at_a_time() -> super::Result<()> {
+        // The batch loop exists to avoid candle's varlen repack, and it is the
+        // reason a mask works at batch > 1 at all — candle refuses that
+        // combination outright, so a regression to the varlen path would show
+        // up here as an error rather than as a wrong number.
+        let dev = Device::Cpu;
+        let (b, h, s, d) = (3usize, 2usize, 24usize, 16usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev)?;
+        let mask = causal_mask(s, &dev)?;
+        assert!(flash_cpu_supported(&q, &k, &v, Some(&mask)));
+
+        let got = flash_attention_cpu(&q, &k, &v, Some(&mask))?;
+        let want = naive_attention(&q, &k, &v, Some(&mask))?;
+        assert_eq!(got.dims(), want.dims());
+        super::testing::assert_close(&got, &want, 1e-5, "flash batched masked vs naive")?;
+
+        // Element i of the batch must be element i of the output. Recomputing
+        // one element alone and comparing catches a concatenation in the wrong
+        // order, which averaging over the whole tensor would hide.
+        let solo = flash_attention_cpu(
+            &q.narrow(0, 2, 1)?,
+            &k.narrow(0, 2, 1)?,
+            &v.narrow(0, 2, 1)?,
+            Some(&mask),
+        )?;
+        super::testing::assert_close(&got.narrow(0, 2, 1)?, &solo, 1e-6, "batch element 2")?;
+        Ok(())
+    }
+
+    #[test]
+    fn flash_cpu_is_preferred_only_for_short_sequences() -> super::Result<()> {
+        // The whole value of the CPU flash path is that it is *not* taken for
+        // the big image-attention shapes, where it loses by up to 2x. If this
+        // test goes green with the limit ignored, every large model gets
+        // slower and nothing else fails.
+        let dev = Device::Cpu;
+        let limit = DEFAULT_FLASH_CPU_MAX_SEQ;
+        let short = Tensor::zeros((1, 4, limit, 64), DType::F32, &dev)?;
+        assert!(flash_cpu_preferred(&short, &short, &short, None)?);
+
+        let long = Tensor::zeros((1, 4, limit + 1, 64), DType::F32, &dev)?;
+        assert!(!flash_cpu_preferred(&long, &long, &long, None)?);
+
+        // A long query axis against a short key axis was measured to lose, so
+        // it must be the maximum of the two that decides, not the minimum.
+        assert!(!flash_cpu_preferred(&long, &short, &short, None)?);
+        assert!(!flash_cpu_preferred(&short, &long, &long, None)?);
+        Ok(())
+    }
+
+    #[test]
+    fn attention_never_reports_the_metal_path_off_metal() -> super::Result<()> {
         // candle 0.11's SDPA is Metal-only, so on a CPU test runner the fused
         // path is unreachable. Asserting this is what stops a "fused agrees
         // with naive" test from quietly becoming naive-agrees-with-itself.
+        //
+        // Which of the CPU paths runs is a length question, so check both
+        // sides of the limit: short sequences take candle's CPU flash kernel,
+        // long ones stay on the chunked path.
         let dev = Device::Cpu;
-        let q = Tensor::zeros((1, 2, 8, 32), DType::F32, &dev)?;
-        let (_, path) = attention_with_path(&q, &q, &q, None)?;
+        let short = Tensor::zeros((1, 2, 8, 32), DType::F32, &dev)?;
+        let (_, path) = attention_with_path(&short, &short, &short, None)?;
+        assert_eq!(path, AttentionPath::FlashCpu);
+
+        let long = Tensor::zeros((1, 2, DEFAULT_FLASH_CPU_MAX_SEQ + 1, 32), DType::F32, &dev)?;
+        let (_, path) = attention_with_path(&long, &long, &long, None)?;
         assert_eq!(path, AttentionPath::Naive);
         Ok(())
     }

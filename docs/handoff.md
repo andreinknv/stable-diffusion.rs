@@ -16,29 +16,24 @@ Four architectures render, all **on CPU only**:
 | SD 3.5 medium | 512x512, 20 steps, 311 s — `assets/sd35-medium-512-crab.png` |
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 224 tests, all gates green
+table is in [roadmap.md](roadmap.md). 230 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
+
+**Attention now has four paths**, and `ops::attention_with_path` reports which
+one ran: `Fused` (candle's Metal SDPA), `FlashCpu` (candle's CPU flash kernel,
+new — taken only at or below 512 tokens, and never for T5, see
+[roadmap.md](roadmap.md#cpu-flash-attention-a-short-sequence-win-not-a-general-one)),
+`Chunked` and `Naive`. Compare paths with `--example attention_path`, which
+prints both CPU timings side by side and flags a bad dispatch choice. Note its
+rows are all unmasked, so they do not tell you what a *masked* caller gets —
+that is pinned by tests instead.
 
 ## Next
 
 In the order I would do them, with why.
 
-### 1. CPU flash attention  — largest available win, unexplored
-
-`candle_nn::cpu_flash_attention::run_flash_attn_cpu(q, k, v, mask, scale,
-max_bias, softcap)` exists in candle 0.11 and nothing here has tried it. CPU
-is the path every model actually runs on today, and attention is the
-dominant cost: 957 ms for one Flux-1024 attention call against 43.8 ms fused
-on Metal.
-
-Wire it as a new arm in `ops::attention_with_path`
-(`crates/sd-tensor/src/lib.rs`), returning a new `AttentionPath` variant so
-tests can assert which path ran — the existing enum exists for exactly that
-reason. Measure with `--example attention_path`, which already prints path
-and timing per model shape.
-
-### 2. Localise the Metal corruption — Metal is 7.3x faster and wrong
+### 1. Localise the Metal corruption — Metal is 7.3x faster and wrong
 
 Flux schnell on Metal renders in 22.7 s instead of 166 s and produces a flat
 orange field with a corrupted top strip. `--example metal_check` compares CPU
@@ -54,7 +49,7 @@ real error was invisible until `Decoder::forward` was made to synchronize. Try
 forcing a synchronize after each stage first; it is cheap and it worked last
 time.
 
-### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
+### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
 
 Three hand-written copies exist — `sd-models/src/t5/mod.rs`,
 `flux/mod.rs`, `sd3/mod.rs` — each doing its own f32 upcast. candle ships a
@@ -69,6 +64,23 @@ fused one. Mechanical, and the golden tests (`golden_t5`,
   two are patchify/unpatchify by another name.
 - Broaden fused attention to SD 1.5 by materialising `causal_mask` from
   `[1,1,s,s]` to `[b,h,s,s]`. A reshape, not a kernel.
+- A **blocked CPU attention kernel**, tiling over query rows as well as keys.
+  This is the one that would matter: attention at 4096 tokens is where CPU
+  time actually goes, and it is exactly where candle's CPU flash kernel loses
+  to gemm — see the measurements in
+  [roadmap.md](roadmap.md#cpu-flash-attention-a-short-sequence-win-not-a-general-one).
+  Real kernel work, not wiring.
+- `--example attention_path` **flags two rows as "flash is faster here", by
+  design** — they are known misses, not regressions:
+  - *Flux 1024*, 1.15-1.25x. CPU flash has a second crossing at
+    `head_dim = 128`: it sags to 0.85x around 1024 tokens then climbs back by
+    4608. `DEFAULT_FLASH_CPU_MAX_SEQ` ignores it because capturing it needs
+    two disjoint intervals fitted to one `head_dim` on one machine.
+  - *SDXL cross-attention*, 1.07-1.12x, repeatable. But SD 1.5's
+    cross-attention at the same sequence lengths and `head_dim = 40` is
+    0.83x, so this one is not separable by sequence length at all — it would
+    need `head_dim` in the rule. Worth ~0.8 ms per call, and SDXL runs on
+    Metal anyway.
 - Flux **dev** is gated on HuggingFace and needs the user's account.
 - CUDA is untested — no device available here.
 - SDXL img2img is unverified end to end after the encoder-tiling fix.
@@ -105,6 +117,32 @@ has no bf16 matmul.
 fused Metal attention kernel the highest-value work available; candle 0.11
 already shipped one and `attention_with_path` was already routing to it. Only
 a stale doc comment said otherwise.
+
+**…and then check whether it is actually faster, on your shapes.** The
+follow-up to that lesson overcorrected: the survey listed CPU flash attention
+as "potentially the largest single win available" on the strength of it
+existing. It is 2-7x faster below 512 tokens and up to 2x slower above, and
+everything above 512 is where CPU time actually goes — net, nothing
+measurable end to end. Wiring it in unconditionally would have made SD 1.5
+self-attention 2x slower while the enum said `FlashCpu` and every test stayed
+green. Benchmark the new path against the existing one across the shapes you
+really run, before the dispatcher prefers it, and keep both.
+
+**On this machine, benchmark by interleaved minimum — never by mean, and
+never from one A/B pair.** Two traps, both paid for on 2026-07-26:
+
+- A mean-of-5 microbenchmark reported figures 10x apart on back-to-back runs
+  of the same binary. Noise here is one-sided — preemption, page faults and
+  thermal excursions only add time — so take the *minimum* of N runs after a
+  warm-up, and *alternate* between the two things compared so drift lands on
+  both. `--example attention_path` does both and says why.
+- At whole-generation scale one A/B pair said CPU flash made SD 3.5 11.8%
+  faster. Running the same pair with the order reversed said 0.7%, and two
+  runs of the *identical* configuration differed by more than the two
+  configurations did. **Always run the pair both ways round.** Had the first
+  pair been believed, a fabricated 12% would now be in roadmap.md, and the
+  arithmetic said it was impossible — the shapes involved are worth 0.4 s.
+  When a measurement disagrees with the mechanism, suspect the measurement.
 
 **Measure before diagnosing.** The Flux bottom-edge striping was assumed to
 be our packing or positional encoding. Handing diffusers *our* conditioning

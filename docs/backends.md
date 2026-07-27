@@ -154,23 +154,64 @@ Two caveats on the numbers: the first Metal call took 36 s including lazy
 shader compilation, so always warm up; and an M4 Max has unusually fast CPU
 matmul, so the CPU column flatters itself relative to a typical x86 machine.
 
-### What not to do about it: candle's fused SDPA
+### What candle's fused SDPA actually does: most Metal shapes, no CPU ones
 
-`candle_nn::ops::sdpa` looks like the free fix. It is not, for us. In 0.11 it is
-Metal-only (`cpu_fwd` bails outright), and on Metal it declines every shape this
-workspace runs:
+`candle_nn::ops::sdpa` is Metal-only in 0.11 — its `cpu_fwd` bails outright —
+but on Metal it takes **every unmasked shape in this workspace except SD 1.5's
+UNet**, and it is worth having:
 
-- f32 at `head_dim = 512` is explicitly excluded — that is exactly the VAE
-  attention block, single-head over 512 channels, i.e. the call that produced
-  the cliff below.
-- the UNet's `head_dim = 40` is not in its supported set at all.
-- a mask must be materialised to `[batch, heads, seq_q, seq_k]`, while
-  `ops::causal_mask` is `[1, 1, s, s]`, so CLIP's causal path declines too.
+```text
+                         CPU        Metal
+  SDXL UNet 1024    453.7 ms    14.8 ms  fused
+  Flux 1024         957.0 ms    43.8 ms  fused
+  SD 3.5 512         37.1 ms     2.7 ms  fused
+  SD 1.5 UNet 512   110.7 ms    16.8 ms  chunked (head_dim 40 is unsupported)
+```
 
-`ops::attention_with_path` is wired up to use it where it applies and reports
-which path actually ran, so this can be re-checked on a candle bump rather than
-re-litigated from memory. Today it reports `Naive` everywhere. Do not record
-"fused attention landed" as a memory win without checking that value.
+It still declines two things: f32 at `head_dim = 512`, which exceeds Metal's
+32 KB of threadgroup memory and is exactly the VAE attention block, and a mask
+that is not `[batch, heads, seq_q, seq_k]` — `ops::causal_mask` is
+`[1, 1, s, s]`, so CLIP's causal path declines.
+
+**This paragraph used to say it declined everything, and that claim outlived
+the fact by several sessions.** The roadmap consequently listed writing a fused
+Metal kernel as the highest-value work available, when candle had already
+shipped one and `attention_with_path` was already routing to it. Re-check the
+path values with `--example attention_path` on a candle bump rather than
+re-reading this section; that is what the function returns them for.
+
+### What CPU got instead: candle's flash kernel, for short sequences only
+
+candle 0.11 also ships a CPU flash kernel
+(`candle_nn::attention::flash_attn`), reached via `ops::flash_attention_cpu`
+and reported as `AttentionPath::FlashCpu`. It streams one output row at a time
+under a running softmax maximum, so like the Metal kernel it never
+materialises the score matrix.
+
+**It is not a uniform win, which is the whole story here.** It gets no register
+blocking across query rows and re-reads the key axis per row, so it beats the
+gemm-based path only while the gemms are too small to amortise their blocking.
+Measured on an M4 Max across `head_dim` {40, 64, 80, 128, 160}, `heads`
+{8, 12, 20, 24, 64} and batch {1, 2}, the crossover is at **512 tokens**: 2-7x
+faster below it, up to 2x slower above. `ops::DEFAULT_FLASH_CPU_MAX_SEQ` holds
+that limit and the measurements behind it; `SD_FLASH_CPU_MAX_SEQ` overrides it,
+and `0` disables the path.
+
+So it serves CLIP at 77 tokens and the UNet blocks at 16x16 and 8x8, and stays
+out of the way of everything that dominates a denoise step. **T5 is not
+served**, despite its 154 tokens: its relative-position bias is a full
+`[batch, heads, n, n]` tensor and the kernel indexes masks flat, with no head
+axis, so `ops::flash_cpu_supported` refuses it.
+
+**End to end that is not measurable on this machine**, and the mechanism says
+it should not be: the eligible calls total about 0.4 s of an SD 1.5
+generation and about 13 ms of an SD 3.5 one. SD 1.5 at 512x512, 20 steps ran
+113.3 s with it and 114.4 s without; SD 3.5 run four times alternating gave
+245.2 / 216.2 / 228.7 / 230.4 s, a spread within one configuration wider than
+the gap between them. Images differ by at most 1/255. See
+[roadmap.md](roadmap.md) for the full table and why the first pair's apparent
+12% was an artefact of run order. **The cliff below is a large-sequence
+problem and this kernel is a small-sequence win, so it does not touch it.**
 
 ### What was done about it: chunked attention
 
@@ -201,10 +242,16 @@ split.
 
 ### What is still to do about it
 
-The cliff above is unchanged, because closing it needs softmax *fused* into the
-matmul so the score matrix never reaches memory at all. That is a kernel, not a
-scheduling change — candle does not expose one for these shapes (see above), so
-it means writing Metal. Tracked in [roadmap.md](roadmap.md).
+On Metal the cliff is closed for every shape candle's fused kernel accepts,
+which is all of them bar SD 1.5's `head_dim = 40` UNet and the VAE's
+`head_dim = 512` block. Those two, and the CPU path above 512 tokens, still
+materialise the score matrix a tile at a time.
+
+On CPU there is no equivalent left to reach for: candle's flash kernel is the
+fused option, and it is slower than the gemm path at exactly the large
+sequences where the cliff lives. Closing that would mean a blocked CPU kernel
+that tiles over query rows as well as keys — real work, not a scheduling
+change. Tracked in [roadmap.md](roadmap.md).
 
 Also note `--features accelerate` on Apple silicon: BLAS-accelerated CPU
 matmul that adds **no native compilation** (it links a system framework). Worth
