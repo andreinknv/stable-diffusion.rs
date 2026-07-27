@@ -218,7 +218,34 @@ assumption has now failed twice.
     Metal anyway.
 - Flux **dev** is gated on HuggingFace and needs the user's account.
 - CUDA is untested — no device available here.
-- SDXL img2img is unverified end to end after the encoder-tiling fix.
+- ~~SDXL img2img is unverified end to end after the encoder-tiling fix.~~
+  **Verified.** Encoder (tiled) through strength, sampler and decoder: the
+  strength maps to steps correctly (`--steps 8 --strength 0.35` runs 3), the
+  output holds the input's composition at low strength and leaves it at high
+  (mean 24.5/255 from the input at 0.35 against 90.0 at 0.9), and forcing the
+  encoder to tile changes the result by mean 6.6/255 — the "close to but not
+  identical" that tiling is documented to be, not a defect.
+
+## SDXL below its native resolution is garbage, and that is not a bug
+
+Worth writing down because it looks exactly like one. SDXL at 256x256 produces
+saturated colour noise with no subject at all — and it does so in **txt2img**,
+which is what rules the pipeline out. An img2img at strength 0.9 looks equally
+broken for the same reason: at that strength the output is mostly generated
+rather than preserved, so it inherits the same failure.
+
+At 512 it is coherent but heavily stylised; 1024 is where it belongs. If an
+SDXL result looks like a bug, render the same prompt as txt2img at the same
+size before investigating anything else — that single control separates "the
+resolution" from "the code" in one run.
+
+This is also why 1024 is a poor size to *test* at. Verifying the img2img path
+means exercising encoder tiling, which only engages above
+`TILE_LATENT_EDGE * 8`; lowering `SD_VAE_TILE_LATENT` makes a 256px image tile
+into four, covering the same code at a sixteenth of the pixels. Reaching for
+native resolution instead put a 1024 VAE *encode* on the GPU — wired memory,
+the allocation class that has taken this machine down before — and did exactly
+that again.
 
 ## Traps this codebase has already paid for
 
@@ -250,6 +277,13 @@ it, and **measure before choosing either number.** The script exists now; run
 it rather than picking a value that turns the light green. That is how the
 Flux VAE encoder's 2e-3 bound and T5's 3e-3 were set, and both sat at or below
 the reference's own noise floor.
+
+**Test the smallest input that reaches the code, not the most realistic one.**
+Verifying SDXL img2img meant exercising encoder tiling, which engages only
+above 512px — so native 1024 looked like the honest choice and wedged the
+machine on a wired Metal allocation. `SD_VAE_TILE_LATENT=16` tiles a 256px
+image into four and covers the same path for a sixteenth of the memory. The
+knob had been added earlier the same day and forgotten.
 
 **Do not `git checkout` a file to undo a temporary edit if it also holds
 uncommitted work.** Reverting a one-line test perturbation this way discarded
