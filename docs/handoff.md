@@ -119,7 +119,32 @@ Measure on a discrete GPU if one is ever available. Everything below was
 verified on unified memory, where the mechanism is right but the payoff is
 smallest.
 
-### 2. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
+### 2. Make the UNet golden bounds relative, then turn Accelerate on by default
+
+`--features accelerate` is **1.7-1.9x faster on CPU** — SD 1.5 at 512, 4
+steps: 19.1/20.6 s against 34.6/35.0 s, interleaved, for output agreeing to
+1/255. Every CPU number in these documents was measured without it. It links a
+system framework and compiles nothing, so it costs nothing but the flag.
+
+Turning it on for macOS is one target-scoped dependency in
+`sd-tensor/Cargo.toml` and it was tried: it fails two golden tests,
+`mid_block_matches_diffusers` at `max_abs = 1.087e-4` and
+`down_pass_skips_match_diffusers` at `1.049e-4`, against `DEFAULT_ATOL = 1e-4`.
+Those tensors peak at **16.2**, so that is 6.7e-6 relative — f32
+reduction-order noise sitting at the theoretical floor for the reduction
+length (`sqrt(4096) * 1.2e-7 = 7.7e-6`), with mean absolute error 1.6e-5, six
+times under the bound. The tests are absolute where they should be relative:
+the same mistake already recorded for text encoders, and
+`testing::allclose_excess` exists for it.
+
+**Do the tolerance work first, on its own merits, and only then flip the
+flag.** Loosening a correctness bound as a side effect of landing a speed-up
+is how a gate stops meaning anything. The standard is in the traps below:
+measure the reference's own f32-vs-f64 spread and cite it. That needs torch,
+which is not installed here — `pip install torch diffusers` and
+`xtask/golden/dump_reference.py` is the path.
+
+### 3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`
 
 Three hand-written copies exist — `sd-models/src/t5/mod.rs`,
 `flux/mod.rs`, `sd3/mod.rs` — each doing its own f32 upcast. candle ships a

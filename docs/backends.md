@@ -253,10 +253,52 @@ sequences where the cliff lives. Closing that would mean a blocked CPU kernel
 that tiles over query rows as well as keys — real work, not a scheduling
 change. Tracked in [roadmap.md](roadmap.md).
 
-Also note `--features accelerate` on Apple silicon: BLAS-accelerated CPU
-matmul that adds **no native compilation** (it links a system framework). Worth
-enabling for CPU builds regardless of the GPU story — see
-[native-deps.md](native-deps.md).
+### What the CPU path already uses, and the 1.9x it does not
+
+Without any feature flags the CPU path is already vectorised and threaded, via
+candle rather than anything here: matmul goes through the `gemm` crate, which
+is SIMD-blocked and rayon-parallel, and `VecOps::vec_dot` — which the CPU
+flash-attention path calls per row — dispatches to NEON, AVX2 or SIMD128.
+There is no scalar fallback being hit by accident.
+
+What is *not* on is Apple's Accelerate, and it is worth a lot. **SD 1.5 at
+512, 4 steps, CPU, interleaved runs:**
+
+| build | run 1 | run 2 |
+|---|---|---|
+| default | 34.6 s | 35.0 s |
+| `--features accelerate` | 19.1 s | 20.6 s |
+
+**1.7-1.9x**, for output that agrees to a maximum of 1/255 with 97% of pixels
+exactly equal. It links a system framework and compiles nothing, so
+`check-native-deps.sh` still reports `onig_sys` alone. Every CPU figure
+elsewhere in these documents was measured *without* it and is correspondingly
+pessimistic.
+
+**Why it is not on by default, which is the interesting part.** Enabling it
+for macOS via a target-scoped dependency works and is one line — and it fails
+two golden tests: `mid_block_matches_diffusers` at `max_abs = 1.087e-4` and
+`down_pass_skips_match_diffusers` at `1.049e-4`, both against
+`DEFAULT_ATOL = 1e-4`. Those tensors peak at 16.2, so the deviation is
+**6.7e-6 relative** — f32 reduction-order noise, right at the theoretical
+floor for a reduction of this length (`sqrt(4096) * 1.2e-7 = 7.7e-6`), and the
+mean absolute error is 1.6e-5, six times *under* the bound.
+
+So the tests are absolute where they should be relative — the same mistake
+this project already documented for text encoders, `testing::allclose_excess`
+already exists for it, and the UNet's peak-16 activations need it too. But
+loosening a correctness tolerance as a side effect of landing a speed-up is
+the wrong order to do things in, and the standard set in the handoff is to
+*measure the reference implementation's own f32-vs-f64 spread* before choosing
+a looser bound rather than picking whatever turns the light green. That needs
+torch, which is not installed here. Until then `--features accelerate` is
+opt-in and correct; see [native-deps.md](native-deps.md).
+
+One more knob deliberately not taken: there is no `.cargo/config.toml`, so
+nothing is built with `-C target-cpu=native`. That would let the compiler use
+NEON extensions beyond the aarch64 baseline, and it would also produce a
+binary that only runs on the machine that built it — the wrong default for a
+library, and a reasonable choice for someone building locally.
 
 ## Does the whole pipeline work on Metal?
 
