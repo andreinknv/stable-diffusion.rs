@@ -721,14 +721,28 @@ So the model, the frame layout and the guidance assembly are all correct, and
 whatever is wrong is **after** the UNet: the sampling loop, the schedule
 mapping, or the run settings.
 
-**The most likely confound, and the cheapest thing to check next:** every
-16-frame run so far was at **256 px**, because 16 frames at 512 under guidance
-is a batch of 32 at 4096 tokens and I did not want to risk the memory. SD 1.5
-composes badly at 256 regardless of motion, so those images may be wrong for a
-reason that has nothing to do with AnimateDiff. **Run diffusers' own pipeline
-at 16 frames, 256 px and look at its output.** If it is mush too, this port
-already matches and the answer is resolution; if it is clean, the fault is in
-the loop.
+**Resolution is ruled out, and the reference fails harder than this port does.**
+Measured, 16 frames, seed 12, same prompt:
+
+```text
+                        adjacent-frame diff   per-frame std
+  diffusers @ 256              109.6              102.7
+  this port  @ 256, dpmpp2m     49.1               69.5
+  this port  @ 512, dpmpp2m     (still noise)
+```
+
+So `diffusers`' own `AnimateDiffPipeline` produces black-and-white banded mush
+at 256 — worse than this port's output at the same settings — and moving to
+512 did not fix this port either. 256 was never a fair test of anything, and
+512 is not the answer on its own.
+
+**The one experiment still missing is `diffusers` at 16 frames, 512 px.** It
+was started and is slow on CPU; if it renders a clean car then there is a real
+bug in this port's sampling loop and the way to find it is to bisect by
+comparing latents after N steps (the one-step comparison already passes at
+1.125e-5, so N > 1). If it produces mush too, this port matches the reference
+and the fault is in how these particular weights are being driven — prompt,
+guidance, step count — rather than in any code here.
 
 After that: our sampler is k-diffusion (variance-exploding sigmas, input
 scaled by `1/sqrt(sigma^2+1)`) where the reference uses PNDM in the
