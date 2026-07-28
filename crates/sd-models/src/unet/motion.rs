@@ -288,13 +288,23 @@ pub(super) fn next_module(channels: usize) -> Result<Option<MotionModule>> {
 }
 
 /// Whether every module was attached.
+///
+/// **Errors when nothing is installed**, not just on a partial count. An
+/// earlier version returned `Ok` for that case, which made a failed install
+/// silent: the UNet built without a single motion module, reported success,
+/// and rendered exactly as if no adapter had been given. That is the failure
+/// this function exists to catch, so it has to be the loudest case rather than
+/// the one that slips through.
 pub fn fully_consumed() -> Result<()> {
     INSTALLED.with(|s| match s.borrow().as_ref() {
+        None => Err(sd_tensor::Error::Msg(
+            "motion adapter: no source was installed, so no modules were attached".to_string(),
+        )),
         Some(src) if src.next != src.names.len() => Err(sd_tensor::Error::Msg(format!(
             "motion adapter: {} of {} modules were attached",
             src.next,
             src.names.len()
         ))),
-        _ => Ok(()),
+        Some(_) => Ok(()),
     })
 }

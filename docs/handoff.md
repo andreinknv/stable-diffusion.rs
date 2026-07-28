@@ -188,6 +188,9 @@ a fixed palette.
 The second pass draws from `seed + 1`, so the two passes do not draw the same
 noise for differently-sized latents.
 
+**AnimateDiff is wired end to end but does not yet render well** — see
+[Next](#next) for exactly what is established and what is not.
+
 **A clip is a batch of frames**, `--frames 8`. The pipeline no longer assumes
 batch 1: the latent draw, the guidance concatenation, the timestep tensor and
 the sampler's noise draws all follow the frame count, and `--output clip.png`
@@ -695,39 +698,45 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### ~~1. Batch the pipeline~~ — done; wire the adapter into the pipeline next
+### 1. AnimateDiff end to end — plumbing works, image quality does not
 
-The model side and the batching are both done. What is left is small: a
-`--motion-adapter <file>` on the pipeline, which means threading the adapter
-path into `Txt2ImgPipeline::load` the way `load_with_ip_adapter` does, since
-the modules live *inside* the UNet and must be present when it is built.
+**Verified:** the motion module at 2.662e-7, and the wired UNet at 5.440e-6.
+`--motion-adapter` reaches the UNet, all 21 modules attach, and the coherence
+effect is measurable. **Not verified:** that a clip looks right. It does not
+yet, and I did not find out why.
 
-Then a clip with an adapter attached should show temporal coherence where one
-without it shows three unrelated crabs — which is the A/B worth capturing, and
-the only part of AnimateDiff not yet demonstrated end to end.
+Adjacent-frame difference at 16 frames, 256 px, seed 12 — lower is more
+coherent:
 
-### ~~Batch the pipeline~~ — the notes that were here
+```text
+  no adapter, euler_a     104.2
+  adapter,    euler_a      73.4
+  adapter,    dpmpp2m      49.1
+```
 
-The model side is done and verified (above). What is missing is that **a clip
-is a batch**: 16 frames is a batch of 16, and the pipeline assumes batch 1
-throughout — the latent draw, the CFG concatenation, the timestep tensor, the
-decode.
+Monotone in the right direction, and `dpmpp2m` helps because euler-ancestral
+draws fresh *independent* noise per frame every step, which fights the very
+coupling the modules add. But the frames are still degraded — recognisable
+structure at 16 frames, mush at 4.
 
-That is the same change a batched still-image path needs, so it is worth doing
-as *batching* rather than as an animation special case. Once it lands, a run
-is: `motion::with_frames(n)`, a latent of `[n, 4, h, w]`, conditioning repeated
-per frame, and the existing loop.
+**Two things are already ruled out, so do not re-run them:**
 
-Two things already in place that make it smaller than it looks:
-`Progress::denoised` and `run_with_latent` mean a caller can already drive
-frames explicitly, and `motion::with_frames` already carries the count to all
-21 modules.
+- **It is not the frame count alone.** At 4 frames `diffusers`' own
+  `AnimateDiffPipeline` produces the *same* noise, with the same prompt and
+  seed. AnimateDiff v2 is trained for 16; 4 is simply outside what it does.
+  That the port reproduces the reference's failure mode is mild evidence for
+  the port.
+- **It is not the beta schedule.** I guessed linear, tried it, saw no
+  improvement, and checked: `AnimateDiffPipeline` defaults to `scaled_linear`,
+  which is what this already uses. Reverted.
 
-The trap to expect: **conditioning is per frame, not per batch entry.** The
-reference `UNetMotionModel` does *not* repeat it internally — passing one row
-where frames expect `n` fails inside the spatial cross-attention with a
-2048-vs-1024 mismatch, which is what stalled the verification of this the
-first time round.
+**What I would try next, in order:** compare our latent against
+`AnimateDiffPipeline`'s after *one* step with identical inputs — that
+localises to the loop rather than the model, which the 5.440e-6 UNet
+comparison already exonerates. Then guidance scale and step count, which
+AnimateDiff is sensitive to. The reference pipeline also applies
+`free_init`/no special scaling by default, so an unnoticed normalisation is
+plausible.
 
 ### ~~2. TAESD and step previews~~ — both done
 

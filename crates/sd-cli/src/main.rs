@@ -127,6 +127,14 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         frames: usize,
 
+        /// AnimateDiff motion adapter, so frames become one motion rather
+        /// than independent images.
+        ///
+        /// Needs --frames above 1: temporal attention over a sequence of one
+        /// is close to inert.
+        #[arg(long)]
+        motion_adapter: Option<String>,
+
         /// Two-pass generation: compose at --width/--height, then add detail
         /// at this size. `1024x1024`, or `1024` for a square.
         ///
@@ -777,6 +785,7 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
+            motion_adapter,
             frames,
             hires,
             hires_strength,
@@ -867,6 +876,22 @@ fn main() -> Result<()> {
                                 lora_scale,
                             )
                             .with_context(|| format!("loading {m} with LoRA {l}"))?
+                        }
+                        None if motion_adapter.is_some() => {
+                            let a = motion_adapter.as_deref().expect("checked");
+                            if frames <= 1 {
+                                tracing::warn!(
+                                    "--motion-adapter with --frames 1: temporal attention over \
+                                     a sequence of one is close to inert"
+                                );
+                            }
+                            tracing::info!(adapter = %a, frames, "motion adapter");
+                            Txt2ImgPipeline::load_with_motion_adapter(
+                                Path::new(m),
+                                &dev,
+                                Path::new(a),
+                            )
+                            .with_context(|| format!("loading {m} with motion adapter {a}"))?
                         }
                         None => match (&ip_adapter, &image_encoder) {
                             (Some(a), Some(e)) => {

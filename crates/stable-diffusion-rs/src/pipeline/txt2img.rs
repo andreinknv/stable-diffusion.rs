@@ -569,7 +569,7 @@ impl Txt2ImgPipeline {
         device: &Device,
         ip_vb: Option<&sd_tensor::VarBuilder<'_>>,
     ) -> Result<Self, PipelineError> {
-        Self::load_all(model_dir, device, None, ip_vb)
+        Self::load_all(model_dir, device, None, ip_vb, None)
     }
 
     fn load_inner(
@@ -577,14 +577,16 @@ impl Txt2ImgPipeline {
         device: &Device,
         lora: Option<(&sd_loader::Lora, f64)>,
     ) -> Result<Self, PipelineError> {
-        Self::load_all(model_dir, device, lora, None)
+        Self::load_all(model_dir, device, lora, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_all(
         model_dir: &Path,
         device: &Device,
         lora: Option<(&sd_loader::Lora, f64)>,
         ip_vb: Option<&sd_tensor::VarBuilder<'_>>,
+        motion_vb: Option<&sd_tensor::VarBuilder<'_>>,
     ) -> Result<Self, PipelineError> {
         let tokenizer_path = model_dir.join("tokenizer/tokenizer.json");
         if !tokenizer_path.exists() {
@@ -641,11 +643,25 @@ impl Txt2ImgPipeline {
                 vb
             }
         };
-        let unet = match ip_vb {
-            Some(ip) => {
+        // Both adapters live *inside* the UNet's blocks, so they must be
+        // present when it is built — unlike a ControlNet, which sits beside it
+        // and can be attached afterwards.
+        let unet = match (ip_vb, motion_vb) {
+            (Some(ip), None) => {
                 UNet2DConditionModel::new_with_ip(&unet_cfg, vb, ip.pp("ip_adapter"), NUM_TOKENS)?
             }
-            None => UNet2DConditionModel::new(&unet_cfg, vb)?,
+            (None, Some(motion)) => {
+                UNet2DConditionModel::new_with_motion(&unet_cfg, vb, motion.clone())?
+            }
+            (Some(_), Some(_)) => {
+                // They occupy different layers and would probably compose, but
+                // each installs its own construction-scoped source and the two
+                // have never been run together. Refused rather than guessed.
+                return Err(PipelineError::Tensor(sd_tensor::Error::Msg(
+                    "an IP-Adapter and a motion adapter together are untested".to_string(),
+                )));
+            }
+            (None, None) => UNet2DConditionModel::new(&unet_cfg, vb)?,
         };
 
         let vb = sd_loader::safetensors_var_builder(&[&vae_path], DType::F32, device)?;
@@ -1034,6 +1050,25 @@ impl Txt2ImgPipeline {
     /// Trigger words currently registered.
     pub fn embedding_names(&self) -> Vec<&str> {
         self.embeddings.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// Load with an AnimateDiff motion adapter attached.
+    ///
+    /// A separate constructor for the same reason as
+    /// [`Self::load_with_ip_adapter`]: the 21 modules go *inside* the UNet's
+    /// blocks, so they must be present when it is built.
+    ///
+    /// Attaching one does nothing on its own — set `Txt2ImgConfig::frames`
+    /// above 1, or the temporal attention runs over a sequence of length one
+    /// and the modules are close to inert.
+    pub fn load_with_motion_adapter(
+        model_dir: &Path,
+        device: &Device,
+        adapter: &Path,
+    ) -> Result<Self, PipelineError> {
+        let adapter = require(adapter.to_path_buf())?;
+        let motion_vb = sd_loader::safetensors_var_builder(&[&adapter], DType::F32, device)?;
+        Self::load_all(model_dir, device, None, None, Some(&motion_vb))
     }
 
     /// Whether an IP-Adapter is attached.
