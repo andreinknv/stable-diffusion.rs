@@ -1,7 +1,32 @@
 # Handoff
 
-Written 2026-07-26. Say **"go"** to resume: read this file, pick the top
-unstarted item under [Next](#next), and start it.
+Updated 2026-07-28.
+
+## Say "go" to resume
+
+**"go" means: read this file, take the first item under [Next](#next) that is
+not struck through, and start it.** No further instruction is needed and none
+should be waited for.
+
+Working rules this project holds to, in rough order of how often they have
+mattered:
+
+1. **Verify against a published reference, tensor by tensor.** Every feature
+   here has a number against `diffusers`/`transformers`. A feature without one
+   is not done, however well it appears to run.
+2. **Measure before optimising, and measure the pair both ways.** Single A/B
+   runs have lied three times in this file's history.
+3. **A tolerance below the reference's own f32-vs-f64 noise floor is measuring
+   float32, not the port.** `xtask/golden/reference_precision.py` establishes
+   the floor; quote it where a bound is set.
+4. **Do not borrow a constant from a paper without checking what it is a
+   constant *of*.** This cost two runs in one session — AnimateDiff's beta
+   schedule and the step-cache threshold band.
+5. **Run the gates before committing**: `cargo fmt --all`,
+   `cargo clippy --workspace --all-targets --features metal -- -D warnings`,
+   `bash scripts/check-seam.sh`, `cargo test --release --workspace`.
+6. **Check free memory before a large run.** Metal allocations are wired; an
+   oversized one takes the machine, not the process.
 
 ## Where things stand
 
@@ -824,136 +849,79 @@ that is pinned by tests instead.
 
 ## Next
 
-In the order I would do them, with why.
+In priority order. Struck-through items are done and kept for their reasoning.
 
-### ~~1. Overlap the block copy with compute~~ — tried, and it is slower
+### 1. unCLIP — image-embedding conditioning
 
-Built and reverted. The prefetch itself worked exactly as intended: a
-background thread copying block `i+1` while block `i` computes took the copy
-wait from ~220 ms per step to ~15 ms. The run got *slower* by about the same
-amount, and the whole generation went from **28.5 s to 36.0 s**.
+Ready to start: `stabilityai/stable-diffusion-2-1-unclip` is gated, but
+`diffusers/stable-diffusion-2-1-unclip-t2i-h`, `-i2i-h` and `-t2i-l` are open
+(checked, 200). `StableUnCLIPPipeline` is the reference.
 
-**The cause is in candle, and it is device-independent.**
-`MetalDevice::allocate_buffer` takes a write lock on a single shared buffer
-pool (`Arc<RwLock<BufferMap>>`). The prefetch thread allocates roughly two
-dozen buffers per block; the compute thread allocates activations constantly.
-They serialise on that lock, so the two never overlap — they take turns with
-extra contention on top.
+A full architecture rather than an adapter, and three pieces:
 
-That matters for whether to revisit this. The obvious reading of the numbers
-is "unified memory shares bandwidth, so a discrete card would be different" —
-but the lock is not a memory-architecture property. It would serialise the
-same way over PCIe.
+- **A CLIP image embedder** — already ported, `clip::ClipVisionEncoder`, and
+  `image_embeds` is the projected form unCLIP wants.
+- **Noise augmentation** on the image embedding, with its own noise-level
+  schedule. This is the part with no analogue elsewhere here.
+- **A UNet with `class_embed_type = "projection"`** — the augmented embedding
+  is projected and *added to the timestep embedding*, the same slot SDXL's
+  micro-conditioning uses, so `AdditionEmbedding` is the shape to follow.
 
-So this is not "prefetch does not pay on this machine", it is "prefetch cannot
-pay until allocation stops being globally serialised". Two routes, neither
-small: pre-allocate each block's buffers once and reuse them across steps
-(sidestepping the allocator entirely), or fix the pool upstream. Measure the
-lock before either — this was diagnosed by reading candle's source, not by
-profiling it.
+Verify the class embedding path in isolation first, then the whole UNet — the
+addition into `temb` is silent when wrong.
 
-### ~~1. GLIGEN~~ — done end to end
+### 2. A real predictor for step caching
 
-Nothing left. What remains of the breadth issue is unCLIP and hypernetworks,
-neither of which is a small addition: unCLIP needs its own checkpoints rather
-than an adapter, and hypernetworks predate LoRA and are little used. Video,
-audio and 3D the issue itself calls separate decisions.
+`--cache-threshold` works but buys ~9 % where the literature reports 1.5-2x.
+The machinery is right (threshold 0 is bit-identical, the last step always
+evaluates); the *predictor* is the weak part — it measures how far the input
+moved rather than predicting how much the output will change.
 
-### ~~2. TAESD and step previews~~ — both done
+Replace it with TeaCache's approach: take the relative change in the
+**timestep-modulated embedding**, rescale through a fitted polynomial, and
+accumulate that. The polynomial is per-model and published for SD 1.5, SDXL
+and Flux. Everything else stays.
 
-Ported, verified and wired up (see above). Two ends left loose, neither large:
+Measured numbers to beat are in `Txt2ImgConfig::cache_threshold`.
 
-- **Flux and SD 3 have no CLI subcommand**, so their previews are driven by
-  `SD_PREVIEW_EVERY` / `SD_TAESD` on `examples/{flux,sd3}_txt2img.rs`. Folding
-  them into `sdrs` is the obvious tidy-up and is a bigger question than it
-  looks: they take paths to five and six files respectively, where txt2img
-  takes one directory.
+### 3. A Metal smoke test — a gap the suite structurally cannot see
 
-### 2. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
+**Every golden test runs on CPU.** GLIGEN shipped a `to_dtype(F64)` that works
+on CPU and fails at load on Metal, and nothing in 337 tests could have caught
+it.
 
-`madebyollin/taesd` is a ~5 MB distilled replacement for the VAE decoder. Two
-things it buys, and the second is the one that matters here:
+One forward per architecture on the GPU, asserting only that it runs and
+returns finite values of the right shape — no reference needed. Cheap, fast,
+and it protects everything already built. Gate it on the `metal` feature so CI
+without a GPU still passes.
 
-- **Step previews.** Decoding is currently far too slow to show intermediate
-  latents, so a 20-step run is a blank wait. TAESD decodes cheaply enough to
-  preview every step.
-- **A decode that always fits.** `decode_tiled` already degrades gracefully,
-  but a decoder small enough to never need tiling removes the failure mode
-  rather than managing it.
+### 4. Newer architectures worth the port
 
-Architecturally it is simple — a stack of 3x3 convolutions and ReLU residual
-blocks, no attention, no GroupNorm — so this is a short port with an easy
-reference (`diffusers.AutoencoderTiny`). The trap to watch: TAESD's latent
-convention is its own (`latent_magnitude = 3`, `latent_shift = 0.5`), *not*
-the SD VAE's `0.18215`, and mixing them gives a washed-out image rather than
-an error. Verify against `AutoencoderTiny.decode` end to end, not just the
-module stack, so the scaling is covered by the test.
+From a July 2026 survey. All fit this library's existing shape — DiT-style
+transformers with quantised GGUF variants:
 
-### 3. Extend streaming past Flux and SD 3.5, and measure it on a discrete GPU
+- **FLUX.2 [dev]** — strongest open-weight photorealism; on a Mac it means the
+  quantised GGUF, which is the path already built. `[klein]` is Apache-2.0.
+- **Qwen-Image** — the specialist for legible in-image text, Apache-2.0.
+- **HiDream-I1** — MIT, and architecturally interesting: 8B pixel-native, no
+  external VAE and no separate text encoders. That makes it *less* work than
+  its size suggests, since two towers disappear.
 
-`Residency::Streamed` works for **Flux and SD 3.5**, both quantised. Gaps, in
-the order they matter:
+### 5. Extend streaming past Flux and SD 3.5, and measure on a discrete GPU
 
-- **Dense checkpoints cannot stream at all.** `quantized::to_device` moves
-  quantised block bytes verbatim, which is what makes it cheap and bit-exact;
-  a dense model would move 4x the bytes with no equivalent shortcut. Flux mini
-  — the model that most needs this, at 12.8 GB dense — is therefore the one
-  that cannot have it. Whether a dense path is worth it is a measurement
-  nobody has made.
-- **Nothing prefetches**, and per the profile above that is not the first
-  thing to fix. `stable-diffusion.cpp` overlaps copy and compute
-  (`stream_layers`); worth doing once the build cost is gone.
+`Residency::Streamed` works for Flux and SD 3.5, both quantised. Gaps:
 
-And the honest one: **the payoff has not been measured on the hardware it is
-for.** On unified memory the host copy sits in the same pool, so what the
-device gives up it gives up to the same allocator — the mechanism is
-demonstrable there (one block resident instead of the stack, at the default
-sync interval) but the *benefit* is not. On a discrete card it should take
-VRAM from 6.66 GB to ~192 MB, by construction rather than by measurement. If a
-CUDA machine ever appears, measure this before anything else here.
+- **Dense checkpoints cannot stream.** `quantized::to_device` moves quantised
+  block bytes verbatim, which is what makes it cheap and bit-exact; a dense
+  model would move 4x the bytes with no shortcut. flux-mini — the model that
+  most needs this at 12.8 GB dense — is therefore the one that cannot have it.
+- **Nothing prefetches**, and per the profile below that is not the first fix.
 
-### ~~3. Deduplicate RMSNorm onto `candle_nn::ops::rms_norm`~~ — done, and the
-answer was no
-
-The three copies are now one, in `ops::rms_norm`, and `PlainLayerNorm`'s two
-copies are one in `ops::plain_layer_norm`. But **candle's fused kernels are
-not what they were deduped onto**, and that is the part worth keeping: its
-`rms_norm` sums each row with a sequential `.sum::<f32>()` where
-`mean_keepdim` reduces in blocks, so it is 4-11x less accurate, worst at long
-rows. Measured against f64 at `[1, 154, 4096]`: 9.695e-7 for ours against
-9.627e-6 for candle's. Swapping T5 onto it moved `golden_t5` to 3.891e-3,
-past a 3e-3 bound that was itself measured. The speed it buys is 2.1x on that
-shape and *negative* — 2.7x slower — at `[1, 77, 768]`.
-
-**`candle_nn::ops::layer_norm` has now been measured too, and the answer is
-also no — but it is the closest call of the three.** Unlike `rms_norm` it
-breaks no golden bound: swapping `ops::plain_layer_norm` onto it leaves Flux
-and SD 3.5 passing. What it costs is margin, and what it buys is 6 %:
-
-```text
-                       ours        candle fused
-  norm alone, Metal    1.60 ms     0.14 ms        11.3x   (Flux shape)
-  norm alone, CPU      1.44 ms     0.56 ms         2.6x
-  SD 3.5 end to end    25.6 s      24.0 s          1.06x  (3 runs vs 2)
-  SD 3.5 max_abs       5.484e-6    8.345e-6       +52 %
-  Flux max_abs         1.190e-3    1.556e-3       +31 %
-```
-
-11x on the operation is 6 % on the run, because a norm is one cheap op in a
-block dominated by attention and two large matmuls. Half the accuracy margin
-for that is the wrong trade in a project whose product is the verified
-agreement — and the bounds are not arbitrary, they were set from the
-reference's own f32-against-f64 noise floor, so spending margin makes every
-later change more likely to trip. On Metal the accuracy is not even
-measurable: there is no f64 there to compare against.
-
-Reversing this is a four-line change if priorities shift; the numbers are
-here so it need not be re-measured. Note the pattern is *not* "fused is
-always worse" — it is that fused trades accuracy for speed, and all three
-times so far the trade has been bad.
-
-`cargo run --release -p sd-tensor --features metal --example layer_norm_bench`
-reproduces the first two rows.
+And the honest one: **the payoff has never been measured on the hardware it is
+for.** On unified memory the host copy comes from the same pool. On a discrete
+card it should take VRAM from 6.66 GB to ~192 MB by construction. **If a CUDA
+machine appears, measure this before anything else here** — CUDA is also
+entirely untested, so that visit should cover both.
 
 ### Also open
 
