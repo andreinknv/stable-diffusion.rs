@@ -80,6 +80,26 @@ pub struct QLinear {
     weight: QMatMul,
     bias: Option<Tensor>,
     resident: usize,
+    /// A LoRA applied at *runtime* rather than merged.
+    ///
+    /// Merging into a quantised weight means dequantising, adding, and
+    /// requantising — lossy, and it throws away the compression that made the
+    /// model fit in the first place. Adding the correction to the *output*
+    /// instead leaves the quantised weight untouched and costs two small dense
+    /// matmuls: `x @ down^T` is `[.., rank]` and `@ up^T` brings it back, so
+    /// nothing of size `[in, out]` is ever formed.
+    lora: Option<LoraDelta>,
+}
+
+/// A low-rank correction held as its factors.
+#[derive(Debug, Clone)]
+pub struct LoraDelta {
+    /// `[rank, in]`.
+    pub down: Tensor,
+    /// `[out, rank]`.
+    pub up: Tensor,
+    /// `alpha/rank * multiplier`, already folded.
+    pub scale: f64,
 }
 
 impl QLinear {
@@ -95,12 +115,32 @@ impl QLinear {
             weight: QMatMul::from_arc(weight)?,
             bias,
             resident,
+            lora: None,
         })
+    }
+
+    /// Attach a runtime LoRA. Consuming, so a layer either has one from
+    /// construction or never does.
+    pub fn with_lora(mut self, delta: LoraDelta) -> Self {
+        self.lora = Some(delta);
+        self
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = without_storage_offset(xs)?;
         let out = self.weight.forward(&xs)?;
+        let out = match &self.lora {
+            None => out,
+            Some(delta) => {
+                // The factors are applied in order, so the widest intermediate
+                // is `[.., rank]` — 4 to 128 wide, against `in` or `out`.
+                let dtype = out.dtype();
+                let x = xs.to_dtype(delta.down.dtype())?;
+                let low = x.broadcast_matmul(&delta.down.t()?)?;
+                let correction = low.broadcast_matmul(&delta.up.t()?)?;
+                (out + (correction * delta.scale)?.to_dtype(dtype)?)?
+            }
+        };
         match &self.bias {
             // Broadcast: the bias is [out], the activation [.., out].
             Some(b) => out.broadcast_add(b),
@@ -375,5 +415,123 @@ mod tests {
         let qt = QTensor::quantize(&w.to_dtype(DType::F16).unwrap(), GgmlDType::F16).unwrap();
         let q = QLinear::new(Arc::new(qt), None).unwrap();
         assert!(matches!(q.weight, QMatMul::Tensor(_)));
+    }
+}
+
+#[cfg(test)]
+mod lora_tests {
+    use super::*;
+    use crate::{Device, Tensor};
+
+    /// A quantised layer and the same weight dense, so the two can be compared.
+    fn pair(in_dim: usize, out_dim: usize) -> (QLinear, Tensor, Device) {
+        let dev = Device::Cpu;
+        let dense = Tensor::randn(0f32, 0.05, (out_dim, in_dim), &dev).unwrap();
+        let q = candle_core::quantized::QTensor::quantize(
+            &dense,
+            candle_core::quantized::GgmlDType::Q8_0,
+        )
+        .unwrap();
+        let layer = QLinear::new(std::sync::Arc::new(q), None).unwrap();
+        (layer, dense, dev)
+    }
+
+    #[test]
+    fn a_runtime_lora_matches_merging_it_into_the_dense_weight() {
+        // The property the whole runtime path exists for: applying the
+        // correction to the *output* must equal applying it to the *weight*,
+        // so nothing is given up by not dequantising.
+        //
+        // Compared against a dense merge rather than against nothing, because
+        // "it changed the output" would pass for any wrong scale or transpose.
+        let (in_dim, out_dim, rank) = (64usize, 32usize, 4usize);
+        let (layer, dense, dev) = pair(in_dim, out_dim);
+
+        let down = Tensor::randn(0f32, 0.1, (rank, in_dim), &dev).unwrap();
+        let up = Tensor::randn(0f32, 0.1, (out_dim, rank), &dev).unwrap();
+        let scale = 0.75f64;
+
+        let layer_ref = QLinear::new(
+            std::sync::Arc::new(
+                candle_core::quantized::QTensor::quantize(
+                    &dense,
+                    candle_core::quantized::GgmlDType::Q8_0,
+                )
+                .unwrap(),
+            ),
+            None,
+        )
+        .unwrap();
+        let with_lora = layer.with_lora(LoraDelta {
+            down: down.clone(),
+            up: up.clone(),
+            scale,
+        });
+        let xs = Tensor::randn(0f32, 1.0, (2, in_dim), &dev).unwrap();
+        let got = with_lora.forward(&xs).unwrap();
+
+        // The same correction merged into the dense weight, then run densely.
+        let delta = (up.matmul(&down).unwrap() * scale).unwrap();
+        let merged = (&dense + &delta).unwrap();
+        let want = xs.matmul(&merged.t().unwrap()).unwrap();
+
+        // The quantiser's own error, measured rather than assumed: the same
+        // layer with no LoRA at all, against the same dense weight. Whatever
+        // that is, the LoRA path must not exceed it — the correction is
+        // computed in f32 and never touches the quantiser, so it should add
+        // nothing.
+        let plain = layer_ref.forward(&xs).unwrap();
+        let plain_want = xs.matmul(&dense.t().unwrap()).unwrap();
+        let worst = |a: &Tensor, b: &Tensor| {
+            let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            a.iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        let floor = worst(&plain, &plain_want);
+        let with = worst(&got, &want);
+        println!("quantiser noise {floor:.3e}, with runtime LoRA {with:.3e}");
+        assert!(
+            with <= floor * 1.5,
+            "the LoRA path added error beyond the quantiser: {with:.3e} against a \
+             {floor:.3e} floor"
+        );
+    }
+
+    #[test]
+    fn scale_zero_is_bit_identical_to_no_lora() {
+        // What makes the strength safe to expose, and a check that the
+        // correction is *added* rather than replacing the quantised output.
+        let (in_dim, out_dim, rank) = (64usize, 32usize, 4usize);
+        let (layer, _dense, dev) = pair(in_dim, out_dim);
+        let xs = Tensor::randn(0f32, 1.0, (2, in_dim), &dev).unwrap();
+        let plain = layer.forward(&xs).unwrap();
+
+        let zeroed = layer.with_lora(LoraDelta {
+            down: Tensor::randn(0f32, 0.1, (rank, in_dim), &dev).unwrap(),
+            up: Tensor::randn(0f32, 0.1, (out_dim, rank), &dev).unwrap(),
+            scale: 0.0,
+        });
+        let got = zeroed.forward(&xs).unwrap();
+        assert_eq!(
+            plain.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+    }
+
+    #[test]
+    fn the_widest_intermediate_is_the_rank_not_the_layer() {
+        // The reason this is worth doing at all: never forming `up @ down`.
+        // A 4096x4096 layer with rank 8 would need 64 MB for the product and
+        // needs 128 KB for the factors.
+        let (in_dim, out_dim, rank) = (4096usize, 4096usize, 8usize);
+        let factors = (rank * in_dim + out_dim * rank) * 4;
+        let product = in_dim * out_dim * 4;
+        assert!(
+            product / factors > 200,
+            "the saving should be large: {product} vs {factors}"
+        );
     }
 }

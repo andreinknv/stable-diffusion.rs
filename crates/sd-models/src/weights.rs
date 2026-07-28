@@ -224,7 +224,11 @@ impl<'a> Source<'a> {
         // negligible beside the weight — and quantising it costs accuracy for
         // no meaningful saving.
         let bias = Self::dense(w, cache, &format!("{path}.bias"))?;
-        Ok(Proj::Quantized(QLinear::new(weight, Some(bias))?))
+        let q = QLinear::new(weight, Some(bias))?;
+        Ok(Proj::Quantized(match runtime_lora::delta_for(path) {
+            Some(delta) => q.with_lora(delta),
+            None => q,
+        }))
     }
 
     /// A projection with no bias.
@@ -235,10 +239,13 @@ impl<'a> Source<'a> {
                 out_dim,
                 Self::at(vb, path),
             )?)),
-            Self::Quantized(w) | Self::QuantizedCached(w, _) => Ok(Proj::Quantized(QLinear::new(
-                Self::quantized(w, &format!("{path}.weight"))?,
-                None,
-            )?)),
+            Self::Quantized(w) | Self::QuantizedCached(w, _) => {
+                let q = QLinear::new(Self::quantized(w, &format!("{path}.weight"))?, None)?;
+                Ok(Proj::Quantized(match runtime_lora::delta_for(path) {
+                    Some(delta) => q.with_lora(delta),
+                    None => q,
+                }))
+            }
         }
     }
 
@@ -255,5 +262,60 @@ impl<'a> Source<'a> {
             Self::Quantized(w) => Self::dense(w, None, path),
             Self::QuantizedCached(w, cache) => Self::dense(w, Some(cache), path),
         }
+    }
+}
+
+/// A LoRA applied at runtime to quantised layers.
+///
+/// Installed for the duration of a model construction, so each layer can look
+/// up its own correction by the path it already knows — the same shape as
+/// GLIGEN's fusers, and for the same reason: there is no index to get wrong.
+///
+/// Ambient rather than a parameter because `Source` is threaded through every
+/// model constructor in the crate, and widening it would touch all of them for
+/// something only quantised linear layers care about.
+pub mod runtime_lora {
+    use std::cell::RefCell;
+
+    use sd_tensor::quantized::LoraDelta;
+
+    thread_local! {
+        static INSTALLED: RefCell<Option<(sd_loader::Lora, f64)>> = const { RefCell::new(None) };
+    }
+
+    /// Removes the adapter when dropped.
+    #[must_use = "the adapter is removed when this guard is dropped"]
+    pub struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            INSTALLED.with(|s| *s.borrow_mut() = None);
+        }
+    }
+
+    /// Apply `lora` to quantised layers built while the guard lives.
+    pub fn install(lora: sd_loader::Lora, multiplier: f64) -> Guard {
+        INSTALLED.with(|s| *s.borrow_mut() = Some((lora, multiplier)));
+        Guard
+    }
+
+    /// This layer's correction, if the installed adapter has one.
+    pub(super) fn delta_for(path: &str) -> Option<LoraDelta> {
+        INSTALLED.with(|s| {
+            let slot = s.borrow();
+            let (lora, multiplier) = slot.as_ref()?;
+            let (down, up, scale) = lora.delta_for(path)?;
+            Some(LoraDelta {
+                down: down.clone(),
+                up: up.clone(),
+                scale: scale * multiplier,
+            })
+        })
+    }
+
+    /// How many layers the installed adapter covers, for a caller to check
+    /// against what it expected — a LoRA that matches nothing applies silently.
+    pub fn len() -> usize {
+        INSTALLED.with(|s| s.borrow().as_ref().map_or(0, |(l, _)| l.len()))
     }
 }

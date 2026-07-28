@@ -164,6 +164,17 @@ impl Lora {
         Ok(Self { entries })
     }
 
+    /// The correction for a model path, if this adapter has one.
+    ///
+    /// Returns `(down, up, scale)` — the factors, *not* their product. That is
+    /// the point of the runtime path: `up @ down` is a full-size dense matrix,
+    /// and never forming it is what lets a LoRA apply to a **quantised** base
+    /// without dequantising it.
+    pub fn delta_for(&self, path: &str) -> Option<(&Tensor, &Tensor, f64)> {
+        let entry = self.entries.get(&flatten(path))?;
+        Some((&entry.down, &entry.up, entry.scale))
+    }
+
     /// How many layers this adapter corrects.
     pub fn len(&self) -> usize {
         self.entries.len()
