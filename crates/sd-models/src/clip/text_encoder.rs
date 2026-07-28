@@ -404,11 +404,10 @@ impl ClipTextEncoder {
     /// CLIP's vocabulary. Using the last index instead would pick a padding
     /// slot — the same token, but at the wrong position, so the wrong vector.
     pub fn pooled(&self, token_ids: &Tensor) -> Result<Option<Tensor>> {
-        let Some(projection) = &self.text_projection else {
+        if self.text_projection.is_none() {
             return Ok(None);
-        };
-        let pooled = self.pooled_hidden(token_ids)?;
-        Ok(Some(projection.forward(&pooled)?))
+        }
+        self.project(&self.pooled_hidden(token_ids)?)
     }
 
     /// The EOS hidden state **without** the text projection.
@@ -441,7 +440,18 @@ impl ClipTextEncoder {
     /// why it survived — the SDXL reference that does cover pooling is
     /// exactly the case where the bug cannot appear.
     pub fn pooled_hidden(&self, token_ids: &Tensor) -> Result<Tensor> {
-        let hidden = self.forward(token_ids)?;
+        self.pool(&self.forward(token_ids)?, token_ids)
+    }
+
+    /// [`Self::pooled_hidden`] on a sequence this encoder has **already
+    /// produced**.
+    ///
+    /// The same answer without running twelve layers a second time. Callers
+    /// almost always want the sequence *and* the pooled vector — SD 3 takes
+    /// its context from the penultimate layer and its pooled vector from the
+    /// projection head, both out of one forward — and the obvious spelling,
+    /// `forward()` followed by `pooled()`, quietly encodes the prompt twice.
+    pub fn pool(&self, hidden: &Tensor, token_ids: &Tensor) -> Result<Tensor> {
         let ids = token_ids.to_dtype(DType::U32)?.to_vec2::<u32>()?;
 
         let mut rows = Vec::with_capacity(ids.len());
@@ -451,6 +461,14 @@ impl ClipTextEncoder {
             rows.push(hidden.i(b)?.narrow(0, eos, 1)?);
         }
         Tensor::cat(&rows, 0)
+    }
+
+    /// Apply `text_projection` to a pooled vector, if the checkpoint has one.
+    pub fn project(&self, pooled: &Tensor) -> Result<Option<Tensor>> {
+        match &self.text_projection {
+            Some(projection) => Ok(Some(projection.forward(pooled)?)),
+            None => Ok(None),
+        }
     }
 
     /// The dtype this encoder's weights are in.

@@ -1793,11 +1793,14 @@ impl Txt2ImgPipeline {
         let (cond_ids, cond_mask) = self.prior_tokens(stack, prompt)?;
         let (uncond_ids, uncond_mask) = self.prior_tokens(stack, negative_prompt)?;
 
+        // One forward per prompt, not two: the prior wants the sequence *and*
+        // the projected pooled vector, and `forward` followed by `pooled`
+        // would encode each prompt twice.
         let encode = |ids: &Tensor| -> Result<(Tensor, Tensor), PipelineError> {
             let hidden = stack.text_encoder.forward(ids)?;
             let pooled = stack
                 .text_encoder
-                .pooled(ids)?
+                .project(&stack.text_encoder.pool(&hidden, ids)?)?
                 .ok_or(PipelineError::NoPrior)?;
             Ok((pooled, hidden))
         };
@@ -1815,11 +1818,15 @@ impl Txt2ImgPipeline {
         // than something scaled onto one.
         let mut latents = rng.randn((1, dim), &self.device)?;
 
-        for &t in scheduler.timesteps() {
+        let total = scheduler.timesteps().len();
+        for (done, &t) in scheduler.timesteps().iter().enumerate() {
             if cfg.base.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                // The prior's own step count, which is not the image half's —
+                // a caller that cancels during the prior should be told where
+                // it actually stopped rather than "0 of 20".
                 return Err(PipelineError::Cancelled {
-                    completed: 0,
-                    total: scheduler.timesteps().len(),
+                    completed: done,
+                    total,
                 });
             }
             let doubled = Tensor::cat(&[&latents, &latents], 0)?;

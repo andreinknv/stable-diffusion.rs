@@ -218,18 +218,21 @@ impl Sd3Pipeline {
 
         // Penultimate layer for the sequences, projection head for the pooled
         // vectors — the two come from different depths of the same forward.
-        let (_, layers_l) = self.clip_l.forward_with_layers(&ids)?;
-        let (_, layers_g) = self.clip_g.forward_with_layers(&ids)?;
+        // The final output is kept, not discarded: pooling reads it, and
+        // `pooled()` would otherwise run all twelve layers a second time for
+        // a tensor this forward has already produced.
+        let (final_l, layers_l) = self.clip_l.forward_with_layers(&ids)?;
+        let (final_g, layers_g) = self.clip_g.forward_with_layers(&ids)?;
         let seq_l = penultimate(&layers_l)?;
         let seq_g = penultimate(&layers_g)?;
 
         let pooled_l = self
             .clip_l
-            .pooled(&ids)?
+            .project(&self.clip_l.pool(&final_l, &ids)?)?
             .ok_or_else(|| PipelineError::MissingFile(PathBuf::from("CLIP-L text_projection")))?;
         let pooled_g = self
             .clip_g
-            .pooled(&ids)?
+            .project(&self.clip_g.pool(&final_g, &ids)?)?
             .ok_or_else(|| PipelineError::MissingFile(PathBuf::from("CLIP-G text_projection")))?;
 
         // 768 + 1280 = 2048, then zero-padded out to T5's 4096. The padding is

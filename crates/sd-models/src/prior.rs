@@ -365,25 +365,15 @@ impl PriorTransformer {
     /// conditioning and the answer, and masking them would hide the prompt
     /// from the token that has to produce the prediction.
     ///
-    /// # Materialised to `[b, heads, seq, seq]`, not left to broadcast
-    ///
-    /// A `[b, 1, seq, seq]` mask is what the arithmetic naturally produces and
-    /// it broadcasts correctly on CPU. **On Metal it does not run**: the seam's
-    /// dispatcher documents that its fast paths want every leading axis at 1,
-    /// and a mask that varies per batch element is outside that — the failure
-    /// is a matmul shape error from inside the kernel, not a wrong number.
-    ///
-    /// Expanding here also matches the reference, which does
-    /// `repeat_interleave(num_attention_heads)` for its own reasons. It costs
-    /// 1.7 MB at batch 2.
-    fn attention_mask(&self, batch: usize, text_mask: Option<&Tensor>) -> Result<Tensor> {
+    /// Left as `[b, 1, seq, seq]` to broadcast over heads rather than
+    /// materialised to `[b, heads, seq, seq]`. The reference expands it —
+    /// `repeat_interleave(num_attention_heads)` — but it does so to satisfy an
+    /// API that takes `[b * heads, ...]`, not for any numerical reason, and
+    /// expanding here would cost 32x the memory for the same numbers.
+    fn attention_mask(&self, _batch: usize, text_mask: Option<&Tensor>) -> Result<Tensor> {
         let seq = self.cfg.sequence_length();
-        let heads = self.cfg.num_attention_heads;
         let Some(text_mask) = text_mask else {
-            return self
-                .causal_mask
-                .broadcast_as((batch, heads, seq, seq))?
-                .contiguous();
+            return Ok(self.causal_mask.clone());
         };
         let (b, n) = text_mask.dims2()?;
         if n != self.cfg.num_embeddings {
@@ -405,9 +395,7 @@ impl PriorTransformer {
         // penalty applies to a *key* whatever the query, and the causal one to
         // the pair.
         let row = row.reshape((b, 1, 1, seq))?;
-        row.broadcast_add(&self.causal_mask)?
-            .broadcast_as((b, heads, seq, seq))?
-            .contiguous()
+        row.broadcast_add(&self.causal_mask)
     }
 
     /// Un-whiten a sampled embedding into the units the image half expects.
@@ -491,7 +479,7 @@ impl PriorScheduler {
         noise: &Tensor,
     ) -> Result<Tensor> {
         let t = timestep.min(self.train_timesteps - 1);
-        let prev = self.previous_timestep(t);
+        let prev = self.previous_timestep(t)?;
 
         let alpha_prod_t = self.alphas_cumprod[t];
         let alpha_prod_prev = match prev {
@@ -536,9 +524,20 @@ impl PriorScheduler {
     /// Read from the schedule rather than computed as `t - ratio`: with a step
     /// count that does not divide 1000 the two disagree, and the reference
     /// walks the list.
-    fn previous_timestep(&self, t: usize) -> Option<usize> {
-        let i = self.timesteps.iter().position(|&x| x == t)?;
-        self.timesteps.get(i + 1).copied()
+    ///
+    /// **`Err` when `t` is not on this schedule at all**, which is a different
+    /// thing from being the last entry and used to be conflated with it — a
+    /// timestep from a 25-step ladder handed to a 50-step scheduler would have
+    /// been treated as the end of the run, skipping the variance and returning
+    /// a quietly wrong sample.
+    fn previous_timestep(&self, t: usize) -> Result<Option<usize>> {
+        let i = self.timesteps.iter().position(|&x| x == t).ok_or_else(|| {
+            sd_tensor::Error::Msg(format!(
+                "timestep {t} is not on this {}-step schedule",
+                self.timesteps.len()
+            ))
+        })?;
+        Ok(self.timesteps.get(i + 1).copied())
     }
 }
 
@@ -563,8 +562,11 @@ mod tests {
         // variance at the end would return a noisy embedding and there is
         // nothing downstream to notice.
         let s = PriorScheduler::new(25);
-        assert!(s.previous_timestep(960).is_some());
-        assert_eq!(s.previous_timestep(0), None);
+        assert!(s.previous_timestep(960).expect("on the schedule").is_some());
+        assert_eq!(s.previous_timestep(0).expect("on the schedule"), None);
+        // And a timestep from a different ladder is refused rather than
+        // silently treated as the end of this one.
+        assert!(s.previous_timestep(961).is_err());
     }
 
     #[test]

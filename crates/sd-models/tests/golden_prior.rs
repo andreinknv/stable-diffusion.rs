@@ -300,6 +300,49 @@ fn the_prior_runs_at_the_batch_guidance_uses() {
 }
 
 #[test]
+fn the_attention_mask_is_derived_the_way_transformers_reports_it() {
+    // Every other test here is handed `prior_mask` straight from the
+    // reference, so the *derivation* — the one thing the pipeline actually
+    // computes — had no coverage at all. This tokenizes the reference's own
+    // prompt and rebuilds the mask the way `prior_tokens` does, against what
+    // `CLIPTokenizer` reported.
+    //
+    // The rule is "one up to and including the EOS, zero after", and the
+    // plausible off-by-ones both run: stopping before the EOS hides the
+    // position the pooled vector is read from, and running one past it lets
+    // the first padding token through.
+    let dev = Device::Cpu;
+    let Some(refs) = refs(&dev) else { return };
+    let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../models/unclip-t2i/prior_tokenizer/tokenizer.json");
+    if !tokenizer_path.exists() {
+        eprintln!("{REGENERATE}");
+        return;
+    }
+    let tokenizer =
+        sd_models::clip::ClipTokenizer::from_file(&tokenizer_path).expect("prior tokenizer");
+
+    const PROMPT: &str = "a photograph of a crab on a beach";
+    let ids = tokenizer.encode(PROMPT).expect("encode");
+    let want_ids: Vec<u32> = refs["prior_tokens"]
+        .to_vec2::<i64>()
+        .expect("tokens")
+        .remove(0)
+        .into_iter()
+        .map(|t| t as u32)
+        .collect();
+    assert_eq!(ids, want_ids, "token ids disagree with the reference");
+
+    let used = tokenizer.content_token_count(PROMPT).expect("count") + 2;
+    let got: Vec<i64> = (0..ids.len())
+        .map(|i| i64::from(i < used.min(ids.len())))
+        .collect();
+    let want = refs["prior_mask"].to_vec2::<i64>().expect("mask").remove(0);
+    assert_eq!(got, want, "the derived attention mask disagrees");
+    assert_eq!(used, 10, "this prompt should occupy ten positions");
+}
+
+#[test]
 fn the_prior_joins_to_its_own_image_half() {
     // The reference that would have caught the published mismatch. Everything
     // above passes on `-t2i-h` too, whose prior emits 768 and whose image half

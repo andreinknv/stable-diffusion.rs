@@ -31,7 +31,7 @@ mattered:
 ## What this project does today
 
 Every capability below is verified against `diffusers`/`transformers` with a
-recorded number. **361 tests, all gates green**, plus 7 GPU smoke tests behind the `metal`
+recorded number. **362 tests, all gates green**, plus 7 GPU smoke tests behind the `metal`
 feature (`cargo test --features metal --test metal_smoke`) — they are not in
 the default count because a machine without a GPU cannot run them.
 
@@ -168,7 +168,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 361 tests, all gates green
+table is in [roadmap.md](roadmap.md). 362 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -1229,6 +1229,25 @@ a suite verifies modules against saved tensors, the *tokenizer-to-model* seam
 is exactly what no golden test sees. `pooling_takes_the_first_eos_not_the_last`
 in `golden_clip_encoder.rs` is structural and needs no reference data, so it
 cannot regress quietly again.
+
+**When a fix works, find out which half of it was the fix.** The prior's Metal
+failure was cleared by two changes made together: materialising the attention
+mask from `[b, 1, s, s]` to `[b, heads, s, s]`, and a `contiguous()` on the
+narrowed output. The second was the entire fix. Reverting the first and
+re-running took two minutes and showed it had never been needed — otherwise a
+32x-larger mask would have shipped, along with a confident paragraph in the
+module docs explaining why it was necessary, which the next person would have
+believed. Two simultaneous changes and one observation cannot tell you which
+one worked.
+
+**`forward()` then `pooled()` encodes the prompt twice**, because
+`pooled_hidden` runs the encoder itself. SD 3 was doing exactly that for both
+CLIP towers — four full forwards per generation where two suffice — and so was
+the first version of the prior's text path. `ClipTextEncoder::pool` and
+`::project` take an already-computed sequence, so a caller that wants the
+sequence *and* the pooled vector pays once. Worth ~0.2 % of a generation and
+found by reading rather than profiling; the reason to fix it is that the
+duplicate call is invisible at the call site, not that it was slow.
 
 **A tensor that does not own its buffer is still a different tensor — and this
 time CPU was the one that hid it.** The prior reads its answer with
