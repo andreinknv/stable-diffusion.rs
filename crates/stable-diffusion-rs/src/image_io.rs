@@ -167,6 +167,39 @@ pub fn composite(generated: &Tensor, original: &Tensor, mask: &Tensor) -> Result
     generated.broadcast_mul(mask)? + original.broadcast_mul(&keep)?
 }
 
+/// Write every image in a batch, numbered.
+///
+/// `out.png` with four frames becomes `out-000.png` .. `out-003.png`. A single
+/// image keeps the name it was given, so nothing changes for the common case —
+/// numbering one file would be a surprise, and callers script against the name
+/// they passed.
+///
+/// Returns the paths written, in order.
+pub fn save_batch<P: AsRef<std::path::Path>>(xs: &Tensor, path: P) -> Result<Vec<String>> {
+    let path = path.as_ref();
+    let count = if xs.rank() == 4 { xs.dim(0)? } else { 1 };
+    if count <= 1 {
+        save_png(xs, path)?;
+        return Ok(vec![path.to_string_lossy().into_owned()]);
+    }
+
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("png");
+    let mut written = Vec::with_capacity(count);
+    for i in 0..count {
+        // Zero-padded to three, so `ls` and any glob sort in frame order
+        // rather than 1, 10, 2.
+        let name = format!("{stem}-{i:03}.{ext}");
+        let out = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+            _ => std::path::PathBuf::from(name),
+        };
+        save_png(&xs.narrow(0, i, 1)?, &out)?;
+        written.push(out.to_string_lossy().into_owned());
+    }
+    Ok(written)
+}
+
 pub fn save_png<P: AsRef<std::path::Path>>(xs: &Tensor, path: P) -> Result<()> {
     let (w, h, bytes) = tensor_to_rgb8(xs)?;
     let buf = image::RgbImage::from_raw(w, h, bytes)

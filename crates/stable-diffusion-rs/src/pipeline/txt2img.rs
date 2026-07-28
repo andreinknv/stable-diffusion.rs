@@ -172,6 +172,13 @@ pub struct Txt2ImgConfig {
     pub cfg_scale: f64,
     pub seed: u64,
     pub sampler: SamplerKind,
+    /// Frames to generate as one clip. 1 is a still image.
+    ///
+    /// **A clip is a batch**: `n` frames is a batch of `n`, denoised together
+    /// so a motion module can attend across them. Without a motion adapter
+    /// attached this just produces `n` independent images that share a
+    /// schedule — which is a batch, not an animation.
+    pub frames: usize,
     /// Set to stop the run early. `None` means it cannot be cancelled.
     pub cancel: Option<Cancel>,
 }
@@ -187,6 +194,7 @@ impl Default for Txt2ImgConfig {
             cfg_scale: 7.5,
             seed: 0,
             sampler: SamplerKind::default(),
+            frames: 1,
             cancel: None,
         }
     }
@@ -385,6 +393,23 @@ pub struct Control {
     pub hint: Tensor,
     /// 1.0 is the published strength; 0.0 contributes exactly nothing.
     pub scale: f64,
+}
+
+/// Repeat a `[2, s, d]` guidance context to `[2n, s, d]`.
+///
+/// Uncond rows first, then cond — the same layout the loop's `narrow` split
+/// expects. Interleaving instead runs, and guides each frame by another
+/// frame's conditioning: a subtle wrongness rather than an error.
+fn repeat_per_frame(context: &Tensor, frames: usize) -> Result<Tensor, PipelineError> {
+    if frames == 1 {
+        return Ok(context.clone());
+    }
+    let uncond = context.narrow(0, 0, 1)?;
+    let cond = context.narrow(0, 1, 1)?;
+    let mut rows: Vec<Tensor> = Vec::with_capacity(frames * 2);
+    rows.extend(std::iter::repeat_n(uncond, frames));
+    rows.extend(std::iter::repeat_n(cond, frames));
+    Ok(Tensor::cat(&rows, 0)?)
 }
 
 /// The control maps for one run, already doubled for the guidance batch.
@@ -860,7 +885,7 @@ impl Txt2ImgPipeline {
         let mut rng = SeededRng::new(base.seed);
         let (lh, lw) = (base.height / 8, base.width / 8);
         let sigmas = self.sigmas_for(base.sampler, base.steps);
-        let latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+        let latent = (rng.randn((cfg.base.frames.max(1), 4, lh, lw), &self.device)? * sigmas[0])?;
 
         let latent = self.denoise_controlled(
             base,
@@ -1252,6 +1277,15 @@ impl Txt2ImgPipeline {
                     None,
                 ),
             };
+        // One row per row of the guidance batch. The reference UNet does *not*
+        // repeat conditioning across frames — hidden states carry frames on
+        // the batch and the text must too. Passing one row where `n` are
+        // expected fails inside the spatial cross-attention rather than
+        // broadcasting, which is how this was found.
+        let contexts = contexts
+            .into_iter()
+            .map(|c| repeat_per_frame(&c, cfg.frames.max(1)))
+            .collect::<Result<Vec<_>, PipelineError>>()?;
 
         let sigmas = self.sigmas_for(cfg.sampler, cfg.steps);
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
@@ -1264,7 +1298,8 @@ impl Txt2ImgPipeline {
         // output. Drawn even when `latent` is supplied, so that the sampler's
         // subsequent draws land in the same sequence either way and a
         // caller-supplied `initial_latent` reproduces the seeded run exactly.
-        let drawn = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+        let frames = cfg.frames.max(1);
+        let drawn = (rng.randn((frames, 4, lh, lw), &self.device)? * sigmas[0])?;
         let latent = match latent {
             Some(given) => {
                 if given.dims() != drawn.dims() {
@@ -1467,6 +1502,12 @@ impl Txt2ImgPipeline {
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
         let steps = sigmas.len().saturating_sub(1);
         let mut dpm = DpmSolverPlusPlus2M::new();
+        // Read from the latent rather than the config: the latent is the one
+        // thing every path here already agrees on, and a caller supplying its
+        // own through `run_with_latent` sets the count by doing so.
+        let frames = latent.dim(0)?;
+        // Motion modules need it too, and they are four levels down.
+        let _frames_guard = sd_models::unet::motion::with_frames(frames);
 
         for i in 0..steps {
             // Checked before the work, so a cancel between steps costs nothing
@@ -1496,7 +1537,8 @@ impl Txt2ImgPipeline {
             };
 
             let t = sigma_to_timestep(&self.schedule, sigma);
-            let timestep = Tensor::new(&[t as f32, t as f32], &self.device)?;
+            // One entry per row of the guidance batch: 2 * frames, not 2.
+            let timestep = Tensor::from_vec(vec![t as f32; 2 * frames], 2 * frames, &self.device)?;
 
             let out = match &control {
                 Some(hints) if !self.controlnets.is_empty() => {
@@ -1534,8 +1576,12 @@ impl Txt2ImgPipeline {
                 }
                 _ => self.unet.forward(&latent_in, &timestep, context)?,
             };
-            let out_uncond = out.narrow(0, 0, 1)?;
-            let out_cond = out.narrow(0, 1, 1)?;
+            // The guidance batch is [uncond frames..., cond frames...], not
+            // interleaved — matching how `latent_in` was concatenated and how
+            // the context is laid out. Splitting it the other way runs and
+            // guides each frame by another frame's conditioning.
+            let out_uncond = out.narrow(0, 0, frames)?;
+            let out_cond = out.narrow(0, frames, frames)?;
             let noise_pred = (&out_uncond + ((out_cond - &out_uncond)? * cfg.cfg_scale)?)?;
 
             // The UNet predicts noise; the samplers want x0.
@@ -1543,14 +1589,14 @@ impl Txt2ImgPipeline {
 
             latent = match cfg.sampler {
                 SamplerKind::EulerAncestral => {
-                    let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+                    let noise = rng.randn((frames, 4, lh, lw), &self.device)?;
                     euler_ancestral_step(&latent, &denoised, sigma, sigma_next, &noise)?
                 }
                 SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next)?,
                 SamplerKind::Lcm => {
                     // Fresh noise each step: LCM re-noises rather than
                     // integrating, so a reused draw correlates the steps.
-                    let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+                    let noise = rng.randn((frames, 4, lh, lw), &self.device)?;
                     lcm_step(&latent, &denoised, sigma, sigma_next, t, &noise)?
                 }
             };
@@ -1562,7 +1608,7 @@ impl Txt2ImgPipeline {
             // paints actually joins up with them.
             if let Some(k) = &keep {
                 let restored = if sigma_next > 0.0 {
-                    let n = rng.randn((1, 4, lh, lw), &self.device)?;
+                    let n = rng.randn((frames, 4, lh, lw), &self.device)?;
                     (k.init + (n * sigma_next)?)?
                 } else {
                     k.init.clone()

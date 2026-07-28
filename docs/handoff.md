@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 321 tests, all gates green
+table is in [roadmap.md](roadmap.md). 324 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -187,6 +187,37 @@ a fixed palette.
 
 The second pass draws from `seed + 1`, so the two passes do not draw the same
 noise for differently-sized latents.
+
+**A clip is a batch of frames**, `--frames 8`. The pipeline no longer assumes
+batch 1: the latent draw, the guidance concatenation, the timestep tensor and
+the sampler's noise draws all follow the frame count, and `--output clip.png`
+writes `clip-000.png`, `clip-001.png`, ...
+
+**The frame count is read from the latent**, not the config, inside the loop.
+That is the one thing every path already agrees on — and a caller supplying
+its own latent through `run_with_latent` sets the count by doing so, which is
+exactly what the coherence techniques in the animation issue need.
+
+Three things this had to get right, each of which runs when wrong:
+
+- **Conditioning is per frame.** The guidance batch is
+  `[uncond x n, cond x n]`, not interleaved, and the reference UNet does not
+  repeat it for you — one row where `n` are expected fails inside the *spatial*
+  cross-attention. Interleaving instead runs and guides each frame by another
+  frame's conditioning.
+- **The guidance split is `narrow(0, 0, n)` / `narrow(0, n, n)`**, matching how
+  the batch was concatenated.
+- **The VAE decodes one frame at a time.** Frames are independent through it,
+  so decoding `n` together only multiplies the largest single allocation — a
+  three-frame 512 decode is 6.8 GiB in one call and trips the memory guard.
+  Looping is byte-identical at one frame's peak, and there is a test that says
+  so.
+
+`frames: 1` is bit-identical to the previous behaviour, which is the property
+that matters most here since every still-image path runs through this loop.
+
+Motion modules pick the count up automatically — `denoise_inner` installs
+`motion::with_frames` for the run.
 
 **Checkpoints merge**, `sdrs merge --a X --b Y --alpha 0.3`. Loader-level
 arithmetic — `(1-alpha)*a + alpha*b` per tensor, on the CPU regardless of the
@@ -664,7 +695,18 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. Batch the pipeline, so motion modules can actually be used
+### ~~1. Batch the pipeline~~ — done; wire the adapter into the pipeline next
+
+The model side and the batching are both done. What is left is small: a
+`--motion-adapter <file>` on the pipeline, which means threading the adapter
+path into `Txt2ImgPipeline::load` the way `load_with_ip_adapter` does, since
+the modules live *inside* the UNet and must be present when it is built.
+
+Then a clip with an adapter attached should show temporal coherence where one
+without it shows three unrelated crabs — which is the A/B worth capturing, and
+the only part of AnimateDiff not yet demonstrated end to end.
+
+### ~~Batch the pipeline~~ — the notes that were here
 
 The model side is done and verified (above). What is missing is that **a clip
 is a batch**: 16 frames is a batch of 16, and the pipeline assumes batch 1

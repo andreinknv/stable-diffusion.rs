@@ -30,6 +30,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// A clap command enum is one value, parsed once, at startup. The variants
+// differ in size because `txt2img` has grown a lot of flags, and boxing it
+// would put an allocation and a deref in front of every field access in the
+// match arm to save bytes on a value that exists once per process.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Decode a latent tensor to an image using the VAE decoder.
     ///
@@ -113,6 +118,14 @@ enum Command {
         /// LoRA strength. 0 is identical to not passing --lora.
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f64,
+
+        /// Generate this many frames as one clip, denoised together.
+        ///
+        /// Without a motion adapter this is a batch of independent images
+        /// sharing a schedule, not an animation. `--output clip.png` writes
+        /// `clip-000.png`, `clip-001.png`, ... when this is above 1.
+        #[arg(long, default_value_t = 1)]
+        frames: usize,
 
         /// Two-pass generation: compose at --width/--height, then add detail
         /// at this size. `1024x1024`, or `1024` for a square.
@@ -764,6 +777,7 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
+            frames,
             hires,
             hires_strength,
             hires_upscale,
@@ -785,6 +799,7 @@ fn main() -> Result<()> {
                 cfg_scale,
                 seed,
                 sampler: parse_sampler(&sampler)?,
+                frames: frames.max(1),
                 cancel: None,
             };
 
@@ -930,8 +945,17 @@ fn main() -> Result<()> {
                 }
             };
 
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            println!("wrote {output} in {:.1?}", started.elapsed());
+            let written = sd::image_io::save_batch(&img, &output)
+                .with_context(|| format!("writing {output}"))?;
+            match written.len() {
+                1 => println!("wrote {} in {:.1?}", written[0], started.elapsed()),
+                n => println!(
+                    "wrote {n} frames, {} .. {}, in {:.1?}",
+                    written[0],
+                    written[n - 1],
+                    started.elapsed()
+                ),
+            }
         }
 
         Command::Flux {
@@ -1180,6 +1204,7 @@ fn main() -> Result<()> {
                     cfg_scale,
                     seed,
                     sampler: parse_sampler(&sampler)?,
+                    frames: 1,
                     cancel: None,
                 },
                 controls: vec![sd::pipeline::Control {
@@ -1234,6 +1259,7 @@ fn main() -> Result<()> {
                         cfg_scale,
                         seed,
                         sampler: parse_sampler(&sampler)?,
+                        frames: 1,
                         cancel: None,
                     },
                     init_image: std::path::PathBuf::from(&init_image),
@@ -1285,6 +1311,7 @@ fn main() -> Result<()> {
                     cfg_scale,
                     seed,
                     sampler: parse_sampler(&sampler)?,
+                    frames: 1,
                     cancel: None,
                 },
                 init_image: std::path::PathBuf::from(&init_image),
@@ -1321,8 +1348,17 @@ fn main() -> Result<()> {
                     .context("running img2img")?
             };
 
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            println!("wrote {output} in {:.1?}", started.elapsed());
+            let written = sd::image_io::save_batch(&img, &output)
+                .with_context(|| format!("writing {output}"))?;
+            match written.len() {
+                1 => println!("wrote {} in {:.1?}", written[0], started.elapsed()),
+                n => println!(
+                    "wrote {n} frames, {} .. {}, in {:.1?}",
+                    written[0],
+                    written[n - 1],
+                    started.elapsed()
+                ),
+            }
         }
     }
 

@@ -41,6 +41,26 @@ impl Decoder {
     /// VAE's factor to TAESD multiplies its input by five and produces a
     /// washed-out image with no error anywhere.
     pub(crate) fn decode(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
+        // **One frame at a time.** A clip is a batch, and the VAE has no
+        // cross-frame interaction — decoding `n` together simply multiplies
+        // the largest single allocation by `n`, which is how a three-frame
+        // 512 decode reaches 6.8 GiB and trips the attention budget. Looping
+        // gives byte-identical output at one frame's peak.
+        let count = if latent.rank() == 4 {
+            latent.dim(0)?
+        } else {
+            1
+        };
+        if count <= 1 {
+            return self.decode_one(latent);
+        }
+        let frames = (0..count)
+            .map(|i| self.decode_one(&latent.narrow(0, i, 1)?))
+            .collect::<Result<Vec<_>, PipelineError>>()?;
+        Ok(Tensor::cat(&frames, 0)?)
+    }
+
+    fn decode_one(&self, latent: &Tensor) -> Result<Tensor, PipelineError> {
         match self {
             Decoder::Tiny(tiny) => Ok(tiny.decode(latent)?),
             Decoder::Vae(vae) => Ok(vae.decode_tiled(latent)?),

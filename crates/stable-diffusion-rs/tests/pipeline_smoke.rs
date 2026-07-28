@@ -295,6 +295,7 @@ fn tiny_config(seed: u64) -> stable_diffusion_rs::pipeline::Txt2ImgConfig {
         cfg_scale: 7.5,
         seed,
         sampler: Default::default(),
+        frames: 1,
         cancel: None,
     }
 }
@@ -767,4 +768,116 @@ fn hires_at_strength_zero_is_the_first_pass_enlarged() {
     let a = zero.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     let b = half.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     assert_ne!(a, b, "the second pass did nothing at strength 0.5");
+}
+
+// -- batching: a clip is a batch of frames --------------------------------
+
+#[test]
+fn frames_are_generated_as_one_batch_and_differ_from_each_other() {
+    let _heavy = heavy();
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP frames_are_generated_as_one_batch_and_differ_from_each_other");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+
+    let mut cfg = tiny_config(41);
+    cfg.steps = 2;
+    cfg.frames = 3;
+
+    let out = pipeline.run(&cfg).expect("clip");
+    assert_eq!(
+        out.dims(),
+        &[3, 3, cfg.height, cfg.width],
+        "one row per frame"
+    );
+
+    // Without a motion adapter the frames are independent draws sharing a
+    // schedule. If they came out identical the batch axis would be a
+    // broadcast rather than three latents, which is the failure this catches.
+    let frame = |i: usize| {
+        out.narrow(0, i, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    assert_ne!(frame(0), frame(1), "frames 0 and 1 are identical");
+    assert_ne!(frame(1), frame(2), "frames 1 and 2 are identical");
+}
+
+#[test]
+fn a_one_frame_clip_is_the_ordinary_still_image() {
+    // `frames: 1` must change nothing at all — same shape, same bytes. The
+    // batching threads a frame count through the loop, the timestep tensor and
+    // the guidance split, and any of those getting it wrong for n = 1 would be
+    // a regression in the path everything else uses.
+    let _heavy = heavy();
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP a_one_frame_clip_is_the_ordinary_still_image");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+
+    let mut cfg = tiny_config(42);
+    cfg.steps = 2;
+    let default_frames = pipeline.run(&cfg).expect("default");
+    cfg.frames = 1;
+    let explicit = pipeline.run(&cfg).expect("frames = 1");
+
+    assert_eq!(default_frames.dims(), &[1, 3, cfg.height, cfg.width]);
+    let a = default_frames
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let b = explicit.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(a, b, "frames = 1 diverged from the default");
+}
+
+#[test]
+fn a_batch_decode_matches_decoding_each_frame_alone() {
+    // The decoder loops per frame so a clip does not multiply the largest
+    // single allocation — a three-frame 512 decode is 6.8 GiB in one call and
+    // trips the memory guard. This pins that the loop is equivalent, not
+    // merely smaller.
+    let _heavy = heavy();
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP a_batch_decode_matches_decoding_each_frame_alone");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+
+    let mut cfg = tiny_config(43);
+    cfg.steps = 2;
+    cfg.frames = 2;
+    let (_, latent) = pipeline
+        .run_with_latent(&cfg, None, &mut |_| {})
+        .expect("clip");
+
+    let together = pipeline.preview(&latent).expect("batch decode");
+    for i in 0..2 {
+        let alone = pipeline
+            .preview(&latent.narrow(0, i, 1).unwrap())
+            .expect("single decode");
+        let a = together
+            .narrow(0, i, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let b = alone.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a, b, "frame {i} differed between batch and single decode");
+    }
 }
