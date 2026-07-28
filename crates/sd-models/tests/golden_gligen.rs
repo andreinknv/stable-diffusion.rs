@@ -94,3 +94,98 @@ fn a_masked_slot_uses_the_learned_null_not_zeros() {
         "an unmasked slot did not move"
     );
 }
+
+// -- the fusers, not just the projection ----------------------------------
+
+fn gligen_unet(dev: &Device) -> Option<sd_models::unet::UNet2DConditionModel> {
+    let weights = golden_dir().join("gligen_unet.safetensors");
+    if !weights.exists() {
+        return None;
+    }
+    let vb = sd_loader::safetensors_var_builder(&[&weights], DType::F32, dev).expect("weights");
+    Some(
+        sd_models::unet::UNet2DConditionModel::new(&sd_models::unet::UNetConfig::sd15(), vb)
+            .expect("building a GLIGEN UNet"),
+    )
+}
+
+#[test]
+fn a_grounded_unet_matches_diffusers() {
+    // What the projection comparison cannot cover: *where* each fuser sits.
+    // Sixteen of them go between attn1 and attn2, and putting them after attn2
+    // instead keeps every shape valid.
+    let dev = Device::Cpu;
+    let refs_path = golden_dir().join("reference.safetensors");
+    let (Some(refs), Some(unet)) = (
+        refs_path
+            .exists()
+            .then(|| sd_tensor::safetensors::load(&refs_path, &dev).expect("reference")),
+        gligen_unet(&dev),
+    ) else {
+        eprintln!("SKIP a_grounded_unet_matches_diffusers: missing fixtures");
+        return;
+    };
+    if !refs.contains_key("unet_grounded") {
+        eprintln!("SKIP: reference predates the grounded dump; regenerate it");
+        return;
+    }
+
+    let _guard = sd_models::unet::gligen::with_objs(refs["objs"].clone());
+    let out = unet
+        .forward(
+            &refs["unet_sample"],
+            &refs["unet_timestep"],
+            &refs["unet_text"],
+        )
+        .expect("forward");
+    let excess = testing::allclose_excess(&out, &refs["unet_grounded"], 1e-3).expect("compare");
+    assert!(excess <= 1e-3, "grounded UNet: excess {excess:.3e}");
+    println!("grounded unet excess {excess:.3e}");
+}
+
+#[test]
+fn without_grounding_tokens_the_fusers_do_nothing() {
+    // A GLIGEN checkpoint with no tokens supplied must behave as an ordinary
+    // SD 1.5 UNet — that is what makes scheduled sampling expressible by
+    // simply dropping the guard part way through a run.
+    let dev = Device::Cpu;
+    let refs_path = golden_dir().join("reference.safetensors");
+    let (Some(refs), Some(unet)) = (
+        refs_path
+            .exists()
+            .then(|| sd_tensor::safetensors::load(&refs_path, &dev).expect("reference")),
+        gligen_unet(&dev),
+    ) else {
+        eprintln!("SKIP without_grounding_tokens_the_fusers_do_nothing");
+        return;
+    };
+    if !refs.contains_key("unet_plain") {
+        eprintln!("SKIP: reference predates the grounded dump");
+        return;
+    }
+
+    // No guard: `objs()` is None, so every fuser is skipped.
+    let out = unet
+        .forward(
+            &refs["unet_sample"],
+            &refs["unet_timestep"],
+            &refs["unet_text"],
+        )
+        .expect("forward");
+    let excess = testing::allclose_excess(&out, &refs["unet_plain"], 1e-3).expect("compare");
+    assert!(excess <= 1e-3, "ungrounded UNet: excess {excess:.3e}");
+
+    // And grounding must actually change something, or the test above would
+    // pass with the fusers never running at all.
+    let _guard = sd_models::unet::gligen::with_objs(refs["objs"].clone());
+    let grounded = unet
+        .forward(
+            &refs["unet_sample"],
+            &refs["unet_timestep"],
+            &refs["unet_text"],
+        )
+        .expect("forward");
+    let a = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = grounded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_ne!(a, b, "grounding changed nothing");
+}

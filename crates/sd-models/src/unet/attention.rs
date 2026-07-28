@@ -193,6 +193,10 @@ impl FeedForward {
 pub struct BasicTransformerBlock {
     norm1: LayerNorm,
     attn1: Attention,
+    /// GLIGEN's gated self-attention, when the checkpoint carries one. Sits
+    /// **between** the two attentions: grounding conditions the image tokens
+    /// before they meet the text, not after.
+    fuser: Option<super::gligen::Fuser>,
     norm2: LayerNorm,
     attn2: Attention,
     norm3: LayerNorm,
@@ -214,6 +218,20 @@ impl BasicTransformerBlock {
         Ok(Self {
             norm1: layer_norm(dim, norm_cfg, vb.pp("norm1"))?,
             attn1: Attention::new(dim, None, heads, dim_head, vb.pp("attn1"))?,
+            // Asked for by name rather than by index — the weights live at
+            // `fuser` beneath this very builder, so there is no ordering to
+            // get wrong. A checkpoint without grounding simply has no such
+            // tensor.
+            fuser: if super::gligen::Fuser::present(&vb) {
+                Some(super::gligen::Fuser::new(
+                    dim,
+                    cross_dim,
+                    heads,
+                    vb.pp("fuser"),
+                )?)
+            } else {
+                None
+            },
             norm2: layer_norm(dim, norm_cfg, vb.pp("norm2"))?,
             attn2: Attention::new(dim, Some(cross_dim), heads, dim_head, vb.pp("attn2"))?,
             norm3: layer_norm(dim, norm_cfg, vb.pp("norm3"))?,
@@ -223,6 +241,13 @@ impl BasicTransformerBlock {
 
     pub fn forward(&self, xs: &Tensor, context: &Tensor) -> Result<Tensor> {
         let xs = (self.attn1.forward(&self.norm1.forward(xs)?, None)? + xs)?;
+        // Grounding, if the checkpoint has it and this forward supplied
+        // tokens. Absent tokens is not an error: it is how scheduled sampling
+        // turns grounding off part way through a run.
+        let xs = match (&self.fuser, super::gligen::objs()) {
+            (Some(fuser), Some(objs)) => fuser.forward(&xs, &objs)?,
+            _ => xs,
+        };
         let xs = (self
             .attn2
             .forward(&self.norm2.forward(&xs)?, Some(context))?

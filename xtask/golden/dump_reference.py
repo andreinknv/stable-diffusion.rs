@@ -1402,10 +1402,34 @@ def dump_gligen(output: pathlib.Path, model_id: str) -> None:
         "boxes": boxes.contiguous(), "masks": masks.contiguous(),
         "phrases": phrases.contiguous(), "objs": objs.detach().contiguous().clone(),
     }
+    # And the whole UNet with grounding applied, which is what catches a fuser
+    # in the wrong place — the projection comparison above cannot.
+    from diffusers import UNet2DConditionModel
+
+    unet = UNet2DConditionModel.from_pretrained(
+        model_id, subfolder="unet", torch_dtype=torch.float32
+    ).eval()
+    gen2 = torch.Generator().manual_seed(SEED + 2)
+    sample = torch.randn(1, 4, 32, 32, generator=gen2)
+    timestep = torch.tensor([500.0])
+    text = torch.randn(1, 77, 768, generator=gen2)
+    with torch.no_grad():
+        grounded = unet(
+            sample, timestep, encoder_hidden_states=text,
+            cross_attention_kwargs={"gligen": {"boxes": boxes, "masks": masks, "positive_embeddings": phrases}},
+        ).sample
+        plain = unet(sample, timestep, encoder_hidden_states=text).sample
+
+    tensors["unet_sample"] = sample.contiguous()
+    tensors["unet_timestep"] = timestep.contiguous()
+    tensors["unet_text"] = text.contiguous()
+    tensors["unet_grounded"] = grounded.detach().contiguous().clone()
+    tensors["unet_plain"] = plain.detach().contiguous().clone()
+
     save_file(tensors, str(out / "reference.safetensors"))
     print(f"\\nwrote {out / 'reference.safetensors'}")
     for k, v in sorted(tensors.items()):
-        print(f"  {k:<8} {tuple(v.shape)}")
+        print(f"  {k:<14} {tuple(v.shape)}")
     print(f"converted {len(state)} tensors")
 
 

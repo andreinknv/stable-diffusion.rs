@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 332 tests, all gates green
+table is in [roadmap.md](roadmap.md). 334 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -193,9 +193,26 @@ through the UNet at the pipeline's own shapes (1.125e-5), and the output now
 tracks the reference — see [Next](#next) for the beta-schedule trap that made
 this look broken for a long time.
 
-**GLIGEN's grounding projection is ported and verified** at **7.629e-6** — the
-half that turns `(box, phrase)` pairs into tokens. The gated attention that
-consumes them is not done; see [Next](#next).
+**GLIGEN's model side is complete and verified**: the grounding projection at
+**7.629e-6**, and a **grounded UNet at 1.419e-6** with all 16 fusers in place.
+Pipeline wiring is what remains; see [Next](#next).
+
+The fusers sit **between `attn1` and `attn2`** — grounding conditions the image
+tokens before they meet the text, not after — and each is gated by
+`tanh(alpha)`, resolved once at load since the gates are learned scalars that
+do not move during inference.
+
+**No installation machinery, unlike the other two adapters.** The weights live
+at `<block>.fuser` and a transformer block already holds a builder scoped to
+itself, so each block asks for its own by name. There is no index list, and so
+none of the ordering trap that cost the most time on the IP-Adapter. A
+checkpoint without grounding simply has no such tensor.
+
+**Grounding off is exactly ordinary SD 1.5**, tested against a separate
+reference: with no tokens supplied every fuser is skipped. That is what makes
+*scheduled sampling* — GLIGEN grounds for roughly the first 30 % of the
+schedule then finishes free — expressible by dropping a guard part way through
+a run rather than by a flag threaded anywhere.
 
 Boxes are expanded into sinusoids at eight frequencies, the timestep-embedding
 trick applied to space. **The axis order is the whole subtlety**: the axes are
@@ -781,37 +798,25 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. Finish GLIGEN: the gated self-attention
+### 1. Wire GLIGEN into the pipeline
 
-The grounding tokens are done and verified at 7.629e-6 (above). What consumes
-them is a **`fuser` in each of the 16 transformer blocks**, between `attn1` and
-`attn2`:
+The model side is done and verified (above). What is left is the run:
 
-```text
-  x = x + tanh(alpha_attn)  * attn(norm1([x ; objs]))[:, :n_visual]
-  x = x + tanh(alpha_dense) * ff(norm2(x))
-```
+- **Phrase embeddings.** One per box, from CLIP. GLIGEN uses the *pooled*
+  embedding per phrase, so `ClipTextEncoder::pooled_hidden` is the entry point
+  rather than the 77-token sequence.
+- **A `Grounding` config** — boxes in `[0, 1]` as `xyxy`, phrases, and a
+  scheduled-sampling fraction. Boxes are relative, not pixels, which is worth
+  stating in the type since both are plausible.
+- **The loop**: build tokens once with `PositionNet`, hold
+  `gligen::with_objs` for the first `fraction * steps` steps, drop it, finish.
+  The guard already makes that a two-line change.
+- Tokens must be doubled for the guidance batch, like every other conditioning
+  here.
 
-Each fuser carries `linear` (768 -> block width, projecting the tokens),
-`attn`, `ff`, `norm1`, `norm2`, and two **scalar** gates `alpha_attn` and
-`alpha_dense`. The `tanh` on the gates means an untrained fuser is an exact
-identity, which is how these are trained against a frozen base — and it also
-gives a free test: zero the gates and the UNet must be bit-identical to the
-same UNet without grounding.
-
-Install them the way `unet::ip` installs IP weights: a construction-scoped
-thread-local pulled as each block is built. **One per cross-attention block,
-16 of them**, and unlike the IP-Adapter's list they are named by path
-(`down_blocks.0.attentions.0.transformer_blocks.0.fuser`) so no index mapping
-is needed — which removes the trap that cost the most time there.
-
-Then: phrase embeddings come from CLIP per phrase (pooled), and GLIGEN applies
-grounding only for the first fraction of the schedule — "scheduled sampling",
-typically 30 %. Verify end to end against `StableDiffusionGLIGENPipeline`,
-since where a fuser lands is silent when wrong.
-
-Note the checkpoint is a **whole SD 1.5 UNet** plus fusers, not an adapter, so
-it loads as its own model rather than attaching to one.
+The checkpoint is a **whole SD 1.5 UNet plus fusers**, not an adapter, so it
+loads as its own model — `Txt2ImgPipeline::load` on its directory already
+builds the fusers, since they are found by name.
 
 ### ~~2. TAESD and step previews~~ — both done
 
