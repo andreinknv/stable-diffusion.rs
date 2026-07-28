@@ -296,6 +296,7 @@ fn tiny_config(seed: u64) -> stable_diffusion_rs::pipeline::Txt2ImgConfig {
         seed,
         sampler: Default::default(),
         frames: 1,
+        cache_threshold: 0.0,
         cancel: None,
     }
 }

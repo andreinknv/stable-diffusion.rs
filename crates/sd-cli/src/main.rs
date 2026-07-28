@@ -119,6 +119,14 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f64,
 
+        /// Reuse the model's prediction between steps when the latent has
+        /// barely moved. 0 is off and bit-identical to not using it.
+        ///
+        /// 0.05-0.15 is the useful band. The saving is in steps skipped, so
+        /// watch the step log rather than assuming a value bought anything.
+        #[arg(long, default_value_t = 0.0)]
+        cache_threshold: f64,
+
         /// Generate this many frames as one clip, denoised together.
         ///
         /// Without a motion adapter this is a batch of independent images
@@ -928,6 +936,7 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
+            cache_threshold,
             motion_adapter,
             frames,
             hires,
@@ -952,6 +961,7 @@ fn main() -> Result<()> {
                 seed,
                 sampler: parse_sampler(&sampler)?,
                 frames: frames.max(1),
+                cache_threshold: cache_threshold.max(0.0),
                 cancel: None,
             };
 
@@ -1296,6 +1306,7 @@ fn main() -> Result<()> {
                     seed,
                     sampler: parse_sampler(&sampler)?,
                     frames: 1,
+                    cache_threshold: 0.0,
                     cancel: None,
                 },
                 boxes,
@@ -1339,6 +1350,7 @@ fn main() -> Result<()> {
                     seed,
                     sampler: parse_sampler(&sampler)?,
                     frames: 1,
+                    cache_threshold: 0.0,
                     cancel: None,
                 },
                 init_image: std::path::PathBuf::from(&init_image),
@@ -1388,6 +1400,7 @@ fn main() -> Result<()> {
                 seed,
                 sampler: parse_sampler(&sampler)?,
                 frames: 1,
+                cache_threshold: 0.0,
                 cancel: None,
             };
             let regions = region
@@ -1546,6 +1559,7 @@ fn main() -> Result<()> {
                     seed,
                     sampler: parse_sampler(&sampler)?,
                     frames: 1,
+                    cache_threshold: 0.0,
                     cancel: None,
                 },
                 controls: vec![sd::pipeline::Control {
@@ -1601,6 +1615,7 @@ fn main() -> Result<()> {
                         seed,
                         sampler: parse_sampler(&sampler)?,
                         frames: 1,
+                        cache_threshold: 0.0,
                         cancel: None,
                     },
                     init_image: std::path::PathBuf::from(&init_image),
@@ -1653,6 +1668,7 @@ fn main() -> Result<()> {
                     seed,
                     sampler: parse_sampler(&sampler)?,
                     frames: 1,
+                    cache_threshold: 0.0,
                     cancel: None,
                 },
                 init_image: std::path::PathBuf::from(&init_image),

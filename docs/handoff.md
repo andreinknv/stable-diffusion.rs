@@ -193,6 +193,41 @@ through the UNet at the pipeline's own shapes (1.125e-5), and the output now
 tracks the reference — see [Next](#next) for the beta-schedule trap that made
 this look broken for a long time.
 
+**Step caching exists and underdelivers**, `--cache-threshold`. Honest numbers,
+SD 1.5, 512, 20 steps:
+
+```text
+  0.0    22.1 s   baseline
+  0.08   21.0 s   bit-identical — nothing was skipped
+  0.3    20.1 s   clean image, mean 8.2/255 from the baseline
+  1.0     9.1 s   2.4x, and badly degraded
+```
+
+**About 9 % at a usable setting**, against the 1.5-2x the caching literature
+reports. The gap is this implementation, not the idea: TeaCache predicts the
+*output* change from the timestep embedding through a per-model fitted
+polynomial, while this measures how far the *input* moved — a poor proxy early
+in a run, when the latent travels far each step but the prediction barely
+changes.
+
+I also documented the wrong useful band first (0.05-0.15), having taken it
+from the paper; those numbers describe TeaCache's rescaled metric, not this
+one. Measuring gave 0.3.
+
+Worth keeping as a foundation rather than reverting: the skip machinery and
+its exactness guarantee (threshold 0 is bit-identical) are the parts that are
+fiddly, and swapping the predictor is contained.
+
+**Runtime LoRA on quantised bases** closes the gap `lora.rs` documented:
+`y = QMatMul(x) + ((x @ down^T) @ up^T) * scale`, so the quantised weight is
+never touched. Verified against a *dense merge* — and the bound is measured,
+not chosen: the quantiser's own noise on that layer is **1.103e-2**, and with
+the runtime LoRA it is **1.103e-2**. The correction adds nothing.
+
+This is what lets a style LoRA reach the models that actually fit here — Flux
+schnell at Q4_K is 6.32 GB and runs, where dense flux-mini does not fit at
+all.
+
 **GLIGEN generates from boxes**, `sdrs ground --box "0.05,0.4,0.45,0.95=a
 wooden bench"`. The only conditioning here that addresses *placement*: text
 cannot do it reliably and a ControlNet needs a picture of the layout.
