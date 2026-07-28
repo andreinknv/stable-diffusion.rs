@@ -7,6 +7,8 @@ use sd_models::clip::{
 };
 use sd_models::controlnet::ControlNet;
 use sd_models::ip_adapter::{ImageProjModel, NUM_TOKENS};
+use sd_models::prior::{PriorConfig, PriorScheduler, PriorTransformer};
+use sd_models::unclip::NoiseAugmentor;
 use sd_models::unet::{UNet2DConditionModel, UNetConfig};
 use sd_models::vae::{AutoencoderKlDecoder, AutoencoderKlEncoder, TinyDecoder, VaeConfig};
 
@@ -389,6 +391,54 @@ pub enum PipelineError {
          as an `in_channel mismatch` rather than as the mistake it is."
     )]
     NeedsInstruct,
+    #[error(
+        "this is an unCLIP checkpoint — use `run_unclip` (`sdrs unclip`).\n\n\
+         Its UNet projects a CLIP *image* embedding into every timestep embedding, so \
+         there is no such thing as running it from text alone: with nothing supplied it \
+         would condition on a zero vector, which is the guidance batch's unconditional \
+         row and not a picture of anything."
+    )]
+    NeedsUnclip,
+    #[error(
+        "this checkpoint does not condition on an image.\n\n\
+         `run_unclip` needs a UNet with a `class_embedding` — the open mirrors are \
+         `diffusers/stable-diffusion-2-1-unclip-i2i-h` and friends. An ordinary SD 2.x \
+         model has nowhere to put an image embedding, and adding one would silently do \
+         nothing."
+    )]
+    NoUnclip,
+    #[error(
+        "this unCLIP checkpoint is missing {0}\n\n\
+         unCLIP needs its own CLIP vision tower and the statistics its image embeddings \
+         are whitened by. Both live beside the UNet in the published layout, under \
+         `image_encoder/` and `image_normalizer/`."
+    )]
+    MissingUnclipPart(PathBuf),
+    #[error(
+        "this pipeline has no prior.\n\n\
+         Running unCLIP without a reference image means sampling the image embedding from \
+         the prompt, which needs the `prior/` half of a text-to-image unCLIP checkpoint. \
+         Attach it with `Txt2ImgPipeline::with_prior(model_dir)`, or supply an image."
+    )]
+    NoPrior,
+    #[error(
+        "this unCLIP checkpoint has no image encoder, so it cannot read a reference \
+         image.\n\n\
+         The text-to-image variants ship no `image_encoder/` at all — a prompt is their \
+         only input. Drop the reference image to generate from the prompt through the \
+         prior, or point `--model` at an image-variation checkpoint such as \
+         `diffusers/stable-diffusion-2-1-unclip-i2i-h`."
+    )]
+    NoImageEncoder,
+    #[error(
+        "the prior emits a {got}-wide embedding but this checkpoint's image half takes \
+         {want}.\n\n\
+         The two must come from the same unCLIP checkpoint. Karlo's prior is ViT-L (768) \
+         and there are unCLIP models built on ViT-H (1024) — and the published \
+         `diffusers/stable-diffusion-2-1-unclip-t2i-h` pairs exactly those two, so it \
+         cannot run at all. `-t2i-l` is the consistent one."
+    )]
+    PriorWidth { got: usize, want: usize },
     #[error("cancelled after {completed} of {total} steps")]
     Cancelled { completed: usize, total: usize },
     #[error("tensor: {0}")]
@@ -491,6 +541,44 @@ pub struct Img2ImgConfig {
     pub strength: Strength,
 }
 
+/// A generation conditioned on what an image *is*, rather than on how it looks.
+///
+/// Different from img2img and from IP-Adapter, and the difference is where the
+/// image enters. img2img starts from the picture's own latent and stops the
+/// schedule early, so composition survives; IP-Adapter gives the cross
+/// attention extra tokens to look at. unCLIP hands the model a single CLIP
+/// embedding of the *whole image* and nothing else — no pixels reach it — so
+/// what comes back shares the subject and the feel of the reference and is
+/// composed from scratch.
+#[derive(Debug, Clone)]
+pub struct UnclipConfig {
+    pub base: Txt2ImgConfig,
+    /// The image to take the embedding from, or `None` to have the **prior**
+    /// invent one from the prompt.
+    ///
+    /// Those are the two halves of unCLIP and they need different checkpoints:
+    /// a reference image needs `image_encoder/`, and `None` needs `prior/`.
+    /// Attach the latter with [`Txt2ImgPipeline::with_prior`].
+    ///
+    /// Read at the tower's 224x224 by shortest edge and centre crop, which is
+    /// what `CLIPImageProcessor` does.
+    pub init_image: Option<PathBuf>,
+    /// Steps and guidance for the prior, when one is running.
+    ///
+    /// Ignored when `init_image` is set. diffusers uses 25 and 4.0; the prior
+    /// is cheap next to the image half — a 768-vector rather than a latent —
+    /// so there is little reason to lower either.
+    pub prior_steps: usize,
+    pub prior_guidance: f64,
+    /// How much noise is mixed into the embedding, `0..1000`.
+    ///
+    /// **The dial between "this image" and "something like it"**, and the
+    /// reason the whole augmentation exists: an unaugmented CLIP embedding is
+    /// a strong enough signal that the model reproduces the reference and
+    /// generates almost nothing. 0 is the tightest, and diffusers' default.
+    pub noise_level: usize,
+}
+
 /// A generation steered by a ControlNet.
 #[derive(Debug, Clone)]
 pub struct ControlConfig {
@@ -534,6 +622,19 @@ fn repeat_per_frame(context: &Tensor, frames: usize) -> Result<Tensor, PipelineE
     let mut rows: Vec<Tensor> = Vec::with_capacity(frames * 2);
     rows.extend(std::iter::repeat_n(uncond, frames));
     rows.extend(std::iter::repeat_n(cond, frames));
+    Ok(Tensor::cat(&rows, 0)?)
+}
+
+/// Repeat a single `[1, d]` row to `[n, d]`.
+///
+/// One row per frame, because the UNet carries frames on the batch and a
+/// single row where `n` are expected fails inside the timestep embedding's
+/// addition rather than broadcasting.
+fn repeat_rows(row: &Tensor, n: usize) -> Result<Tensor, PipelineError> {
+    if n == 1 {
+        return Ok(row.clone());
+    }
+    let rows: Vec<Tensor> = std::iter::repeat_n(row.clone(), n).collect();
     Ok(Tensor::cat(&rows, 0)?)
 }
 
@@ -593,6 +694,39 @@ pub struct Txt2ImgPipeline {
     /// The image tower and projection, when an IP-Adapter is attached. The
     /// adapter's own weights live inside the UNet.
     ip: Option<(ClipVisionEncoder, ImageProjModel)>,
+    /// The noise augmentation, and the image tower when the checkpoint ships
+    /// one, for an unCLIP UNet.
+    unclip: Option<UnclipStack>,
+    /// The prior and its own tokenizer and text encoder, when attached.
+    ///
+    /// Opt-in through [`Txt2ImgPipeline::with_prior`] rather than loaded with
+    /// the rest, because it is 4.6 GB that an image-variation run never
+    /// touches — and the two paths are alternatives, never both at once.
+    ///
+    /// Its text encoder is a *third* one: SD 1.5's CLIP-L with a projection
+    /// head, beside the checkpoint's own 1024-wide OpenCLIP-H. Different
+    /// vocabulary positions, different width, different weights.
+    prior: Option<Box<PriorStack>>,
+}
+
+/// What an unCLIP UNet needs in front of it.
+///
+/// The augmentation is always required — every unCLIP checkpoint carries an
+/// `image_normalizer` and the UNet cannot run without one. **The image tower
+/// is not**: the text-to-image checkpoints ship no `image_encoder` at all,
+/// because a prompt is their only input. So a pipeline can legitimately be
+/// unCLIP with no way to read a reference image, and asking it for an image
+/// variation is a clear error rather than a missing file.
+struct UnclipStack {
+    vision: Option<ClipVisionEncoder>,
+    augmentor: NoiseAugmentor,
+}
+
+/// Everything the text half of unCLIP needs.
+struct PriorStack {
+    tokenizer: ClipTokenizer,
+    text_encoder: ClipTextEncoder,
+    prior: PriorTransformer,
 }
 
 impl std::fmt::Debug for Txt2ImgPipeline {
@@ -608,6 +742,19 @@ fn require(path: PathBuf) -> Result<PathBuf, PipelineError> {
         Ok(path)
     } else {
         Err(PipelineError::MissingFile(path))
+    }
+}
+
+/// [`require`], for the two files only an unCLIP checkpoint has.
+///
+/// Its own error because "missing model file" would send someone looking at
+/// their download when what they actually have is an unCLIP UNet in a
+/// directory assembled for an ordinary one.
+fn require_unclip(path: PathBuf) -> Result<PathBuf, PipelineError> {
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(PipelineError::MissingUnclipPart(path))
     }
 }
 
@@ -703,6 +850,20 @@ impl Txt2ImgPipeline {
         const CROSS_KEY: &str = "down_blocks.0.attentions.0.transformer_blocks.0.attn2.to_k.weight";
         match sd_tensor::tensor_shape(unet_path, CROSS_KEY) {
             Ok(Some(shape)) if shape.last() == Some(&1024) => {
+                // unCLIP is SD 2.x plus a `class_embedding`, and the tensor's
+                // presence is the whole tell — the geometry is identical, so
+                // there is nothing else to read. Its *width* is read too
+                // rather than assumed at 2048: it is twice the image
+                // embedding's, and a checkpoint built on a different tower
+                // would differ there and nowhere else.
+                const CLASS_KEY: &str = "class_embedding.linear_1.weight";
+                if let Ok(Some(shape)) = sd_tensor::tensor_shape(unet_path, CLASS_KEY) {
+                    if let Some(&dim) = shape.last() {
+                        let mut cfg = UNetConfig::unclip();
+                        cfg.class_projection = Some(dim);
+                        return (cfg, ClipTextConfig::sd2());
+                    }
+                }
                 (UNetConfig::sd2(), ClipTextConfig::sd2())
             }
             _ => (UNetConfig::sd15(), ClipTextConfig::sd15()),
@@ -764,10 +925,21 @@ impl Txt2ImgPipeline {
         let unet_path = require(model_dir.join("unet/diffusion_pytorch_model.safetensors"))?;
         let vae_path = require(model_dir.join("vae/diffusion_pytorch_model.safetensors"))?;
 
+        // unCLIP carries a fourth tower — a 2.5 GB ViT-H — inside the
+        // checkpoint. It is loaded whenever the UNet asks for one, because
+        // there is no way to run such a checkpoint without it, and it is
+        // counted here for the same reason the other three are.
+        let image_encoder_path = model_dir.join("image_encoder/model.safetensors");
+        let normalizer_path =
+            model_dir.join("image_normalizer/diffusion_pytorch_model.safetensors");
+
         // See the same check in sdxl.rs: weights stay resident for the whole
         // run and dominate, so the projection has to include them.
-        let weights =
-            sd_loader::resident_bytes(&[&text_encoder_path, &unet_path, &vae_path], DType::F32)?;
+        let mut resident = vec![&text_encoder_path, &unet_path, &vae_path];
+        if image_encoder_path.exists() {
+            resident.push(&image_encoder_path);
+        }
+        let weights = sd_loader::resident_bytes(&resident, DType::F32)?;
         // The *active* tile, not the default: see the note in sdxl.rs.
         let tile = sd_models::vae::tile_latent_edge()?;
         let decode_peak = sd_models::vae::DecoderConfig::from(&VaeConfig::sd15())
@@ -861,6 +1033,38 @@ impl Txt2ImgPipeline {
             }
         })?;
 
+        // Loaded eagerly rather than through a `with_` builder, unlike every
+        // other adapter here, because this one is not optional: a UNet with a
+        // `class_embedding` cannot produce an image without it. Refusing at
+        // load time beats refusing after the weights are resident.
+        let unclip = if unet.takes_class_labels() {
+            let normalizer_path = require_unclip(normalizer_path)?;
+            // The width comes from the statistics themselves rather than from
+            // the tower's config: the image-variation checkpoint is 1024 wide
+            // and the text-to-image one 768, and there is no tower at all to
+            // ask in the second case.
+            let width = sd_tensor::tensor_shape(&normalizer_path, "mean")
+                .ok()
+                .flatten()
+                .and_then(|s| s.last().copied())
+                .ok_or_else(|| PipelineError::MissingUnclipPart(normalizer_path.clone()))?;
+            let vb = sd_loader::safetensors_var_builder(&[&normalizer_path], DType::F32, device)?;
+            let augmentor = NoiseAugmentor::new(width, vb)?;
+
+            // Present only on the image-variation checkpoints. Absent is not
+            // an error — it just means this model reads prompts, not pictures.
+            let vision = if image_encoder_path.exists() {
+                let vb =
+                    sd_loader::safetensors_var_builder(&[&image_encoder_path], DType::F32, device)?;
+                Some(ClipVisionEncoder::new(&ClipVisionConfig::vit_h_14(), vb)?)
+            } else {
+                None
+            };
+            Some(UnclipStack { vision, augmentor })
+        } else {
+            None
+        };
+
         Ok(Self {
             tokenizer,
             text_encoder,
@@ -887,6 +1091,8 @@ impl Txt2ImgPipeline {
             embeddings: Vec::new(),
             position_net,
             ip: None,
+            unclip,
+            prior: None,
         })
     }
 
@@ -951,6 +1157,11 @@ impl Txt2ImgPipeline {
             embeddings: Vec::new(),
             position_net: None,
             ip: None,
+            // A single-file GGUF is an LDM-layout SD 1.x/2.x checkpoint. No
+            // published one carries unCLIP's image tower, and there is nowhere
+            // in the format to put it.
+            unclip: None,
+            prior: None,
         })
     }
 
@@ -1497,6 +1708,273 @@ impl Txt2ImgPipeline {
         self.decode(&latent)
     }
 
+    /// Whether this checkpoint conditions on a CLIP image embedding.
+    pub fn is_unclip(&self) -> bool {
+        self.unclip.is_some()
+    }
+
+    /// Whether the prior is attached, so text alone can drive an unCLIP run.
+    pub fn has_prior(&self) -> bool {
+        self.prior.is_some()
+    }
+
+    /// Attach the prior, letting [`Self::run_unclip`] work without a reference
+    /// image.
+    ///
+    /// Opt-in and not part of `load`, because it is 4.6 GB — a whole second
+    /// diffusion model plus its own text encoder — and an image-variation run
+    /// never touches it.
+    ///
+    /// **The prior and the image half must come from the same checkpoint.**
+    /// Karlo's prior emits a 768-wide ViT-L embedding and there are unCLIP
+    /// checkpoints built on a 1024-wide ViT-H one; the published
+    /// `stable-diffusion-2-1-unclip-t2i-h` in fact pairs the two and cannot
+    /// run. The widths are checked here rather than left to fail inside the
+    /// augmentation.
+    pub fn with_prior(mut self, model_dir: impl AsRef<Path>) -> Result<Self, PipelineError> {
+        let dir = model_dir.as_ref();
+        let stack = self.unclip.as_ref().ok_or(PipelineError::NoUnclip)?;
+
+        let tokenizer_path = dir.join("prior_tokenizer/tokenizer.json");
+        if !tokenizer_path.exists() {
+            return Err(PipelineError::MissingUnclipPart(tokenizer_path));
+        }
+        let encoder_path = require_unclip(dir.join("prior_text_encoder/model.safetensors"))?;
+        let prior_path = require_unclip(dir.join("prior/diffusion_pytorch_model.safetensors"))?;
+
+        let weights = sd_loader::resident_bytes(&[&encoder_path, &prior_path], DType::F32)?;
+        sd_tensor::sysmem::check_headroom(weights, "attaching the unCLIP prior")?;
+
+        let tokenizer = ClipTokenizer::from_file(&tokenizer_path)?;
+        // The prior's own encoder is CLIP-L **with** a projection head, which
+        // SD 1.5's plain `CLIPTextModel` does not have — so this is
+        // `sd15()` plus `projection_dim`, not `sd15()`.
+        let cfg = ClipTextConfig {
+            projection_dim: Some(PriorConfig::karlo().embedding_dim),
+            ..ClipTextConfig::sd15()
+        };
+        let vb = sd_loader::safetensors_var_builder(&[&encoder_path], DType::F32, &self.device)?;
+        let text_encoder = ClipTextEncoder::new(&cfg, vb)?;
+
+        let vb = sd_loader::safetensors_var_builder(&[&prior_path], DType::F32, &self.device)?;
+        let prior = PriorTransformer::new(&PriorConfig::karlo(), vb)?;
+
+        let want = stack.augmentor.embed_dim();
+        let got = prior.config().embedding_dim;
+        if got != want {
+            return Err(PipelineError::PriorWidth { got, want });
+        }
+        self.prior = Some(Box::new(PriorStack {
+            tokenizer,
+            text_encoder,
+            prior,
+        }));
+        Ok(self)
+    }
+
+    /// Sample an image embedding from a prompt, using the prior.
+    ///
+    /// Twenty-five DDPM steps over a 768-vector — a whole diffusion run, and a
+    /// cheap one: the thing being denoised is one embedding, not a latent
+    /// image, so the whole loop costs less than a single UNet step.
+    fn prior_embedding(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        cfg: &UnclipConfig,
+        rng: &mut SeededRng,
+    ) -> Result<Tensor, PipelineError> {
+        let stack = self.prior.as_ref().ok_or(PipelineError::NoPrior)?;
+        let dim = stack.prior.config().embedding_dim;
+
+        // Both prompts, and their masks. The mask is the part that is easy to
+        // skip — every other CLIP consumer in this crate ignores it — and the
+        // prior attends over 77 positions of which a short prompt occupies ten.
+        let (cond_ids, cond_mask) = self.prior_tokens(stack, prompt)?;
+        let (uncond_ids, uncond_mask) = self.prior_tokens(stack, negative_prompt)?;
+
+        let encode = |ids: &Tensor| -> Result<(Tensor, Tensor), PipelineError> {
+            let hidden = stack.text_encoder.forward(ids)?;
+            let pooled = stack
+                .text_encoder
+                .pooled(ids)?
+                .ok_or(PipelineError::NoPrior)?;
+            Ok((pooled, hidden))
+        };
+        let (cond_pooled, cond_hidden) = encode(&cond_ids)?;
+        let (uncond_pooled, uncond_hidden) = encode(&uncond_ids)?;
+
+        // Uncond first, then cond — the same layout the image half uses.
+        let proj = Tensor::cat(&[&uncond_pooled, &cond_pooled], 0)?;
+        let hidden = Tensor::cat(&[&uncond_hidden, &cond_hidden], 0)?;
+        let mask = Tensor::cat(&[&uncond_mask, &cond_mask], 0)?;
+
+        let scheduler = PriorScheduler::new(cfg.prior_steps.max(1));
+        // Unit variance, unlike a latent: the prior's schedule starts at
+        // alpha_cumprod near zero, so the noise *is* the starting point rather
+        // than something scaled onto one.
+        let mut latents = rng.randn((1, dim), &self.device)?;
+
+        for &t in scheduler.timesteps() {
+            if cfg.base.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                return Err(PipelineError::Cancelled {
+                    completed: 0,
+                    total: scheduler.timesteps().len(),
+                });
+            }
+            let doubled = Tensor::cat(&[&latents, &latents], 0)?;
+            let timestep = Tensor::from_vec(vec![t as f32; 2], 2, &self.device)?;
+            let predicted =
+                stack
+                    .prior
+                    .forward(&doubled, &timestep, &proj, &hidden, Some(&mask))?;
+            let uncond = predicted.narrow(0, 0, 1)?;
+            let cond = predicted.narrow(0, 1, 1)?;
+            let guided = (&uncond + ((cond - &uncond)? * cfg.prior_guidance)?)?;
+            let noise = rng.randn((1, dim), &self.device)?;
+            latents = scheduler.step(&guided, t, &latents, &noise)?;
+        }
+        // Back into CLIP's own units. Without this the image half conditions
+        // on a whitened vector and produces a washed, generic picture.
+        Ok(stack.prior.post_process(&latents)?)
+    }
+
+    /// Tokenize for the prior, returning ids and the attention mask.
+    ///
+    /// The mask is `1` up to and including the EOS and `0` for the padding
+    /// after it — which is exactly what `CLIPTokenizer` reports and what this
+    /// crate has never needed until now.
+    fn prior_tokens(
+        &self,
+        stack: &PriorStack,
+        prompt: &str,
+    ) -> Result<(Tensor, Tensor), PipelineError> {
+        let ids = stack.tokenizer.encode(prompt)?;
+        // Content plus BOS and EOS. The EOS is attended over — it is where the
+        // pooled embedding is read from — so the mask covers it and stops at
+        // the padding that follows.
+        let used = stack.tokenizer.content_token_count(prompt)? + 2;
+        let len = ids.len();
+        let mask: Vec<f32> = (0..len)
+            .map(|i| if i < used.min(len) { 1.0 } else { 0.0 })
+            .collect();
+        Ok((
+            Tensor::from_vec(ids, (1, len), &self.device)?,
+            Tensor::from_vec(mask, (1, len), &self.device)?,
+        ))
+    }
+
+    /// The augmented image embedding a reference image produces.
+    ///
+    /// `image` is `[1, 3, h, w]` in `[0, 1]`, resized to the tower's 224 by the
+    /// caller — the same convention [`Self::image_tokens`] takes. `noise` is
+    /// `[1, embed_dim]`, supplied so the caller owns its seed sequence.
+    ///
+    /// Exposed because it is the only interesting intermediate here: an
+    /// unCLIP run is an ordinary SD 2.x run with this vector added into every
+    /// timestep embedding, so a caller that wants to interpolate between two
+    /// references, or reuse one across a sequence, needs the vector rather
+    /// than the pipeline's opinion of it.
+    pub fn image_conditioning(
+        &self,
+        image: &Tensor,
+        noise_level: usize,
+        noise: &Tensor,
+    ) -> Result<Tensor, PipelineError> {
+        let stack = self.unclip.as_ref().ok_or(PipelineError::NoUnclip)?;
+        let vision = stack.vision.as_ref().ok_or(PipelineError::NoImageEncoder)?;
+        let embeds = vision.image_embeds(&preprocess(image)?)?;
+        Ok(stack.augmentor.augment(&embeds, noise_level, noise)?)
+    }
+
+    /// Generate an image that shares a reference's subject, not its pixels.
+    ///
+    /// Needs an unCLIP checkpoint. An ordinary SD 2.x UNet has no
+    /// `class_embedding`, so there would be nowhere for the embedding to go
+    /// and the reference would be silently ignored — which is refused rather
+    /// than rendered.
+    pub fn run_unclip(&self, cfg: &UnclipConfig) -> Result<Tensor, PipelineError> {
+        self.run_unclip_with_progress(cfg, &mut |_| {})
+    }
+
+    /// [`Self::run_unclip`], reporting progress after each step.
+    pub fn run_unclip_with_progress(
+        &self,
+        cfg: &UnclipConfig,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let base = &cfg.base;
+        if base.width % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("width", base.width));
+        }
+        if base.height % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("height", base.height));
+        }
+        if base.steps == 0 {
+            return Err(PipelineError::NoSteps);
+        }
+        let augmentor = &self
+            .unclip
+            .as_ref()
+            .ok_or(PipelineError::NoUnclip)?
+            .augmentor;
+
+        // Drawn from the seed before the latent is, so a run is reproducible
+        // and so that changing `--noise-level` alone changes only how much of
+        // this noise is mixed in rather than which noise it is.
+        let mut rng = SeededRng::new(base.seed);
+
+        // The two halves of unCLIP. A reference image goes through the vision
+        // tower; without one the prior samples an embedding from the prompt.
+        // Everything after this point is identical — which is the whole point
+        // of the architecture, and why the text-to-image variant costs a front
+        // end rather than a pipeline.
+        let embeds = match &cfg.init_image {
+            Some(path) => {
+                // The tower's own input size, not the output size. unCLIP
+                // reads the reference at 224 whatever it is asked to draw at,
+                // so a 4096px reference costs nothing extra here.
+                let image = crate::image_io::load_clip_square(path, 224, &self.device)?;
+                let stack = self.unclip.as_ref().ok_or(PipelineError::NoUnclip)?;
+                let vision = stack.vision.as_ref().ok_or(PipelineError::NoImageEncoder)?;
+                vision.image_embeds(&preprocess(&image)?)?
+            }
+            None => self.prior_embedding(&base.prompt, &base.negative_prompt, cfg, &mut rng)?,
+        };
+        let noise = rng.randn((1, augmentor.embed_dim()), &self.device)?;
+        let conditioning = augmentor.augment(&embeds, cfg.noise_level, &noise)?;
+
+        let frames = base.frames.max(1);
+        // Uncond rows first, then cond — matching how `latent_in` and the
+        // context are concatenated in the loop. The unconditional row is
+        // **zeros of the full width**, which is what diffusers hands the model
+        // for "no image": an augmented zero embedding would still carry the
+        // noise level's sinusoid and mean something.
+        let uncond = augmentor.unconditional(frames, conditioning.dtype(), &self.device)?;
+        let cond = repeat_rows(&conditioning, frames)?;
+        let class_labels = Tensor::cat(&[&uncond, &cond], 0)?;
+
+        let context = self
+            .encode_conditioning(&base.prompt, &base.negative_prompt)?
+            .context;
+        let context = repeat_per_frame(&context, frames)?;
+
+        let sigmas = self.sigmas_for(base.sampler, base.steps);
+        let (lh, lw) = (base.height / 8, base.width / 8);
+        let latent = (rng.randn((frames, 4, lh, lw), &self.device)? * sigmas[0])?;
+
+        let latent = self.denoise_unclip(
+            base,
+            latent,
+            &sigmas,
+            &context,
+            class_labels,
+            &mut rng,
+            progress,
+        )?;
+        self.decode(&latent)
+    }
+
     /// Generate with objects placed by bounding box.
     ///
     /// Needs a GLIGEN checkpoint — an ordinary SD 1.5 UNet has no fusers, and
@@ -1669,6 +2147,7 @@ impl Txt2ImgPipeline {
             None,
             None,
             Some(Areas { regions }),
+            None,
             progress,
         )?;
         self.decode(&latent)
@@ -1822,6 +2301,12 @@ impl Txt2ImgPipeline {
         // rather than letting it fail inside a convolution.
         if self.unet.in_channels() != 4 {
             return Err(PipelineError::NeedsInstruct);
+        }
+        // Nor can one that projects an image embedding into every timestep.
+        // Without this it would run — on zeros, which is the guidance batch's
+        // unconditional row — and return an image conditioned on nothing.
+        if self.unet.takes_class_labels() {
+            return Err(PipelineError::NeedsUnclip);
         }
         let frames = cfg.frames.max(1);
         let drawn = (rng.randn((frames, 4, lh, lw), &self.device)? * sigmas[0])?;
@@ -1988,7 +2473,35 @@ impl Txt2ImgPipeline {
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
         self.denoise_inner(
-            cfg, latent, sigmas, contexts, select, rng, None, None, None, progress,
+            cfg, latent, sigmas, contexts, select, rng, None, None, None, None, progress,
+        )
+    }
+
+    /// [`Self::denoise`], conditioned on an image embedding as well as text.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_unclip(
+        &self,
+        cfg: &Txt2ImgConfig,
+        latent: Tensor,
+        sigmas: &[f64],
+        context: &Tensor,
+        class_labels: Tensor,
+        rng: &mut SeededRng,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let contexts = [context.clone()];
+        self.denoise_inner(
+            cfg,
+            latent,
+            sigmas,
+            &contexts,
+            None,
+            rng,
+            None,
+            None,
+            None,
+            Some(class_labels),
+            progress,
         )
     }
 
@@ -2007,7 +2520,7 @@ impl Txt2ImgPipeline {
     ) -> Result<Tensor, PipelineError> {
         let contexts = [context.clone()];
         self.denoise_inner(
-            cfg, latent, sigmas, &contexts, None, rng, keep, control, None, progress,
+            cfg, latent, sigmas, &contexts, None, rng, keep, control, None, None, progress,
         )
     }
 
@@ -2059,6 +2572,7 @@ impl Txt2ImgPipeline {
         keep: Option<Keep<'_>>,
         control: Option<Hints>,
         areas: Option<Areas>,
+        class_labels: Option<Tensor>,
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
@@ -2184,7 +2698,16 @@ impl Txt2ImgPipeline {
                         None => self.unet.forward(&latent_in, &timestep, context)?,
                     }
                 }
-                _ => self.unet.forward(&latent_in, &timestep, context)?,
+                // The image embedding is fixed for the whole run — it does not
+                // depend on the step or the latent — so it is built once by
+                // the caller and handed in already doubled for the guidance
+                // batch, uncond rows first.
+                _ => match &class_labels {
+                    Some(labels) => self
+                        .unet
+                        .forward_unclip(&latent_in, &timestep, context, labels)?,
+                    None => self.unet.forward(&latent_in, &timestep, context)?,
+                },
             };
             // The guidance batch is [uncond frames..., cond frames...], not
             // interleaved — matching how `latent_in` was concatenated and how

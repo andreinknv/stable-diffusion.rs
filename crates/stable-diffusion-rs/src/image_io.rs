@@ -113,8 +113,9 @@ pub fn load_rgb_unit<P: AsRef<std::path::Path>>(
 
 /// [`load_rgb_unit`], resized to an exact size.
 ///
-/// For CLIP's vision tower, which takes a fixed 224 square. Lanczos, since a
-/// reference photograph is a signal rather than a mask.
+/// Squashes to fit. For a square target and a non-square source that changes
+/// the aspect of everything in the frame — see [`load_clip_square`], which is
+/// what CLIP's own preprocessing does instead.
 pub fn load_rgb_unit_resized<P: AsRef<std::path::Path>>(
     path: P,
     width: u32,
@@ -127,6 +128,58 @@ pub fn load_rgb_unit_resized<P: AsRef<std::path::Path>>(
         .to_rgb8();
     let data: Vec<f32> = img.as_raw().iter().map(|&b| b as f32 / 255.0).collect();
     Tensor::from_vec(data, (height as usize, width as usize, 3), device)?
+        .permute((2, 0, 1))?
+        .contiguous()?
+        .unsqueeze(0)
+}
+
+/// Read a reference image the way CLIP's own preprocessing does: `[1, 3, e, e]`
+/// in `[0, 1]`.
+///
+/// **Shortest edge to `edge`, then a centre crop** — not a squash to square,
+/// which is what [`load_rgb_unit_resized`] does and what both the IP-Adapter
+/// and unCLIP paths used to do. On a square reference the two agree exactly;
+/// on a 16:9 one the squash compresses everything horizontally by 1.8x, and
+/// the tower was never shown images like that. `CLIPImageProcessor` ships
+/// `do_resize` + `do_center_crop` for precisely this reason.
+///
+/// **Catmull-Rom, not Lanczos**, because `resample: 3` in the shipped
+/// `preprocessor_config.json` is PIL's `BICUBIC` and Catmull-Rom is the
+/// cubic filter closest to it. Lanczos is sharper and therefore *further*
+/// from the reference, which is the opposite of what is wanted at a boundary
+/// this precise.
+pub fn load_clip_square<P: AsRef<std::path::Path>>(
+    path: P,
+    edge: u32,
+    device: &sd_tensor::Device,
+) -> Result<Tensor> {
+    let img = image::open(path.as_ref())
+        .map_err(|e| sd_tensor::Error::Msg(format!("failed to read image: {e}")))?;
+    let (w, h) = (img.width().max(1), img.height().max(1));
+
+    // Scale so the *shorter* side lands on `edge`; the longer one overhangs
+    // and is cropped. Scaling the longer side instead would leave the shorter
+    // one short of the crop and is the natural mistake here.
+    let scale = edge as f64 / w.min(h) as f64;
+    let (rw, rh) = (
+        ((w as f64 * scale).round() as u32).max(edge),
+        ((h as f64 * scale).round() as u32).max(edge),
+    );
+    let img = img
+        .resize_exact(rw, rh, image::imageops::FilterType::CatmullRom)
+        .to_rgb8();
+
+    // Integer-divided, matching torchvision's centre crop: an odd overhang
+    // leaves the extra pixel on the bottom-right.
+    let (x0, y0) = ((rw - edge) / 2, (rh - edge) / 2);
+    let mut data = Vec::with_capacity((edge * edge * 3) as usize);
+    for y in 0..edge {
+        for x in 0..edge {
+            let p = img.get_pixel(x0 + x, y0 + y);
+            data.extend(p.0.iter().map(|&b| b as f32 / 255.0));
+        }
+    }
+    Tensor::from_vec(data, (edge as usize, edge as usize, 3), device)?
         .permute((2, 0, 1))?
         .contiguous()?
         .unsqueeze(0)
@@ -282,5 +335,79 @@ mod tests {
         let (_, _, px) = tensor_to_rgb8(&t).unwrap();
         assert_eq!(px[0], 0);
         assert_eq!(px[1], 255);
+    }
+
+    /// Write a `w x h` image whose leftmost `red_cols` columns are red and the
+    /// rest white, and return its path.
+    fn striped(name: &str, w: u32, h: u32, red_cols: u32) -> std::path::PathBuf {
+        let mut img = image::RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let p = if x < red_cols {
+                    image::Rgb([255u8, 0, 0])
+                } else {
+                    image::Rgb([255u8, 255, 255])
+                };
+                img.put_pixel(x, y, p);
+            }
+        }
+        let path = std::env::temp_dir().join(name);
+        img.save(&path).expect("writing the test image");
+        path
+    }
+
+    fn max_red_excess(t: &Tensor) -> f32 {
+        // How far any pixel's red channel exceeds its green: 0 for white,
+        // ~1 for red. A cheap "is there any red here at all".
+        let (r, g) = (t.narrow(1, 0, 1).unwrap(), t.narrow(1, 1, 1).unwrap());
+        (r - g)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .fold(0f32, f32::max)
+    }
+
+    #[test]
+    fn a_clip_reference_is_cropped_rather_than_squashed() {
+        // The whole point of the shortest-edge-plus-crop rule: on a wide
+        // image, content near the edge is *outside* the frame the tower sees.
+        // Squashing keeps it and changes every proportion instead, which is
+        // what this crate used to do for both IP-Adapter and unCLIP.
+        let dev = Device::Cpu;
+        let wide = striped("sdrs-clip-crop-wide.png", 448, 224, 56);
+
+        let cropped = load_clip_square(&wide, 224, &dev).expect("crop");
+        assert_eq!(cropped.dims(), &[1, 3, 224, 224]);
+        // Source columns 112..336 are all white, so no red survives.
+        assert!(
+            max_red_excess(&cropped) < 0.05,
+            "the cropped frame still contains edge content"
+        );
+
+        let squashed = load_rgb_unit_resized(&wide, 224, 224, &dev).expect("squash");
+        assert!(
+            max_red_excess(&squashed) > 0.5,
+            "the squashed frame should still contain the red stripe"
+        );
+        let _ = std::fs::remove_file(&wide);
+    }
+
+    #[test]
+    fn a_square_clip_reference_keeps_everything() {
+        // The other half of the property: a square source loses nothing, so
+        // every reference image used in this repo's assets is unaffected by
+        // the change.
+        let dev = Device::Cpu;
+        let square = striped("sdrs-clip-crop-square.png", 224, 224, 56);
+        let out = load_clip_square(&square, 224, &dev).expect("crop");
+        assert_eq!(out.dims(), &[1, 3, 224, 224]);
+        assert!(
+            max_red_excess(&out) > 0.5,
+            "a square reference must not be cropped"
+        );
+        let _ = std::fs::remove_file(&square);
     }
 }

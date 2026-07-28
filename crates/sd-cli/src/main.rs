@@ -415,6 +415,80 @@ enum Command {
         output: String,
     },
 
+    /// Generate a variation of an image: its subject, not its pixels.
+    ///
+    /// Needs an unCLIP checkpoint, e.g.
+    /// `diffusers/stable-diffusion-2-1-unclip-i2i-h`. Unlike img2img, no pixel
+    /// of the reference reaches the model — only a single CLIP embedding of
+    /// the whole image — so the result is composed from scratch and shares the
+    /// subject rather than the layout.
+    #[command(name = "unclip")]
+    Unclip {
+        /// An unCLIP checkpoint: an SD 2.x UNet with a `class_embedding`,
+        /// plus `image_encoder/` and `image_normalizer/`.
+        #[arg(long)]
+        model: String,
+
+        /// The image to take the embedding from. Read at 224x224 whatever
+        /// size the output is.
+        ///
+        /// Omit it to generate from the prompt alone: the checkpoint's prior
+        /// samples an image embedding from the text, which needs a
+        /// text-to-image unCLIP model such as
+        /// `diffusers/stable-diffusion-2-1-unclip-t2i-l`.
+        #[arg(long)]
+        init_image: Option<String>,
+
+        /// Required without --init-image; optional with one, where an empty
+        /// prompt is the usual choice for a pure variation.
+        #[arg(long, default_value = "")]
+        prompt: String,
+
+        /// Denoising steps for the prior. Ignored with --init-image.
+        #[arg(long, default_value_t = 25)]
+        prior_steps: usize,
+
+        /// Guidance for the prior, separate from the image half's. Ignored
+        /// with --init-image.
+        #[arg(long, default_value_t = 4.0)]
+        prior_guidance: f64,
+
+        /// How much noise is mixed into the image embedding, 0..999.
+        ///
+        /// The dial between "this image" and "something like it". 0 is
+        /// tightest and is diffusers' default; a few hundred loosens it.
+        #[arg(long, default_value_t = 0)]
+        noise_level: usize,
+
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        #[arg(long, default_value_t = 768)]
+        width: usize,
+
+        #[arg(long, default_value_t = 768)]
+        height: usize,
+
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        /// diffusers' published default, which pairs it with PNDM. With this
+        /// project's euler_a it runs to crushed blacks and hard vignetting
+        /// across every seed tried; 5.0 is warmer and flatter. Stylistic
+        /// rather than broken — try 5.0 if the output looks over-processed.
+        #[arg(long, default_value_t = 10.0)]
+        cfg_scale: f64,
+
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        #[arg(long, default_value = "euler_a")]
+        sampler: String,
+
+        #[arg(long, short, default_value = "variation.png")]
+        output: String,
+    },
+
     /// Generate with different prompts in different regions.
     ///
     /// Each `--region` is `MASK=PROMPT`, where MASK is an image whose white
@@ -1073,8 +1147,11 @@ fn main() -> Result<()> {
                     let mut report = previewing(&pipeline, preview_every, &output);
                     match ip_image.as_deref() {
                         Some(path) if pipeline.has_ip_adapter() => {
-                            // 224 is the tower's input size; [0, 1] is its range.
-                            let image = sd::image_io::load_rgb_unit_resized(path, 224, 224, &dev)
+                            // 224 is the tower's input size; [0, 1] is its
+                            // range; and the shortest edge is scaled to it and
+                            // the rest cropped away, which is what CLIP's own
+                            // preprocessing does.
+                            let image = sd::image_io::load_clip_square(path, 224, &dev)
                                 .with_context(|| format!("reading {path}"))?;
                             let cond = pipeline
                                 .encode_conditioning_with_image(
@@ -1366,6 +1443,74 @@ fn main() -> Result<()> {
             let img = pipeline
                 .run_instruct_with_progress(&cfg, &mut report)
                 .context("running instruct")?;
+            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
+            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
+        }
+
+        Command::Unclip {
+            model,
+            init_image,
+            prompt,
+            prior_steps,
+            prior_guidance,
+            noise_level,
+            negative_prompt,
+            width,
+            height,
+            steps,
+            cfg_scale,
+            seed,
+            sampler,
+            output,
+        } => {
+            if init_image.is_none() && prompt.is_empty() {
+                anyhow::bail!(
+                    "unclip needs either --init-image or a --prompt to build an image \
+                     embedding from"
+                );
+            }
+            let cfg = sd::pipeline::UnclipConfig {
+                base: Txt2ImgConfig {
+                    prompt,
+                    negative_prompt,
+                    width,
+                    height,
+                    steps,
+                    cfg_scale,
+                    seed,
+                    sampler: parse_sampler(&sampler)?,
+                    frames: 1,
+                    cache_threshold: 0.0,
+                    cancel: None,
+                },
+                init_image: init_image.as_deref().map(std::path::PathBuf::from),
+                prior_steps,
+                prior_guidance,
+                noise_level,
+            };
+            tracing::info!(
+                model = %model,
+                init = init_image.as_deref().unwrap_or("<prior>"),
+                noise_level,
+                "unclip"
+            );
+            let started = std::time::Instant::now();
+            let mut report = |p: sd::pipeline::Progress| {
+                tracing::info!(step = p.step, total = p.total, "denoise");
+            };
+            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
+                .with_context(|| format!("loading pipeline from {model}"))?;
+            // Only when it is needed: the prior is a second diffusion model
+            // and 4.6 GB, and an image-variation run never touches it.
+            let pipeline = match init_image {
+                Some(_) => pipeline,
+                None => pipeline
+                    .with_prior(Path::new(&model))
+                    .with_context(|| format!("attaching the prior from {model}"))?,
+            };
+            let img = pipeline
+                .run_unclip_with_progress(&cfg, &mut report)
+                .context("running unclip")?;
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
         }

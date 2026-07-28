@@ -39,6 +39,15 @@ pub struct UNetConfig {
     pub use_linear_projection: bool,
     /// SDXL's micro-conditioning. `None` for SD 1.5, which has none.
     pub addition: Option<AdditionEmbedding>,
+    /// unCLIP's image conditioning: the width of the vector `class_embedding`
+    /// projects into the timestep embedding. `Some(2048)` for
+    /// stable-diffusion-2-1-unclip, `None` for everything else here.
+    ///
+    /// diffusers spells this `class_embed_type: "projection"` plus
+    /// `projection_class_embeddings_input_dim`; the type is an `Option` because
+    /// "projection" is the only variant any checkpoint here uses, and a bool
+    /// plus a width would let the two disagree.
+    pub class_projection: Option<usize>,
 }
 
 /// SDXL's extra conditioning: image size and crop offsets, sinusoidally
@@ -66,6 +75,7 @@ impl UNetConfig {
             norm_eps: 1e-5,
             use_linear_projection: false,
             addition: None,
+            class_projection: None,
         }
     }
 
@@ -126,6 +136,25 @@ impl UNetConfig {
                 // 6 ids * 256 = 1536, plus the 1280-wide pooled embedding.
                 projection_input_dim: 2816,
             }),
+            class_projection: None,
+        }
+    }
+
+    /// unCLIP — `stabilityai/stable-diffusion-2-1-unclip` and its open mirrors.
+    ///
+    /// **SD 2.x exactly**, plus one thing: a `class_embedding` that projects a
+    /// CLIP *image* embedding into the timestep embedding. Every block, every
+    /// width and the text encoder behind it are unchanged, which is why this is
+    /// two lines rather than an architecture.
+    ///
+    /// 2048 because the vector is the 1024-wide image embedding concatenated
+    /// with a 1024-wide sinusoid of the noise level it was augmented at — see
+    /// [`crate::unclip`]. Handing it the bare 1024 embedding fails to load,
+    /// which is the good direction.
+    pub fn unclip() -> Self {
+        Self {
+            class_projection: Some(2048),
+            ..Self::sd2()
         }
     }
 
@@ -187,6 +216,14 @@ pub struct UNet2DConditionModel {
     dtype: DType,
     /// SDXL only. Projects the micro-conditioning into the time embedding.
     add_embedding: Option<(TimestepEmbedding, AdditionEmbedding)>,
+    /// unCLIP only. Projects the augmented image embedding into the same slot.
+    ///
+    /// A separate field from `add_embedding` rather than a shared one because
+    /// they are separate tensors in the checkpoint (`class_embedding` against
+    /// `add_embedding`) and separate arguments in diffusers. No checkpoint
+    /// carries both, but collapsing them would make that a silent assumption
+    /// rather than an observation.
+    class_embedding: Option<TimestepEmbedding>,
     in_channels: usize,
 }
 
@@ -379,6 +416,14 @@ impl UNet2DConditionModel {
                 )),
                 None => None,
             },
+            class_embedding: match cfg.class_projection {
+                Some(dim) => Some(TimestepEmbedding::new(
+                    dim,
+                    temb_channels,
+                    vb.pp("class_embedding"),
+                )?),
+                None => None,
+            },
         })
     }
 
@@ -396,9 +441,37 @@ impl UNet2DConditionModel {
         self.dtype
     }
 
+    /// Whether this UNet conditions on a CLIP image embedding.
+    ///
+    /// Read from the weights it was built with, so a caller can tell an unCLIP
+    /// checkpoint from an ordinary SD 2.x one without reopening the file.
+    pub fn takes_class_labels(&self) -> bool {
+        self.class_embedding.is_some()
+    }
+
     /// `sample`: `[b, 4, h, w]`, `timestep`: `[b]`, `context`: `[b, 77, dim]`.
     pub fn forward(&self, sample: &Tensor, timestep: &Tensor, context: &Tensor) -> Result<Tensor> {
         self.forward_with_skips(sample, timestep, context, None)
+            .map(|(out, _, _)| out)
+    }
+
+    /// unCLIP's forward: the same, plus the augmented image embedding.
+    ///
+    /// `class_labels` is `[b, 2048]` — the CLIP image embedding, noised at a
+    /// chosen level, with that level's sinusoid appended. Build it with
+    /// [`crate::unclip::NoiseAugmentor::augment`] rather than by hand: the
+    /// halves are the same width, so a swapped concatenation runs.
+    ///
+    /// The unconditional row of a guidance batch is **zeros of this shape**,
+    /// not an absent argument — an unCLIP UNet has nowhere to put "no image".
+    pub fn forward_unclip(
+        &self,
+        sample: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        class_labels: &Tensor,
+    ) -> Result<Tensor> {
+        self.run(sample, timestep, context, None, None, Some(class_labels))
             .map(|(out, _, _)| out)
     }
 
@@ -417,7 +490,7 @@ impl UNet2DConditionModel {
         down: &[Tensor],
         mid: &Tensor,
     ) -> Result<Tensor> {
-        self.run(sample, timestep, context, None, Some((down, mid)))
+        self.run(sample, timestep, context, None, Some((down, mid)), None)
             .map(|(out, _, _)| out)
     }
 
@@ -452,9 +525,10 @@ impl UNet2DConditionModel {
         context: &Tensor,
         added: Option<(&Tensor, &Tensor)>,
     ) -> Result<(Tensor, Vec<Tensor>, Tensor)> {
-        self.run(sample, timestep, context, added, None)
+        self.run(sample, timestep, context, added, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         sample: &Tensor,
@@ -462,11 +536,34 @@ impl UNet2DConditionModel {
         context: &Tensor,
         added: Option<(&Tensor, &Tensor)>,
         control: Option<(&[Tensor], &Tensor)>,
+        class_labels: Option<&Tensor>,
     ) -> Result<(Tensor, Vec<Tensor>, Tensor)> {
         // `timestep` is [b], not a scalar: a scalar yields [1, 1280] where
         // [b, 1280] is needed, and that only surfaces deep inside a resnet.
         let temb = timestep_embedding(timestep, self.freq_dim)?.to_dtype(self.dtype)?;
         let temb = self.time_embedding.forward(&temb)?;
+
+        // unCLIP's image conditioning lands in the *same slot* as SDXL's
+        // micro-conditioning — added to the timestep embedding, before the
+        // blocks see it — so nothing downstream of here knows it exists. That
+        // is also why getting it wrong is silent: every block runs unchanged
+        // on a temb that means something else.
+        let temb = match (&self.class_embedding, class_labels) {
+            (Some(embed), Some(labels)) => {
+                (temb + embed.forward(&labels.to_dtype(self.dtype)?)?)?
+            }
+            (Some(_), None) => {
+                return Err(sd_tensor::Error::Msg(
+                    "this UNet expects an image embedding; use forward_unclip".to_string(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(sd_tensor::Error::Msg(
+                    "class labels supplied to a UNet that has no class_embedding".to_string(),
+                ))
+            }
+            (None, None) => temb,
+        };
 
         let temb = match (&self.add_embedding, added) {
             (Some((embed, cfg)), Some((pooled, time_ids))) => {

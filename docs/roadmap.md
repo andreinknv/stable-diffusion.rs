@@ -142,7 +142,40 @@ Remaining milestone 2 work:
 
 SD 2.x · SD 3 · Flux (schnell, dev) · ControlNet · LoRA · TAESD ·
 ESRGAN upscaling · inpainting  —  ✅ Flux (flux-mini), ✅ T5 text encoder,
-✅ LoRA (SD 1.5 dense path), ✅ LCM sampling, ✅ inpainting, ✅ ControlNet, ✅ TAESD, ✅ SD 2.x, ✅ ESRGAN upscaling, ✅ IP-Adapter, ✅ seamless tiling, ✅ textual inversion, ✅ two-pass (hires), ✅ checkpoint merging, ✅ motion modules, ✅ area conditioning, ✅ InstructPix2Pix, ✅ GLIGEN
+✅ LoRA (SD 1.5 dense path), ✅ LCM sampling, ✅ inpainting, ✅ ControlNet, ✅ TAESD, ✅ SD 2.x, ✅ ESRGAN upscaling, ✅ IP-Adapter, ✅ seamless tiling, ✅ textual inversion, ✅ two-pass (hires), ✅ checkpoint merging, ✅ motion modules, ✅ area conditioning, ✅ InstructPix2Pix, ✅ GLIGEN, ✅ unCLIP
+
+**unCLIP generates from an image embedding**, `sdrs unclip` — either from a
+reference image, or from a prompt through the prior. The last capability
+outstanding from the third integration issue, and the least code of any of
+them: its UNet is SD 2.x with one extra module, and the prior reuses the
+timestep embedding, the masked-attention primitive and the cosine ladder that
+were already here.
+
+It also found two defects in code that had been green for the whole project:
+a pooled CLIP embedding read from the last padding position rather than the
+first EOS (affecting Flux, SD 3 and GLIGEN), and a Metal-only matmul refusal on
+a narrowed view. Both are written up in [handoff.md](handoff.md#traps-this-codebase-has-already-paid-for).
+
+| component | vs. reference | agreement |
+|---|---|---|
+| noise augmentation, level 0 | `diffusers` | 4.9e-6, floor 6.4e-6 |
+| noise augmentation, level 250 | `diffusers` | 1.5e-5, floor 1.0e-5 |
+| image embeds (this ViT-H) | `transformers` | 1.3e-6 |
+| whole UNet with `class_labels` | `diffusers` | 2.0e-4, floor 2.8e-4 |
+| the unconditional (zero) row | `diffusers` | 6.2e-4 |
+| prior transformer, masked | `diffusers` | 3.2e-6 |
+| prior transformer, unmasked | `diffusers` | 4.7e-6 |
+| prior text encoder, projected | `transformers` | 9.7e-7 |
+| one prior DDPM step | `diffusers` | 4.8e-7 |
+| the t2i UNet under the prior | `diffusers` | 2.0e-3, floor 1.5e-3 |
+
+The floors are the reference's own f32-against-f64 spread, from
+`reference_precision.py unclip`. Two of them are unusually high for what looks
+like arithmetic on a 1024-vector, and both took measuring rather than
+guessing: `1 - alpha` cancels catastrophically near the top of the ladder, and
+the noise level's sinusoid is evaluated at arguments as large as the level, so
+rounding its frequency to f32 costs `250 * 6e-8` in the argument and `cos`
+passes that straight through.
 
 This is the phase that took upstream years, and it parallelizes well: each
 architecture is independent and verifiable against its own golden data.

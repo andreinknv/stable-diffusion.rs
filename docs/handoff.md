@@ -31,22 +31,22 @@ mattered:
 ## What this project does today
 
 Every capability below is verified against `diffusers`/`transformers` with a
-recorded number. **337 tests, all gates green**, plus 5 GPU smoke tests behind the `metal`
+recorded number. **361 tests, all gates green**, plus 7 GPU smoke tests behind the `metal`
 feature (`cargo test --features metal --test metal_smoke`) — they are not in
 the default count because a machine without a GPU cannot run them.
 
 | | |
 |---|---|
-| **Architectures** | SD 1.5, SD 2.x, SDXL, SD 3.5, Flux (schnell, mini) |
-| **Conditioning** | LoRA (dense *and* quantised), ControlNet (several at once), IP-Adapter, GLIGEN boxes, textual inversion, area/regional prompts, per-step conditioning |
+| **Architectures** | SD 1.5, SD 2.x, SDXL, SD 3.5, Flux (schnell, mini), unCLIP (image *and* text) |
+| **Conditioning** | LoRA (dense *and* quantised), ControlNet (several at once), IP-Adapter, GLIGEN boxes, unCLIP image embeddings, textual inversion, area/regional prompts, per-step conditioning |
 | **Editing** | img2img, inpainting, InstructPix2Pix |
 | **Animation** | AnimateDiff motion modules, frame batching, explicit latent in/out |
 | **Output** | TAESD (4 variants), tiled VAE decode, ESRGAN 4x, two-pass hires, seamless tiling |
 | **Runtime** | Metal + CPU, GGUF quantisation, block streaming, step previews, cancellation, determinism, checkpoint merging |
 | **Formats** | safetensors, GGUF, pickled `.bin` (converted by the dumper) |
 
-Three integration issues drove most of this. **#1 and #2 are closed**; **#3 is
-eight of nine**, with unCLIP the only capability outstanding and video/audio/3D
+Three integration issues drove most of this. **All three are now closed** —
+unCLIP was the last capability outstanding from #3, and video/audio/3D are
 explicitly out of scope by the author's own ranking.
 
 ## Where things stand
@@ -64,6 +64,8 @@ sensible default rather than a broken option.
 | SD 3.5 medium 512, 20 steps | 230 s (dense) | **24.5 s** † | now Q4_K_M by default |
 | SD 3.5 medium 256, 20 steps | 71.8 s (dense) | **9.0 s** | mean 7.0/255, same image |
 | Flux mini (3.2B) 512, 20 steps | 212 s | does not fit ‡ | — |
+| unCLIP 768, 20 steps | — | **36 s** § | components verified; see below |
+| unCLIP text-to-image 768, 20 steps | — | **67 s** wall | prior adds 25 steps over a 768-vector |
 
 † **Now the quantised checkpoint, and reliable.** `sd3_paths_in` prefers
 `sd35-medium-q4_k_m.gguf` (1.79 GB) over the dense `.safetensors` (10.2 GB at
@@ -76,6 +78,10 @@ That step-1 failure was recorded here for several sessions as a *VAE decode*
 failure, which was wrong: candle queues Metal work and reports a failed
 command buffer only at the next synchronisation point, so the blame lands on
 whatever waits first. See the trap below.
+
+§ 27.7 s of denoising at 1.38 s/step plus 8.4 s of tiled VAE decode. Wall clock
+is 61 s: loading is another 25 s, because unCLIP holds a **fourth tower** — a
+2.5 GB ViT-H — on top of the usual three, and all of it dense f32.
 
 ‡ Flux mini holds dense f32 weights: 12.8 GB for a 3.2B model, against
 schnell's 6.8 GB for 12B held as Q4_K. Quantisation is what makes the *larger*
@@ -162,9 +168,110 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 337 tests, all gates green
+table is in [roadmap.md](roadmap.md). 361 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
+
+**unCLIP generates variations**, `sdrs unclip --model models/unclip
+--init-image X`. The last capability outstanding from the third integration
+issue, and the smallest: its UNet is SD 2.x with **one extra module**, so the
+config is two lines and the blocks are untouched.
+
+The A/B that makes it a demonstration rather than a hope: same seed, same
+*empty* prompt, same everything, two different references. A crab photograph
+gives a crab on sand (`assets/unclip-crab-noise0.png`); an armoured figure in
+a field gives an armoured figure in a field, from behind, in the same pose
+(`assets/unclip-knight-noise0.png`). The reference is the only thing choosing
+the subject.
+
+All three assets are `--cfg-scale 5.0 --steps 20 --width 768 --height 768
+--seed 42`. **Not the CLI's default of 10.0**, which is diffusers' published
+figure — and the difference is stylistic rather than a defect, checked across
+seeds 42, 7 and 3 rather than asserted from one: at 10.0 the output runs to
+crushed blacks and hard vignetting, at 5.0 it is warmer and flatter. The
+default stays at the reference's because neither is wrong and because
+diffusers pairs 10.0 with PNDM where this runs euler_a; pass 5.0 to reproduce
+the assets.
+
+Worth setting expectations either way: with an **empty prompt** this
+checkpoint is a stylised photographer, not a neutral one. Every variation
+above is more saturated and more contrasty than its reference. That is the
+model, not the port — the same is visible in diffusers' own examples.
+
+**No pixel of the reference reaches the model.** That is the difference from
+everything else here that takes an image. img2img starts from the picture's
+own latent and stops the schedule early, so the composition survives; a
+ControlNet gets a map at spatial resolution; IP-Adapter gives the cross
+attention four extra tokens to look at. unCLIP passes a **single 1024-vector
+describing the whole image** and nothing else, so the output is composed from
+scratch — which is why the crab variation is a front-on close-up where the
+source is a three-quarter view.
+
+**The noise level is the point, not a detail.** An unaugmented CLIP embedding
+is a strong enough signal that the model reproduces the reference and
+generates almost nothing, so unCLIP noises the embedding on purpose and the
+level is the dial. At 0 it is a tight variation; at 500 the same reference
+still gives a crab on sand but the model has invented an ocean, a beach and a
+far more elaborate animal (`assets/unclip-crab-noise500.png`).
+
+The level conditions the model **twice** — by being the amount of noise mixed
+in, and by having its own sinusoid appended to the vector. That is what makes
+`class_labels` 2048 wide where the embedding is 1024.
+
+Verified component by component against diffusers, with every bound measured
+first:
+
+```text
+  noise augmentation, level 0     4.9e-6     floor 6.4e-6
+  noise augmentation, level 250   1.5e-5     floor 1.0e-5
+  image embeds (this ViT-H)       1.3e-6
+  whole UNet with class_labels    2.0e-4     floor 2.8e-4
+  the unconditional (zero) row    6.2e-4
+```
+
+**Two of those floors are far higher than a 1024-vector of arithmetic
+suggests, and the first attempt at measuring them was wrong by 40x.** It held
+the schedule at diffusers' f32 constants and routed the sinusoid through
+`get_timestep_embedding`, which hardcodes f32 internally — so the f64 "run"
+returned f32 numbers and reported a floor of 2.652e-07. Against that, a
+correct implementation failed. Recomputing *both* at f64 gives the real
+figures and shows where they come from: `1 - alpha` cancels near the top of
+the ladder, turning an absolute 2e-8 difference in the schedule into a
+relative 5e-4 one; and the sinusoid is evaluated at arguments as large as the
+level, where rounding the frequency to f32 costs `250 * 6e-8` in the argument
+and `cos` passes it through undamped. **When measuring a noise floor, check
+that the high-precision run is actually running in high precision.**
+
+**Reference images are read the way CLIP reads them**: shortest edge to 224,
+then a centre crop, with Catmull-Rom because `resample: 3` in the shipped
+`preprocessor_config.json` is PIL's bicubic. Both this and the IP-Adapter path
+used to squash to a square, which is identical on a square reference and
+changes every proportion in a wide one. `load_clip_square` in `image_io`.
+
+**The checkpoint's normalizer is the identity** — `mean` all zeros, `std` all
+ones, the constructor's defaults, never trained. So the golden comparison runs
+straight through it and cannot see `scale` and `unscale` swapped or either one
+dropped. Unit tests on synthetic statistics pin the formula instead; the gap
+is recorded rather than left for whoever meets a checkpoint that does ship
+statistics.
+
+The **unconditional row is zeros of the full 2048**, not an absent argument
+and not an augmented zero embedding — the last would still carry the level's
+sinusoid and mean something. Checked against diffusers rather than assumed,
+because all three run.
+
+**The whole checkpoint ships pickled**, so `dump_reference.py unclip` converts
+all five components — 1834 tensors, 7.2 GB — and assembles `models/unclip` as
+it goes. It downloads outside the shared cache and deletes each `.bin` as soon
+as it is converted, because holding both forms at once is more disk than this
+machine has spare.
+
+`Txt2ImgPipeline::load` detects unCLIP from the presence of
+`class_embedding.linear_1.weight` and reads its width rather than assuming
+2048. Text-only generation on such a checkpoint is refused by name: with
+nothing supplied it would run on the zero vector — the guidance batch's own
+unconditional row — and return a perfectly ordinary image of nothing in
+particular.
 
 **LCM sampling works**, `--sampler lcm`, in both SD 1.5 and SDXL. It is not
 another ODE solver: a consistency model maps any point on the trajectory
@@ -892,26 +999,80 @@ Two things worth keeping about how it is written:
   linked but not exercised**, so adding an architecture without adding GPU
   coverage is caught rather than remembered.
 
-### 1. unCLIP — image-embedding conditioning
+### ~~1. unCLIP — image-embedding conditioning~~ — done
 
-Ready to start: `stabilityai/stable-diffusion-2-1-unclip` is gated, but
-`diffusers/stable-diffusion-2-1-unclip-t2i-h`, `-i2i-h` and `-t2i-l` are open
-(checked, 200). `StableUnCLIPPipeline` is the reference.
+`sdrs unclip`, against `diffusers/stable-diffusion-2-1-unclip-i2i-h` — the
+stock `stabilityai/stable-diffusion-2-1-unclip` is gated but the diffusers
+mirrors are open. See the section above for the numbers and the two traps.
 
-A full architecture rather than an adapter, and three pieces:
+It turned out to be the *smallest* remaining capability rather than a full
+architecture: the UNet is SD 2.x with a `class_embedding`, so `UNetConfig`
+gained one `Option` and the blocks were untouched. What took the time was the
+noise augmentation's tolerance, which is a story about measuring floors
+properly rather than about diffusion.
 
-- **A CLIP image embedder** — already ported, `clip::ClipVisionEncoder`, and
-  `image_embeds` is the projected form unCLIP wants.
-- **Noise augmentation** on the image embedding, with its own noise-level
-  schedule. This is the part with no analogue elsewhere here.
-- **A UNet with `class_embed_type = "projection"`** — the augmented embedding
-  is projected and *added to the timestep embedding*, the same slot SDXL's
-  micro-conditioning uses, so `AdditionEmbedding` is the shape to follow.
+**The text-to-image half is done too**, `sdrs unclip --model models/unclip-t2i
+--prompt "..."` with no reference image: the prior samples an image embedding
+from the prompt and the image half proceeds exactly as if a photograph had
+produced one. `assets/unclip-t2i-crab-768.png`, 768px in 67 s.
 
-Verify the class embedding path in isolation first, then the whole UNet — the
-addition into `temb` is silent when wrong.
+It was smaller than it looked. The prior is a 20-block, 2048-wide transformer,
+and most of what it needs already existed: `timestep_embedding` and
+`TimestepEmbedding` verbatim, the masked-attention primitive CLIP's text tower
+already uses, and — exactly — the `squaredcos_cap_v2` ladder written for the
+noise augmentation, which is the prior's sampling schedule too. What was
+genuinely new is one assembly and one sampler.
 
-### 2. A real predictor for step caching
+**`diffusers/stable-diffusion-2-1-unclip-t2i-h` cannot work, and it is
+published.** Its prior is Karlo's, emitting a 768-wide ViT-L embedding, while
+its image half is the ViT-H one — `image_normalizer` 1024 wide and a UNet
+whose class projection is 2048, being twice that. The two ends do not meet.
+**`-t2i-l` is the consistent pairing**: 768 throughout, class projection 1536.
+`with_prior` checks the two widths and names the mismatch rather than letting
+it fail inside the augmentation.
+
+Worth knowing when assembling model directories: `-i2i-h` and `-t2i-h` share
+their UNet, VAE and text encoder **byte for byte** (identical sha256), but
+`-t2i-l` shares none of them. One directory serves the first two; the third
+needs its own, which is why there is a `models/unclip-t2i` beside
+`models/unclip`. The *prior* is identical across both t2i mirrors, so it is
+downloaded once.
+
+Five things the prior gets to be wrong about, all of which run:
+
+- **The sequence is `[77 text | pooled text | timestep | latent | prd]`**, 81
+  positions, and the answer is read from the **last** one — a learned `prd`
+  token that exists to have somewhere to put it. Reading the latent's position
+  returns a well-shaped vector that is not the prediction.
+- **The attention mask is load-bearing**, uniquely here. Every other CLIP
+  consumer in this project ignores the tokenizer's mask because SD conditions
+  on all 77 positions, padding included. The prior masks padding *and* applies
+  a causal mask, and the reference's ten-token prompt moves the prediction by
+  **0.604** between masked and unmasked — so both are dumped and both compared.
+- **The model predicts the sample, not the noise.** `prediction_type:
+  "sample"`, so there is no `x0` to derive; and the variance is
+  `fixed_small_log`, where diffusers' `_get_variance` returns a *standard
+  deviation* while every other variance type returns a variance. Squaring or
+  rooting it once more gives a quieter run and a plausible image.
+- **The feed-forward is plain GELU, not GEGLU** — every SD transformer here is
+  GEGLU. The projection widths differ (8192 against 16384), so this one fails
+  to load rather than running.
+- **`clip_mean`/`clip_std` un-whiten the result.** Skipping it hands the image
+  half a vector at the wrong scale.
+
+Verified against diffusers:
+
+```text
+  prior transformer, masked        3.2e-6
+  prior transformer, unmasked      4.7e-6     the mask is worth 0.604
+  prior text encoder, hidden       6.3e-6
+  prior text encoder, projected    9.7e-7
+  one DDPM step                    4.8e-7
+  the final step (no variance)     0.0        exactly
+  the t2i UNet under it            2.0e-3     floor 1.5e-3
+```
+
+### 1. A real predictor for step caching
 
 `--cache-threshold` works but buys ~9 % where the literature reports 1.5-2x.
 The machinery is right (threshold 0 is bit-identical, the last step always
@@ -925,7 +1086,7 @@ and Flux. Everything else stays.
 
 Measured numbers to beat are in `Txt2ImgConfig::cache_threshold`.
 
-### 3. Newer architectures worth the port
+### 2. Newer architectures worth the port
 
 From a July 2026 survey. All fit this library's existing shape — DiT-style
 transformers with quantised GGUF variants:
@@ -937,7 +1098,7 @@ transformers with quantised GGUF variants:
   external VAE and no separate text encoders. That makes it *less* work than
   its size suggests, since two towers disappear.
 
-### 4. Extend streaming past Flux and SD 3.5, and measure on a discrete GPU
+### 3. Extend streaming past Flux and SD 3.5, and measure on a discrete GPU
 
 `Residency::Streamed` works for Flux and SD 3.5, both quantised. Gaps:
 
@@ -1046,6 +1207,57 @@ it, and **measure before choosing either number.** The script exists now; run
 it rather than picking a value that turns the light green. That is how the
 Flux VAE encoder's 2e-3 bound and T5's 3e-3 were set, and both sat at or below
 the reference's own noise floor.
+
+**A pooled CLIP embedding was being read from the wrong position, in three
+places, for the whole history of this project.** `transformers` finds the EOS
+with `argmax`, which returns the *first* maximum; Rust's `max_by_key` returns
+the *last*. SD 1.5's tokenizer **pads with EOS**, so a ten-token prompt has 68
+copies of 49407 and the two rules are 67 positions apart. Flux's pooled
+conditioning, SD 3's CLIP-L half and GLIGEN's phrase embeddings were all
+reading the final padding slot.
+
+It survived because the only golden test covering pooling is SDXL's second
+encoder, whose tokenizer pads with `!` — leaving one maximum, where both rules
+agree. Every other test feeds *pre-computed* conditioning tensors and never
+tokenizes, so none of them touched the function. It surfaced only when the
+unCLIP prior's text encoder was compared against `transformers` and missed by
+**1.72**; the fix takes it to 9.7e-7.
+
+Two lessons. **A helper used by five callers and covered by one is covered by
+none** — the covered case was the one where the bug is unreachable. And when
+a suite verifies modules against saved tensors, the *tokenizer-to-model* seam
+is exactly what no golden test sees. `pooling_takes_the_first_eos_not_the_last`
+in `golden_clip_encoder.rs` is structural and needs no reference data, so it
+cannot regress quietly again.
+
+**A tensor that does not own its buffer is still a different tensor — and this
+time CPU was the one that hid it.** The prior reads its answer with
+`narrow(1, 80, 1)`, leaving a `[b, 2048]` view whose row stride is the
+sequence's `81 * 2048`. CPU computes the right answer from it; candle's Metal
+matmul refuses outright, with `Invalid matmul arguments [165888, 1] [1, 2048]
+(2, 768, 2048)` from inside the kernel and nothing naming the line. Every
+golden test passed — they all run on CPU — and the GPU smoke test is what
+caught it, which is the second time that file has earned its place on a new
+architecture's first run. Read the `mnk` triple in that message: `(2, 768,
+2048)` is `m, n, k`, and `165888 / 2048 = 81` named the tensor.
+
+**Check that the high-precision run is actually running in high precision.**
+`reference_precision.py` earns its keep by measuring the reference against
+itself in f64 — but two things in the unCLIP path silently stayed f32: the
+DDPM schedule, whose constants diffusers builds once in f32 and hands to both
+runs, and `get_timestep_embedding`, which hardcodes `dtype=torch.float32`
+inside. The "f64 run" therefore returned f32 numbers, the reported floor came
+out 40x too low, and a correct implementation failed against it. Before
+trusting a floor, confirm the f64 run's *inputs and constants* are f64 too,
+not just its weights.
+
+**Cancellation moves a noise floor by four orders of magnitude.** The same
+measurement showed why the level-0 augmentation is twenty times noisier than
+level 250: near the top of the ladder `alpha` is within 4e-5 of one, so an
+absolute 2e-8 difference in it is a *relative* 5e-4 difference in `1 - alpha`,
+which is what the noise gets multiplied by. Wherever a bound is set on
+something computed from `1 - x` with `x` near 1, measure it there rather than
+extrapolating from a well-conditioned neighbour.
 
 **Test the smallest input that reaches the code, not the most realistic one.**
 Verifying SDXL img2img meant exercising encoder tiling, which engages only
@@ -1162,7 +1374,15 @@ cargo run --release -p sd-cli --example requantise -- in.gguf out.gguf Q4_K
 
 # golden references (local only; CI skips the numerical tests)
 python3 xtask/golden/dump_reference.py <component> --output tests/golden
-#   components: vae flux_vae sd3 flux_transformer flux_sampling t5 flow clip_* unet_* samplers sdxl_*
+#   components: vae flux_vae sd3 flux_transformer flux_sampling t5 flow clip_* unet_* samplers sdxl_* unclip unclip_prior
+
+# tolerances: what the reference's own f32 misses its f64 by
+python3 xtask/golden/reference_precision.py <unet|vae|taesd|unclip>
+python3 xtask/golden/reference_precision.py unclip --model-id models/unclip-t2i
+
+# unCLIP, both halves
+sdrs unclip --model models/unclip --init-image ref.png --cfg-scale 5.0
+sdrs unclip --model models/unclip-t2i --prompt "a crab on a beach"
 ```
 
 `flux_txt2img` prefers `flux-schnell-q4_k_s.gguf` when present and falls back
@@ -1179,6 +1399,13 @@ Regenerable, so deleting them is cheap:
   CLIP-L, CLIP-G
 - `tests/golden/gguf/` — SD 1.5 quant sweep. The k-quants were deleted to
   save space; regenerate with `--example requantise` from `sd15-f16.gguf`.
+- `models/unclip/` — the image-variation unCLIP checkpoint converted from
+  pickled `.bin` to safetensors, 7.2 GB, written by `dump_reference.py unclip`;
+  `tests/golden/unclip/` symlinks into it rather than holding a second copy.
+- `models/unclip-t2i/` — the *text-to-image* one, 9.9 GB, from
+  `dump_reference.py unclip_prior`. A separate directory because `-t2i-l`
+  shares nothing with `-i2i-h` but the prior. Both are regenerable, so
+  deleting either to reclaim space costs one download.
 
 Ungated mirrors matter: `black-forest-labs/*` and `stabilityai/*` are gated.
 Use `Freepik/flux.1-lite-8B` for the Flux VAE and T5 tokenizer, and

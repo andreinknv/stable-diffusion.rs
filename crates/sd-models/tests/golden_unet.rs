@@ -136,6 +136,7 @@ fn tiny_config() -> UNetConfig {
         norm_eps: 1e-5,
         use_linear_projection: false,
         addition: None,
+        class_projection: None,
     }
 }
 

@@ -422,18 +422,32 @@ impl ClipTextEncoder {
     /// Available regardless of whether the checkpoint carries a projection,
     /// which matters because CLIP-L as shipped with SD 1.5 (and reused by
     /// Flux) is a plain `CLIPTextModel` and has none.
+    ///
+    /// # The **first** highest id, not the last
+    ///
+    /// `transformers` locates the EOS position with `argmax`, which returns
+    /// the first maximum. That distinction is invisible for a tokenizer that
+    /// pads with something other than EOS — SDXL's second pads with `!`, id 0,
+    /// so there is exactly one 49407 and either rule finds it. **SD 1.5's
+    /// tokenizer pads with EOS itself**, so a 10-token prompt has 68 copies of
+    /// 49407 and the two rules are 67 positions apart.
+    ///
+    /// Rust's `max_by_key` returns the *last* maximum, which is what this did
+    /// until the unCLIP prior's text encoder was verified against
+    /// `transformers` and missed by 1.72. Every caller that pools a
+    /// CLIP-L sequence was reading the final padding position instead of the
+    /// end of the prompt: Flux's pooled conditioning, SD 3's CLIP-L half, and
+    /// GLIGEN's phrase embeddings. None had a test on this function, which is
+    /// why it survived — the SDXL reference that does cover pooling is
+    /// exactly the case where the bug cannot appear.
     pub fn pooled_hidden(&self, token_ids: &Tensor) -> Result<Tensor> {
         let hidden = self.forward(token_ids)?;
         let ids = token_ids.to_dtype(DType::U32)?.to_vec2::<u32>()?;
 
         let mut rows = Vec::with_capacity(ids.len());
         for (b, row) in ids.iter().enumerate() {
-            let eos = row
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, &id)| id)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+            let highest = row.iter().copied().max().unwrap_or(0);
+            let eos = row.iter().position(|&id| id == highest).unwrap_or(0);
             rows.push(hidden.i(b)?.narrow(0, eos, 1)?);
         }
         Tensor::cat(&rows, 0)

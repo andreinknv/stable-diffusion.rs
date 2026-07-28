@@ -28,7 +28,7 @@ const DIFFUSERS_LAYOUT: [&str; 4] = ["sd15", "sd21", "sdxl", "gligen"];
 /// Models that cannot be driven from text alone, and the test that covers
 /// each instead. Listed so the coverage check below can tell "not exercised"
 /// from "exercised elsewhere".
-const NON_TXT2IMG: [&str; 1] = ["ip2p"];
+const NON_TXT2IMG: [&str; 3] = ["ip2p", "unclip", "unclip-t2i"];
 
 fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models")
@@ -216,6 +216,124 @@ fn the_quantised_path_runs_on_the_gpu() {
         })
         .expect("quantised Flux runs on Metal");
     assert_plausible(&image, "flux quantised");
+}
+
+#[test]
+fn the_unclip_path_runs_on_the_gpu() {
+    // Its own test because unCLIP reaches the GPU through two paths nothing
+    // else here does at once: a ViT-H vision tower, and a projection added
+    // into every timestep embedding. It also cannot be driven from text.
+    let Some(dev) = gpu() else { return };
+    let dir = models_dir().join("unclip");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/crab-512-dpmpp2m-seed42.png");
+    if !dir.join("unet").exists() || !source.exists() {
+        eprintln!("SKIP: no unclip model or source image");
+        return;
+    }
+    let pipeline = match Txt2ImgPipeline::load(&dir, &dev) {
+        Ok(p) => p,
+        Err(e) if refused_for_memory(&e) => {
+            eprintln!("SKIP: not enough free memory for unclip right now");
+            return;
+        }
+        Err(e) => panic!("unclip failed to load on Metal: {e}"),
+    };
+    assert!(pipeline.is_unclip(), "the checkpoint was not detected");
+
+    // Text alone must be refused with a message that names the fix. Without
+    // this the run would succeed on a zero image embedding — the guidance
+    // batch's unconditional row — and return a plausible wrong image.
+    let refused = pipeline.run(&tiny(11));
+    assert!(
+        refused.is_err(),
+        "text-only on an unCLIP UNet should be refused"
+    );
+
+    let image = pipeline
+        .run_unclip(&unclip_cfg(11, Some(source.clone())))
+        .expect("unclip run on Metal");
+    assert_plausible(&image, "unclip");
+
+    // More than a smoke check, and deliberately so: nothing else covers the
+    // step between "the UNet handles class labels" — which the golden suite
+    // verifies — and "the pipeline builds them from the reference image". If
+    // the embedding were dropped, zeroed or computed once and cached, every
+    // assertion above would still pass and every run would return the same
+    // picture whatever it was shown.
+    let other =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/hires-on-512to1024.png");
+    if !other.exists() {
+        eprintln!("SKIP the reference-changes-the-image check: no second image");
+        return;
+    }
+    let elsewhere = pipeline
+        .run_unclip(&unclip_cfg(11, Some(other)))
+        .expect("second unclip run on Metal");
+    let a = image.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = elsewhere.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_ne!(a, b, "a different reference image changed nothing");
+}
+
+#[test]
+fn the_unclip_prior_path_runs_on_the_gpu() {
+    // The other half of unCLIP, and its own checkpoint: `-t2i-l`, whose image
+    // side is 768-wide where the image-variation model's is 1024. It reaches
+    // the GPU through a transformer nothing else here uses — 20 self-attention
+    // blocks over 81 tokens, with an additive mask.
+    let Some(dev) = gpu() else { return };
+    let dir = models_dir().join("unclip-t2i");
+    if !dir.join("prior").exists() {
+        eprintln!("SKIP: no unclip-t2i model");
+        return;
+    }
+    let pipeline = match Txt2ImgPipeline::load(&dir, &dev) {
+        Ok(p) => p,
+        Err(e) if refused_for_memory(&e) => {
+            eprintln!("SKIP: not enough free memory for unclip-t2i right now");
+            return;
+        }
+        Err(e) => panic!("unclip-t2i failed to load on Metal: {e}"),
+    };
+
+    // Without the prior attached, a run with no reference image must say so
+    // rather than producing something from a zero embedding.
+    let refused = pipeline.run_unclip(&unclip_cfg(3, None));
+    assert!(
+        refused.is_err(),
+        "a prompt-only unCLIP run without a prior should be refused"
+    );
+
+    let pipeline = match pipeline.with_prior(&dir) {
+        Ok(p) => p,
+        Err(e) if refused_for_memory(&e) => {
+            eprintln!("SKIP: not enough free memory for the prior right now");
+            return;
+        }
+        Err(e) => panic!("attaching the prior on Metal: {e}"),
+    };
+    assert!(pipeline.has_prior());
+
+    let mut cfg = unclip_cfg(3, None);
+    cfg.base.prompt = "a crab".into();
+    // Two steps rather than 25: this is a smoke test, and the prior's
+    // correctness is the golden suite's job.
+    cfg.prior_steps = 2;
+    let image = pipeline.run_unclip(&cfg).expect("prior run on Metal");
+    assert_plausible(&image, "unclip prior");
+}
+
+fn unclip_cfg(
+    seed: u64,
+    init_image: Option<PathBuf>,
+) -> stable_diffusion_rs::pipeline::UnclipConfig {
+    stable_diffusion_rs::pipeline::UnclipConfig {
+        base: tiny(seed),
+        init_image,
+        prior_steps: 25,
+        prior_guidance: 4.0,
+        noise_level: 0,
+    }
 }
 
 /// Kept last: a note for whoever adds an architecture.

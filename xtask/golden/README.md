@@ -30,6 +30,23 @@ Every component has its own subcommand — `unet_full`, `sd3`, `flux_transformer
 `reference.safetensors` and symlinks the checkpoint it used next to it, so the
 Rust test has one fixed path to open and no knowledge of the HuggingFace cache.
 
+**`unclip` is the exception, and needs the repo root as the working
+directory.** Its checkpoint is published only as pickled `.bin`, so the
+subcommand converts all five components to safetensors and assembles a
+complete model directory at `models/unclip` — 7.2 GB — with
+`tests/golden/unclip/` symlinking into it rather than holding a second copy.
+That directory is what `sdrs unclip --model` is pointed at, so it is built in
+the layout the pipeline reads rather than converted twice. The `.bin` sources
+are downloaded outside the shared HuggingFace cache and deleted as each is
+converted; holding both forms at once is 15 GB.
+
+`unclip_prior` does the same for the **text-to-image** checkpoint, into
+`models/unclip-t2i`. That is a second directory rather than an addition to the
+first because `-t2i-l` shares only its *prior* with the image-variation model —
+its UNet, VAE and text encoder all differ by sha256. Use `-t2i-l` and not
+`-t2i-h`: the latter pairs a 768-wide prior with a 1024-wide image half and
+cannot run at all.
+
 ## Running the tests
 
 ```bash
@@ -49,6 +66,7 @@ Do not guess a bound. Measure what the reference does against *itself*:
 ```bash
 python3 xtask/golden/reference_precision.py unet
 python3 xtask/golden/reference_precision.py vae
+python3 xtask/golden/reference_precision.py unclip
 ```
 
 That runs the same diffusers module in float32 and in float64 on identical
@@ -62,6 +80,10 @@ rather than this port. Measured:
 | `down_11` | 19.219 | 1.083e-4 | 5.636e-6 |
 | `encoder_moments` | 18.063 | 7.751e-5 | 4.291e-6 |
 | `output` (UNet) | 3.889 | 9.700e-6 | 2.494e-6 |
+| `augmented_0` (unCLIP) | 4.101 | 6.391e-6 | 1.558e-6 |
+| `augmented_250` (unCLIP) | 4.479 | 3.290e-7 | 7.345e-8 |
+| `level_sinusoid` (unCLIP) | 1.000 | 1.020e-5 | 1.020e-5 |
+| `unet_output` (unCLIP) | 1.901 | 2.757e-4 | 1.450e-4 |
 
 **`mid_output` cannot be held to `atol = 1e-4`: diffusers misses that against
 its own f64 by 1.108e-4.** That bound passed only because candle happened to
@@ -76,6 +98,23 @@ result, checked by perturbing the reference: passes at 0.1% (that is `rtol`),
 fails at 0.2% and above, against a measured noise floor of 0.0007%. Real
 porting bugs are far past that — the VAE's asymmetric-padding bug showed
 17.32.
+
+**The unCLIP rows carry their own lesson: make sure the f64 run is actually
+f64.** Two things in that path silently stayed float32 — the DDPM schedule,
+whose constants diffusers builds once in f32 and hands to both runs, and
+`get_timestep_embedding`, which hardcodes `dtype=torch.float32` inside. The
+first measurement therefore compared f32 against f32, reported a floor of
+2.652e-07, and condemned a correct implementation. Recomputing both at the
+requested precision gives the numbers above.
+
+They also show why the floor is nowhere near uniform. `augmented_0` is twenty
+times noisier than `augmented_250` because the augmentation mixes in
+`sqrt(1 - alpha)` and, near the top of the ladder, `alpha` is within 4e-5 of
+one — so an absolute 2e-8 difference in the schedule is a *relative* 5e-4 one
+after the subtraction. And `level_sinusoid` is the worst of the three despite
+peaking at 1.0, because its argument reaches the noise level itself and
+rounding the frequency to f32 costs `250 * 6e-8` there, which `cos` passes
+through undamped. Neither is visible from the neighbouring row.
 
 ControlNet is compared correction by correction — twelve for the skips plus
 one for the mid block — rather than as a single tensor. It has no image of its

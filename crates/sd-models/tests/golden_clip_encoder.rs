@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use sd_models::clip::{ClipTextConfig, ClipTextEncoder};
 use sd_tensor::nn::{VarBuilder, VarMap};
-use sd_tensor::{testing, DType, Device, Tensor};
+use sd_tensor::{testing, DType, Device, IndexOp, Tensor};
 
 fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/clip_encoder")
@@ -97,6 +97,60 @@ fn encoder_output_shape_is_batch_77_768() {
         let out = encoder.forward(&ids).expect("forward");
         assert_eq!(out.dims(), &[batch, 77, cfg.hidden_size]);
     }
+}
+
+#[test]
+fn pooling_takes_the_first_eos_not_the_last() {
+    // The bug this pins cost real output quality and no test caught it.
+    //
+    // SD 1.5's tokenizer **pads with EOS**, so a short prompt leaves dozens of
+    // copies of the highest id. `transformers` locates the pooled position
+    // with `argmax`, which takes the first; Rust's `max_by_key` takes the
+    // last, and that is what this used to do — so Flux's pooled conditioning,
+    // SD 3's CLIP-L half and GLIGEN's phrase embeddings were all reading the
+    // final padding slot instead of the end of the prompt.
+    //
+    // It survived because the one golden test that covers pooling is SDXL's
+    // second encoder, whose tokenizer pads with `!` — leaving exactly one
+    // maximum, where the two rules agree. Structural rather than golden, so
+    // it runs without reference data and cannot regress silently again.
+    let dev = Device::Cpu;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+    let cfg = tiny_config();
+    let encoder = ClipTextEncoder::new(&cfg, vb).expect("encoder builds");
+
+    // [bos, word, eos, eos, ...] — the shape every padded CLIP prompt has.
+    let eos = (cfg.vocab_size - 1) as u32;
+    let mut ids = vec![eos; 77];
+    ids[0] = 1;
+    ids[1] = 2;
+    let ids = Tensor::from_vec(ids, (1, 77), &dev).expect("ids");
+
+    let hidden = encoder.forward(&ids).expect("forward");
+    let pooled = encoder.pooled_hidden(&ids).expect("pooled");
+    let row = |i: usize| {
+        hidden
+            .i(0)
+            .unwrap()
+            .narrow(0, i, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let got = pooled.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(
+        got,
+        row(2),
+        "pooling must take the first EOS, at position 2"
+    );
+    assert_ne!(
+        got,
+        row(76),
+        "pooling took the last padding position, not the end of the prompt"
+    );
 }
 
 #[test]

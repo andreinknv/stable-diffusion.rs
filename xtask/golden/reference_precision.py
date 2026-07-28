@@ -141,6 +141,126 @@ def unet(model_id):
     )
 
 
+def unclip(model_id):
+    """unCLIP's two new tensors: the augmented embedding and the UNet under it.
+
+    Worth measuring separately from the plain UNet because the class embedding
+    enters through a 2048-wide projection added into `temb`, and `temb` is
+    consumed by every resnet in the model -- so whatever noise the augmentation
+    carries is multiplied through the whole stack rather than appearing once.
+    """
+    import math
+
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import DDPMScheduler, UNet2DConditionModel
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_unclip_img2img import (
+        StableUnCLIPImg2ImgPipeline,
+    )
+    from diffusers.pipelines.stable_diffusion.stable_unclip_image_normalizer import (
+        StableUnCLIPImageNormalizer,
+    )
+
+    # Read rather than assumed: the image-variation checkpoint is 1024 wide and
+    # the text-to-image one is 768, and running this at the wrong width
+    # measures a floor for a model that does not exist.
+    import json as _json
+    import pathlib as _pathlib
+
+    width = 1024
+    local = _pathlib.Path(model_id) / "image_normalizer" / "config.json"
+    if local.exists():
+        width = _json.loads(local.read_text())["embedding_dim"]
+    print(f"measuring at an embedding width of {width}")
+
+    gen = torch.Generator().manual_seed(SEED)
+    embeds = torch.randn(1, width, generator=gen)
+    noise = torch.randn(1, width, generator=gen)
+    sample = torch.randn(1, 4, 32, 32, generator=gen)
+    timestep = torch.tensor([500.0])
+    context = torch.randn(1, 77, 1024, generator=gen)
+
+    def cosine_alphas(dtype, n=1000, max_beta=0.999):
+        """`squaredcos_cap_v2`, at whichever precision is asked for.
+
+        diffusers builds this in float32 unconditionally, so casting its result
+        to f64 would measure the *computation* against a fixed set of constants
+        and report a floor that is far too low. The augmentation mixes in
+        `sqrt(1 - alpha)`, and near the top of the ladder `alpha` is within 4e-5
+        of one -- so an absolute 2e-8 difference in `alpha` is a *relative* 5e-4
+        one in `1 - alpha`, and four orders of magnitude of that lands in the
+        output. Recomputing at both precisions is the only way to see it.
+        """
+
+        def alpha_bar(t):
+            return math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+
+        betas = [
+            min(1 - alpha_bar((i + 1) / n) / alpha_bar(i / n), max_beta) for i in range(n)
+        ]
+        return torch.cumprod(1.0 - torch.tensor(betas, dtype=dtype), dim=0)
+
+    def sinusoid(level, dim, dtype):
+        """The noise level's own embedding, at whichever precision is asked for.
+
+        `get_timestep_embedding` hardcodes float32 internally, so this is the
+        formula rather than a call to it -- otherwise the f64 run would return
+        f32 numbers and report a floor of zero.
+        """
+        half = dim // 2
+        exponent = torch.arange(0, half, dtype=dtype) * (-math.log(10000.0) / half)
+        args = torch.tensor([float(level)], dtype=dtype)[:, None] * exponent.exp()[None, :]
+        return torch.cat([args.cos(), args.sin()], dim=-1)
+
+    results = {}
+    for dtype in (torch.float32, torch.float64):
+        print(f"running the reference unCLIP UNet in {dtype}")
+        normalizer = StableUnCLIPImageNormalizer.from_pretrained(
+            model_id, subfolder="image_normalizer", torch_dtype=torch.float32
+        ).to(dtype).eval()
+        noising = DDPMScheduler.from_pretrained(model_id, subfolder="image_noising_scheduler")
+        noising.alphas_cumprod = cosine_alphas(dtype)
+        stub = argparse.Namespace(image_normalizer=normalizer, image_noising_scheduler=noising)
+        with torch.no_grad():
+            augmented = StableUnCLIPImg2ImgPipeline.noise_image_embeddings(
+                stub, image_embeds=embeds.to(dtype), noise_level=250, noise=noise.to(dtype)
+            )
+        # Levels 0 and 250 diverge for different reasons and by different
+        # amounts, so both are reported: 0 is where `1 - alpha` cancels worst
+        # and 250 is where the sinusoid's argument is largest.
+        with torch.no_grad():
+            augmented_0 = StableUnCLIPImg2ImgPipeline.noise_image_embeddings(
+                stub, image_embeds=embeds.to(dtype), noise_level=0, noise=noise.to(dtype)
+            )
+
+        net = UNet2DConditionModel.from_pretrained(
+            model_id, subfolder="unet", torch_dtype=torch.float32
+        ).to(dtype).eval()
+        with torch.no_grad():
+            out = net(
+                sample.to(dtype),
+                timestep.to(dtype),
+                encoder_hidden_states=context.to(dtype),
+                class_labels=augmented,
+            ).sample
+        results[dtype] = {
+            "augmented_0": augmented_0.detach().contiguous().clone(),
+            "augmented_250": augmented.detach().contiguous().clone(),
+            "level_sinusoid": sinusoid(250, width, dtype),
+            "unet_output": out.detach().contiguous().clone(),
+        }
+        del net, normalizer
+
+    f32, f64 = results[torch.float32], results[torch.float64]
+    print("\nreference f32 against its own f64, same weights and inputs:")
+    for name in f64:
+        report(name, spread(f32[name], f64[name]))
+    print(
+        "\nA tolerance below these numbers is measuring float32, not the port.\n"
+        "Quote them where the tolerance is set."
+    )
+
+
 def vae(model_id):
     torch = _require("torch")
     _require("diffusers")
@@ -219,7 +339,7 @@ def taesd(_model_id):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("component", choices=["unet", "vae", "taesd"])
+    ap.add_argument("component", choices=["unet", "vae", "taesd", "unclip"])
     ap.add_argument(
         "--model-id", default="stable-diffusion-v1-5/stable-diffusion-v1-5"
     )
@@ -230,6 +350,14 @@ def main():
         vae(args.model_id)
     elif args.component == "taesd":
         taesd(args.model_id)
+    elif args.component == "unclip":
+        # Defaults to the converted directory rather than the hub: the
+        # published checkpoint is pickled, and this must measure the file the
+        # golden test's weights actually came from.
+        model_id = args.model_id
+        if model_id == "stable-diffusion-v1-5/stable-diffusion-v1-5":
+            model_id = "models/unclip"
+        unclip(model_id)
 
 
 if __name__ == "__main__":

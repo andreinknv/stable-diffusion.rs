@@ -17,7 +17,7 @@ pub use txt2img::{
     sigma_to_timestep, AreaConfig, Cancel, Conditioning, Control, ControlConfig, GroundedBox,
     GroundingConfig, HiresConfig, Img2ImgConfig, InpaintConfig, InstructConfig, PipelineError,
     Prediction, Progress, ProgressFn, Region, SamplerKind, Strength, Txt2ImgConfig,
-    Txt2ImgPipeline, Upscale,
+    Txt2ImgPipeline, UnclipConfig, Upscale,
 };
 
 /// Whichever decoder a pipeline is using.

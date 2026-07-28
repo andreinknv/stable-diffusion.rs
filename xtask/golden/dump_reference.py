@@ -30,6 +30,7 @@ import os
 import pathlib
 import shutil
 import sys
+import time
 
 SEED = 0
 LATENT_SHAPE = (1, 4, 32, 32)  # -> 256x256 image, small enough to commit
@@ -1433,6 +1434,495 @@ def dump_gligen(output: pathlib.Path, model_id: str) -> None:
     print(f"converted {len(state)} tensors")
 
 
+# One entry per component of the unCLIP checkpoint: (subfolder, published
+# name, the name the diffusers layout wants once converted).
+#
+# Every one ships as a pickled `.bin` -- this repository publishes nothing else
+# -- so the whole checkpoint has to be converted before Rust can read any of it.
+UNCLIP_COMPONENTS = [
+    ("unet", "diffusion_pytorch_model.bin", "diffusion_pytorch_model.safetensors"),
+    ("vae", "diffusion_pytorch_model.bin", "diffusion_pytorch_model.safetensors"),
+    ("text_encoder", "pytorch_model.bin", "model.safetensors"),
+    ("image_encoder", "pytorch_model.bin", "model.safetensors"),
+    ("image_normalizer", "diffusion_pytorch_model.bin", "diffusion_pytorch_model.safetensors"),
+]
+
+# Fetched alongside the weights so the converted directory is a *complete*
+# diffusers checkpoint: `from_pretrained` reads these, and so does the Rust
+# side's prediction-type detection.
+UNCLIP_CONFIGS = [
+    ("unet", "config.json"),
+    ("vae", "config.json"),
+    ("text_encoder", "config.json"),
+    ("image_encoder", "config.json"),
+    ("image_normalizer", "config.json"),
+    ("scheduler", "scheduler_config.json"),
+    ("image_noising_scheduler", "scheduler_config.json"),
+    ("feature_extractor", "preprocessor_config.json"),
+]
+
+
+def _convert_pickled(model_id: str, subfolder: str, source: str, dest: pathlib.Path) -> int:
+    """Download one pickled `.bin` and rewrite it as f32 safetensors.
+
+    The source is downloaded outside the shared HuggingFace cache and deleted
+    **before the safetensors file is written**, not after. That is not
+    tidiness: the whole checkpoint is 7.7 GB of `.bin` and 7.7 GB of
+    safetensors, and the machine this was written on had 11 GB spare. Unlinking
+    after `torch.load` -- by which point the weights are in memory -- means
+    peak disk is one copy rather than two. The download is the thing at risk if
+    `save_file` then fails, and a download is cheap to repeat.
+    """
+    torch = _require("torch")
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import save_file
+
+    if dest.exists():
+        print(f"  {subfolder}: already converted")
+        return 0
+
+    staging = dest.parent / ".staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    print(f"  {subfolder}: downloading {source}")
+    # Retried with backoff because the Hub rate-limits (429) a session that has
+    # pulled several multi-gigabyte files, and losing a 4 GB download to a
+    # transient refusal is a bad trade for four lines.
+    src = None
+    for attempt in range(6):
+        try:
+            src = hf_hub_download(
+                repo_id=model_id, filename=f"{subfolder}/{source}", local_dir=str(staging)
+            )
+            break
+        except Exception as e:  # noqa: BLE001 - the hub raises several types
+            if attempt == 5:
+                raise
+            delay = 30 * (attempt + 1)
+            print(f"  {subfolder}: {type(e).__name__}, retrying in {delay}s")
+            time.sleep(delay)
+    state = torch.load(src, map_location="cpu", weights_only=True)
+    state = {k: v.contiguous().float() for k, v in state.items()}
+    pathlib.Path(src).unlink()
+    shutil.rmtree(staging, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    save_file(state, str(dest))
+    count = len(state)
+    del state
+    print(f"  {subfolder}: {count} tensors -> {dest.name}")
+    return count
+
+
+def dump_unclip(output: pathlib.Path, model_id: str) -> None:
+    """unCLIP: conditioning on a CLIP *image* embedding.
+
+    Three references, and they answer different questions:
+
+    - `noised_*` is the augmentation in isolation -- normalise, add DDPM noise
+      at a chosen level, un-normalise, then append the level's own sinusoid.
+      Every step of that is arithmetic on a 1024-vector with no shape to check
+      it, so it is dumped at two noise levels and compared directly.
+    - `image_embeds` pins that this checkpoint's ViT-H loads into the existing
+      vision tower.
+    - `unet_out` is the whole UNet with `class_labels`. That is the one that
+      matters: the projected embedding is *added into the timestep embedding*,
+      so dropping it, projecting it wrong, or adding it in the wrong place all
+      run and all return a tensor of exactly the right shape.
+
+    `unet_out_zero` is the guidance batch's unconditional row -- zeros, not an
+    absent argument -- and doubles as the control that says the class path
+    changes anything at all.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    _require("transformers")
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import save_file
+
+    out = output / "unclip"
+    out.mkdir(parents=True, exist_ok=True)
+    # The converted checkpoint is a model directory, not a bag of tensors: it
+    # is what `sdrs unclip --model` is pointed at, so it is laid out that way
+    # from the start rather than assembled by hand afterwards.
+    models = pathlib.Path("models") / "unclip"
+
+    total = 0
+    for subfolder, source, dest_name in UNCLIP_COMPONENTS:
+        total += _convert_pickled(model_id, subfolder, source, models / subfolder / dest_name)
+    for subfolder, name in UNCLIP_CONFIGS:
+        target = models / subfolder / name
+        if target.exists():
+            continue
+        src = hf_hub_download(repo_id=model_id, filename=f"{subfolder}/{name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target)
+
+    # The repository ships the slow tokenizer (vocab.json + merges.txt) and the
+    # Rust side reads `tokenizer.json`. Converting the checkpoint's own rather
+    # than borrowing SD 1.5's keeps the model directory self-contained.
+    from transformers import CLIPTokenizerFast
+
+    tok_dir = models / "tokenizer"
+    if not (tok_dir / "tokenizer.json").exists():
+        tok_dir.mkdir(parents=True, exist_ok=True)
+        CLIPTokenizerFast.from_pretrained(model_id, subfolder="tokenizer").save_pretrained(
+            str(tok_dir)
+        )
+
+    print(f"converted {total} tensors into {models}")
+
+    from diffusers import UNet2DConditionModel
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_unclip_img2img import (
+        StableUnCLIPImg2ImgPipeline,
+    )
+    from diffusers.pipelines.stable_diffusion.stable_unclip_image_normalizer import (
+        StableUnCLIPImageNormalizer,
+    )
+    from diffusers import DDPMScheduler
+    from transformers import CLIPVisionModelWithProjection
+
+    # Loaded from the converted directory, not from the hub: when a checkpoint
+    # exists in two forms, the reference has to come from the one Rust reads.
+    encoder = CLIPVisionModelWithProjection.from_pretrained(
+        str(models), subfolder="image_encoder", torch_dtype=torch.float32
+    ).eval()
+    normalizer = StableUnCLIPImageNormalizer.from_pretrained(
+        str(models), subfolder="image_normalizer", torch_dtype=torch.float32
+    ).eval()
+    noising = DDPMScheduler.from_pretrained(str(models), subfolder="image_noising_scheduler")
+    print(f"  noising schedule: {noising.config.beta_schedule}, {noising.config.num_train_timesteps}")
+
+    gen = torch.Generator().manual_seed(SEED)
+    # Already CLIP-normalised, like the vision-tower reference: preprocessing is
+    # compared separately rather than folded in here.
+    pixels = torch.randn(1, 3, 224, 224, generator=gen)
+    with torch.no_grad():
+        image_embeds = encoder(pixels).image_embeds
+
+    # `noise_image_embeddings` is an instance method that touches exactly two
+    # attributes, so it runs against a stand-in -- which means the published
+    # implementation is what produced these numbers, not a paraphrase of it.
+    stub = argparse.Namespace(image_normalizer=normalizer, image_noising_scheduler=noising)
+    noise = torch.randn(1, 1024, generator=gen)
+
+    tensors = {
+        "pixels": pixels.contiguous(),
+        "image_embeds": image_embeds.detach().contiguous().clone(),
+        "noise": noise.contiguous(),
+    }
+    levels = (0, 250)
+    for level in levels:
+        with torch.no_grad():
+            noised = StableUnCLIPImg2ImgPipeline.noise_image_embeddings(
+                stub, image_embeds=image_embeds, noise_level=level, noise=noise
+            )
+        tensors[f"noised_{level}"] = noised.detach().contiguous().clone()
+
+    unet = UNet2DConditionModel.from_pretrained(
+        str(models), subfolder="unet", torch_dtype=torch.float32
+    ).eval()
+    print(
+        f"  class_embed_type {unet.config.class_embed_type}, "
+        f"input dim {unet.config.projection_class_embeddings_input_dim}"
+    )
+
+    gen2 = torch.Generator().manual_seed(SEED + 2)
+    sample = torch.randn(*LATENT_SHAPE, generator=gen2)
+    timestep = torch.tensor([500.0])
+    text = torch.randn(1, 77, 1024, generator=gen2)
+    class_labels = tensors["noised_250"]
+    with torch.no_grad():
+        conditioned = unet(
+            sample, timestep, encoder_hidden_states=text, class_labels=class_labels
+        ).sample
+        unconditioned = unet(
+            sample, timestep, encoder_hidden_states=text, class_labels=torch.zeros_like(class_labels)
+        ).sample
+
+    tensors["unet_sample"] = sample.contiguous()
+    tensors["unet_timestep"] = timestep.contiguous()
+    tensors["unet_text"] = text.contiguous()
+    tensors["unet_out"] = conditioned.detach().contiguous().clone()
+    tensors["unet_out_zero"] = unconditioned.detach().contiguous().clone()
+
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    # One fixed path per weight file for the test, pointing at the model
+    # directory rather than duplicating 7.7 GB.
+    for subfolder, _, dest_name in UNCLIP_COMPONENTS:
+        link = out / f"{subfolder}.safetensors"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to((models / subfolder / dest_name).resolve())
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<16} {tuple(v.shape)}")
+    spread = (tensors["unet_out"] - tensors["unet_out_zero"]).abs().max().item()
+    print(f"\nclass conditioning moves the output by up to {spread:.4f}")
+
+
+UNCLIP_PRIOR_COMPONENTS = [
+    ("prior", "diffusion_pytorch_model.bin", "diffusion_pytorch_model.safetensors"),
+    ("prior_text_encoder", "pytorch_model.bin", "model.safetensors"),
+    # The image half again, because the text-to-image checkpoint's is *not*
+    # the image-variation one -- see the note in `dump_unclip_prior`.
+    ("unet", "diffusion_pytorch_model.bin", "diffusion_pytorch_model.safetensors"),
+    ("vae", "diffusion_pytorch_model.bin", "diffusion_pytorch_model.safetensors"),
+    ("text_encoder", "pytorch_model.bin", "model.safetensors"),
+    ("image_normalizer", "diffusion_pytorch_model.bin", "diffusion_pytorch_model.safetensors"),
+]
+
+UNCLIP_PRIOR_CONFIGS = [
+    ("prior", "config.json"),
+    ("prior_text_encoder", "config.json"),
+    ("prior_scheduler", "scheduler_config.json"),
+    ("unet", "config.json"),
+    ("vae", "config.json"),
+    ("text_encoder", "config.json"),
+    ("image_normalizer", "config.json"),
+    ("scheduler", "scheduler_config.json"),
+    ("image_noising_scheduler", "scheduler_config.json"),
+]
+
+
+def dump_unclip_prior(output: pathlib.Path, model_id: str) -> None:
+    """unCLIP's prior: the model that invents an image embedding from text.
+
+    # Why `-t2i-l` and not `-t2i-h`
+
+    **`diffusers/stable-diffusion-2-1-unclip-t2i-h` cannot work.** Its prior is
+    Karlo's, which emits a 768-wide ViT-L embedding, while its image half is
+    the ViT-H one: `image_normalizer` is 1024 wide and the UNet's
+    `projection_class_embeddings_input_dim` is 2048, being twice that. The two
+    halves cannot be connected, and the mismatch is in the published configs
+    rather than anything this port does. `-t2i-l` is the consistent pairing --
+    768 throughout, and a UNet whose class projection takes 1536.
+
+    That is also why this writes `models/unclip-t2i` rather than adding to
+    `models/unclip`. The image-variation checkpoint and this one share their
+    *prior* (byte-identical between the two `t2i` mirrors) but **not** their
+    UNet, VAE or text encoder, all three of which differ by sha256. One
+    directory cannot hold both.
+
+    Three references:
+
+    - `prior_out` is the transformer itself, with a **partially masked** text
+      sequence. The mask matters and is easy to skip: SD ignores CLIP's
+      attention mask everywhere else in this project, and this is the one
+      place that does not.
+    - `text_embeds` / `text_hidden` pin the prior's own text encoder, which is
+      SD 1.5's tower plus a projection head.
+    - `stepped` is one DDPM step at `prediction_type="sample"`, which is a
+      shape of sampler this project has none of: every other one here is
+      sigma-based and predicts noise.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    _require("transformers")
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import save_file
+
+    out = output / "unclip"
+    out.mkdir(parents=True, exist_ok=True)
+    models = pathlib.Path("models") / "unclip-t2i"
+
+    total = 0
+    for subfolder, source, dest_name in UNCLIP_PRIOR_COMPONENTS:
+        total += _convert_pickled(model_id, subfolder, source, models / subfolder / dest_name)
+    for subfolder, name in UNCLIP_PRIOR_CONFIGS:
+        target = models / subfolder / name
+        if target.exists():
+            continue
+        src = hf_hub_download(repo_id=model_id, filename=f"{subfolder}/{name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target)
+
+    from transformers import CLIPTokenizerFast
+
+    for sub in ("prior_tokenizer", "tokenizer"):
+        tok_dir = models / sub
+        if not (tok_dir / "tokenizer.json").exists():
+            tok_dir.mkdir(parents=True, exist_ok=True)
+            CLIPTokenizerFast.from_pretrained(model_id, subfolder=sub).save_pretrained(
+                str(tok_dir)
+            )
+    print(f"converted {total} tensors into {models}")
+
+    from diffusers import DDPMScheduler, PriorTransformer
+    from transformers import CLIPTextModelWithProjection, CLIPTokenizer
+
+    prior = PriorTransformer.from_pretrained(
+        str(models), subfolder="prior", torch_dtype=torch.float32
+    ).eval()
+    cfg = prior.config
+    print(
+        f"  prior: {cfg.num_layers} layers, {cfg.num_attention_heads} heads x "
+        f"{cfg.attention_head_dim}, embedding {cfg.embedding_dim}, "
+        f"{cfg.num_embeddings} + {cfg.additional_embeddings} tokens"
+    )
+
+    encoder = CLIPTextModelWithProjection.from_pretrained(
+        str(models), subfolder="prior_text_encoder", torch_dtype=torch.float32
+    ).eval()
+    tokenizer = CLIPTokenizer.from_pretrained(str(models), subfolder="prior_tokenizer")
+
+    prompt = "a photograph of a crab on a beach"
+    tokens = tokenizer(
+        prompt, padding="max_length", max_length=tokenizer.model_max_length,
+        truncation=True, return_tensors="pt",
+    )
+    with torch.no_grad():
+        encoded = encoder(tokens.input_ids)
+    text_embeds = encoded.text_embeds
+    text_hidden = encoded.last_hidden_state
+    mask = tokens.attention_mask
+    print(f"  prompt occupies {int(mask.sum().item())} of {mask.shape[1]} positions")
+
+    gen = torch.Generator().manual_seed(SEED)
+    latents = torch.randn(1, cfg.embedding_dim, generator=gen)
+    timestep = torch.tensor([500])
+    with torch.no_grad():
+        predicted = prior(
+            latents,
+            timestep=timestep,
+            proj_embedding=text_embeds,
+            encoder_hidden_states=text_hidden,
+            attention_mask=mask.bool(),
+        ).predicted_image_embedding
+        # And again with every position unmasked, so a port that ignores the
+        # mask disagrees on one of the two rather than passing both.
+        unmasked = prior(
+            latents,
+            timestep=timestep,
+            proj_embedding=text_embeds,
+            encoder_hidden_states=text_hidden,
+            attention_mask=torch.ones_like(mask).bool(),
+        ).predicted_image_embedding
+
+    scheduler = DDPMScheduler.from_pretrained(str(models), subfolder="prior_scheduler")
+    print(
+        f"  prior scheduler: {scheduler.config.beta_schedule}, "
+        f"prediction {scheduler.config.prediction_type}, "
+        f"variance {scheduler.config.variance_type}, "
+        f"clip {scheduler.config.clip_sample} at {scheduler.config.clip_sample_range}"
+    )
+    scheduler.set_timesteps(25)
+    # `DDPMScheduler.step` draws its own noise and takes no `variance_noise`,
+    # so the draw is pinned by replacing the function it calls. The published
+    # `step` then runs verbatim -- this is the same trick the augmentation
+    # reference uses, and it beats transcribing the arithmetic into the dumper
+    # and comparing the port against that.
+    import diffusers.schedulers.scheduling_ddpm as ddpm_mod
+
+    step_noise = torch.randn(1, cfg.embedding_dim, generator=gen)
+    original_randn = ddpm_mod.randn_tensor
+    ddpm_mod.randn_tensor = lambda shape, **kw: step_noise.clone()
+    try:
+        with torch.no_grad():
+            # A step at a *listed* timestep, so the reference exercises the
+            # same previous-timestep lookup a real run does, and one at the
+            # final timestep, where no variance is added at all.
+            t = int(scheduler.timesteps[3])
+            stepped = scheduler.step(predicted, t, latents).prev_sample
+            t_final = int(scheduler.timesteps[-1])
+            stepped_final = scheduler.step(predicted, t_final, latents).prev_sample
+    finally:
+        ddpm_mod.randn_tensor = original_randn
+
+    # The standard deviations the port has to reproduce, straight from
+    # `_get_variance`. `fixed_small_log` returns the *deviation*, not the
+    # variance, which `step` then multiplies by the noise with no further
+    # square root -- so a port that squares or roots it once more is wrong by
+    # exactly that and still produces a plausible embedding.
+    probe_timesteps = [int(x) for x in scheduler.timesteps[:4]] + [int(scheduler.timesteps[-1])]
+    stds = torch.tensor(
+        [float(scheduler._get_variance(t)) for t in probe_timesteps[:-1]] + [0.0]
+    )
+
+    tensors = {
+        "prior_tokens": tokens.input_ids.to(torch.int64).contiguous(),
+        "prior_mask": mask.to(torch.int64).contiguous(),
+        "text_embeds": text_embeds.detach().contiguous().clone(),
+        "text_hidden": text_hidden.detach().contiguous().clone(),
+        "prior_latents": latents.contiguous(),
+        "prior_out": predicted.detach().contiguous().clone(),
+        "prior_out_unmasked": unmasked.detach().contiguous().clone(),
+        "prior_timesteps": scheduler.timesteps.to(torch.int64).contiguous(),
+        "step_timestep": torch.tensor([t], dtype=torch.int64),
+        "step_timestep_final": torch.tensor([t_final], dtype=torch.int64),
+        "step_noise": step_noise.contiguous(),
+        "stepped": stepped.detach().contiguous().clone(),
+        "stepped_final": stepped_final.detach().contiguous().clone(),
+        "probe_timesteps": torch.tensor(probe_timesteps, dtype=torch.int64),
+        "probe_stds": stds.contiguous(),
+        "clip_mean": prior.clip_mean.detach().contiguous().clone(),
+        "clip_std": prior.clip_std.detach().contiguous().clone(),
+    }
+    # And the join: the prior's output, augmented, through this checkpoint's
+    # own UNet. That is the only reference that says the two halves connect --
+    # the widths are what `-t2i-h` gets wrong, and everything up to here would
+    # pass on that broken pairing too.
+    from diffusers import UNet2DConditionModel
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_unclip_img2img import (
+        StableUnCLIPImg2ImgPipeline,
+    )
+    from diffusers.pipelines.stable_diffusion.stable_unclip_image_normalizer import (
+        StableUnCLIPImageNormalizer,
+    )
+
+    normalizer = StableUnCLIPImageNormalizer.from_pretrained(
+        str(models), subfolder="image_normalizer", torch_dtype=torch.float32
+    ).eval()
+    noising = DDPMScheduler.from_pretrained(str(models), subfolder="image_noising_scheduler")
+    stub = argparse.Namespace(image_normalizer=normalizer, image_noising_scheduler=noising)
+    image_embeds = prior.post_process_latents(predicted)
+    aug_noise = torch.randn(1, cfg.embedding_dim, generator=gen)
+    with torch.no_grad():
+        class_labels = StableUnCLIPImg2ImgPipeline.noise_image_embeddings(
+            stub, image_embeds=image_embeds, noise_level=0, noise=aug_noise
+        )
+
+    unet = UNet2DConditionModel.from_pretrained(
+        str(models), subfolder="unet", torch_dtype=torch.float32
+    ).eval()
+    print(
+        f"  t2i unet class dim {unet.config.projection_class_embeddings_input_dim} "
+        f"against a {cfg.embedding_dim}-wide prior"
+    )
+    gen2 = torch.Generator().manual_seed(SEED + 2)
+    sample = torch.randn(*LATENT_SHAPE, generator=gen2)
+    unet_timestep = torch.tensor([500.0])
+    text = torch.randn(1, 77, unet.config.cross_attention_dim, generator=gen2)
+    with torch.no_grad():
+        t2i_out = unet(
+            sample, unet_timestep, encoder_hidden_states=text, class_labels=class_labels
+        ).sample
+
+    tensors["image_embeds"] = image_embeds.detach().contiguous().clone()
+    tensors["aug_noise"] = aug_noise.contiguous()
+    tensors["class_labels"] = class_labels.detach().contiguous().clone()
+    tensors["t2i_unet_sample"] = sample.contiguous()
+    tensors["t2i_unet_timestep"] = unet_timestep.contiguous()
+    tensors["t2i_unet_text"] = text.contiguous()
+    tensors["t2i_unet_out"] = t2i_out.detach().contiguous().clone()
+
+    save_file(tensors, str(out / "prior_reference.safetensors"))
+
+    for subfolder, _, dest_name in UNCLIP_PRIOR_COMPONENTS:
+        link = out / f"t2i_{subfolder}.safetensors"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to((models / subfolder / dest_name).resolve())
+
+    print(f"\nwrote {out / 'prior_reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<18} {tuple(v.shape)}")
+    moved = (tensors["prior_out"] - tensors["prior_out_unmasked"]).abs().max().item()
+    print(f"\nthe attention mask moves the prediction by {moved:.4f}")
+
+
 SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
 
 
@@ -1819,6 +2309,16 @@ def main() -> None:
     )
     sdxlu.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    uc = sub.add_parser("unclip", help="dump unCLIP image-conditioning references")
+    uc.add_argument("--model-id", default="diffusers/stable-diffusion-2-1-unclip-i2i-h")
+    uc.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
+    ucp = sub.add_parser("unclip_prior", help="dump unCLIP text-to-image prior references")
+    # `-t2i-l`, not `-t2i-h`: the latter pairs a 768-wide prior with a
+    # 1024-wide image half and cannot run. See `dump_unclip_prior`.
+    ucp.add_argument("--model-id", default="diffusers/stable-diffusion-2-1-unclip-t2i-l")
+    ucp.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     gg = sub.add_parser("gguf", help="link small real GGUF files for the header tests")
     gg.add_argument("--model-id", default="", help="unused")
     gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -1826,6 +2326,10 @@ def main() -> None:
     args = ap.parse_args()
     if args.component == "gligen":
         dump_gligen(args.output, args.model_id)
+    elif args.component == "unclip":
+        dump_unclip(args.output, args.model_id)
+    elif args.component == "unclip_prior":
+        dump_unclip_prior(args.output, args.model_id)
     elif args.component == "motion":
         dump_motion(args.output, args.model_id)
     elif args.component == "ip_adapter":
