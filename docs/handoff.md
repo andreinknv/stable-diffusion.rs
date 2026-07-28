@@ -28,9 +28,30 @@ mattered:
 6. **Check free memory before a large run.** Metal allocations are wired; an
    oversized one takes the machine, not the process.
 
+## What this project does today
+
+Every capability below is verified against `diffusers`/`transformers` with a
+recorded number. **337 tests, all gates green**, plus 5 GPU smoke tests behind the `metal`
+feature (`cargo test --features metal --test metal_smoke`) — they are not in
+the default count because a machine without a GPU cannot run them.
+
+| | |
+|---|---|
+| **Architectures** | SD 1.5, SD 2.x, SDXL, SD 3.5, Flux (schnell, mini) |
+| **Conditioning** | LoRA (dense *and* quantised), ControlNet (several at once), IP-Adapter, GLIGEN boxes, textual inversion, area/regional prompts, per-step conditioning |
+| **Editing** | img2img, inpainting, InstructPix2Pix |
+| **Animation** | AnimateDiff motion modules, frame batching, explicit latent in/out |
+| **Output** | TAESD (4 variants), tiled VAE decode, ESRGAN 4x, two-pass hires, seamless tiling |
+| **Runtime** | Metal + CPU, GGUF quantisation, block streaming, step previews, cancellation, determinism, checkpoint merging |
+| **Formats** | safetensors, GGUF, pickled `.bin` (converted by the dumper) |
+
+Three integration issues drove most of this. **#1 and #2 are closed**; **#3 is
+eight of nine**, with unCLIP the only capability outstanding and video/audio/3D
+explicitly out of scope by the author's own ranking.
+
 ## Where things stand
 
-Four architectures render, and **Metal now produces the right image for every
+Five architectures render, and **Metal produces the right image for every
 one that fits** — the Flux corruption is fixed (see the trap on storage
 offsets below). Metal is 6-9x faster across the board, so it is now the
 sensible default rather than a broken option.
@@ -851,6 +872,26 @@ that is pinned by tests instead.
 
 In priority order. Struck-through items are done and kept for their reasoning.
 
+### ~~1. A Metal smoke test~~ — done
+
+`tests/metal_smoke.rs`, gated on the `metal` feature. One forward per
+architecture on the GPU, asserting only that it loads, runs, and returns
+finite non-flat values — correctness stays the golden suite's job.
+
+It earned its place on the first run by catching a real bug: `Txt2ImgPipeline::run`
+on an InstructPix2Pix checkpoint failed with `in_channel mismatch between input
+(4, groups 1) and kernel (8)` from deep inside a convolution. That is now
+`PipelineError::NeedsInstruct`, which names the fix.
+
+Two things worth keeping about how it is written:
+
+- **A memory refusal skips, it does not fail.** "This machine is busy" and
+  "this model is broken on the GPU" are different answers, and a smoke test
+  that goes red when something else is running teaches people to ignore it.
+- **`the_smoke_list_covers_what_the_repo_links` fails if a model directory is
+  linked but not exercised**, so adding an architecture without adding GPU
+  coverage is caught rather than remembered.
+
 ### 1. unCLIP — image-embedding conditioning
 
 Ready to start: `stabilityai/stable-diffusion-2-1-unclip` is gated, but
@@ -884,18 +925,7 @@ and Flux. Everything else stays.
 
 Measured numbers to beat are in `Txt2ImgConfig::cache_threshold`.
 
-### 3. A Metal smoke test — a gap the suite structurally cannot see
-
-**Every golden test runs on CPU.** GLIGEN shipped a `to_dtype(F64)` that works
-on CPU and fails at load on Metal, and nothing in 337 tests could have caught
-it.
-
-One forward per architecture on the GPU, asserting only that it runs and
-returns finite values of the right shape — no reference needed. Cheap, fast,
-and it protects everything already built. Gate it on the `metal` feature so CI
-without a GPU still passes.
-
-### 4. Newer architectures worth the port
+### 3. Newer architectures worth the port
 
 From a July 2026 survey. All fit this library's existing shape — DiT-style
 transformers with quantised GGUF variants:
@@ -907,7 +937,7 @@ transformers with quantised GGUF variants:
   external VAE and no separate text encoders. That makes it *less* work than
   its size suggests, since two towers disappear.
 
-### 5. Extend streaming past Flux and SD 3.5, and measure on a discrete GPU
+### 4. Extend streaming past Flux and SD 3.5, and measure on a discrete GPU
 
 `Residency::Streamed` works for Flux and SD 3.5, both quantised. Gaps:
 

@@ -382,6 +382,13 @@ pub enum PipelineError {
          would ignore the boxes silently."
     )]
     NoGrounding,
+    #[error(
+        "this is an InstructPix2Pix checkpoint — use `run_instruct` (`sdrs instruct`).\n\n\
+         Its UNet takes 8 input channels: the noisy latent *and* the source image's. \
+         Plain text-to-image supplies only 4, which surfaces deep inside a convolution \
+         as an `in_channel mismatch` rather than as the mistake it is."
+    )]
+    NeedsInstruct,
     #[error("cancelled after {completed} of {total} steps")]
     Cancelled { completed: usize, total: usize },
     #[error("tensor: {0}")]
@@ -1811,6 +1818,11 @@ impl Txt2ImgPipeline {
         // output. Drawn even when `latent` is supplied, so that the sampler's
         // subsequent draws land in the same sequence either way and a
         // caller-supplied `initial_latent` reproduces the seeded run exactly.
+        // An 8-channel UNet cannot be driven from text alone; say so here
+        // rather than letting it fail inside a convolution.
+        if self.unet.in_channels() != 4 {
+            return Err(PipelineError::NeedsInstruct);
+        }
         let frames = cfg.frames.max(1);
         let drawn = (rng.randn((frames, 4, lh, lw), &self.device)? * sigmas[0])?;
         let latent = match latent {

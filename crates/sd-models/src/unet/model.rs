@@ -187,6 +187,7 @@ pub struct UNet2DConditionModel {
     dtype: DType,
     /// SDXL only. Projects the micro-conditioning into the time embedding.
     add_embedding: Option<(TimestepEmbedding, AdditionEmbedding)>,
+    in_channels: usize,
 }
 
 fn conv3x3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
@@ -365,6 +366,7 @@ impl UNet2DConditionModel {
             )?,
             conv_out: conv3x3(first, cfg.out_channels, vb.pp("conv_out"))?,
             freq_dim: first,
+            in_channels: cfg.in_channels,
             dtype: vb.dtype(),
             add_embedding: match cfg.addition {
                 Some(add) => Some((
@@ -378,6 +380,12 @@ impl UNet2DConditionModel {
                 None => None,
             },
         })
+    }
+
+    /// Input channels. 4 for every architecture here except InstructPix2Pix,
+    /// which takes 8 — the noisy latent concatenated with the source image's.
+    pub fn in_channels(&self) -> usize {
+        self.in_channels
     }
 
     /// The dtype this UNet's weights are in.
