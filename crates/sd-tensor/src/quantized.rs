@@ -120,7 +120,9 @@ impl QLinear {
     }
 
     /// Attach a runtime LoRA. Consuming, so a layer either has one from
-    /// construction or never does.
+    /// construction or never does — and dropping the result silently leaves
+    /// the adapter off, which renders a plausible image without it.
+    #[must_use]
     pub fn with_lora(mut self, delta: LoraDelta) -> Self {
         self.lora = Some(delta);
         self

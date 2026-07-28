@@ -25,6 +25,51 @@ pub use candle_core::{
 };
 pub use candle_nn::VarBuilder;
 
+/// Memory refusals — the guard declining, as opposed to something being wrong.
+///
+/// The distinction is load-bearing: "this machine is busy" and "this model is
+/// broken" are different answers, and the GPU smoke test skips on the first
+/// and fails on the second.
+///
+/// It cannot be an [`Error`] variant, because `Error` is candle's and this
+/// workspace does not fork it. So the marker lives here, next to the only two
+/// places that produce one, with a test binding the constructor to the
+/// predicate. **The point is that it is in one place**: before this, four call
+/// sites in three crates each matched a substring of a message defined
+/// somewhere else, and editing that message would have quietly turned every
+/// memory skip into a hard failure.
+pub mod refusal {
+    use super::Error;
+
+    /// Every refusal message begins with this.
+    pub const MARKER: &str = "refusing to";
+
+    /// Build a refusal. `detail` continues the sentence — `refuse("allocate:
+    /// ...")` reads "refusing to allocate: ...".
+    pub fn refuse(detail: impl std::fmt::Display) -> Error {
+        Error::Msg(format!("{MARKER} {detail}"))
+    }
+
+    /// Whether an error is the memory guard declining.
+    ///
+    /// Matches anywhere in the chain's display, because a refusal is usually
+    /// seen after being wrapped by a caller's own error type.
+    pub fn is_refusal(e: &Error) -> bool {
+        e.to_string().contains(MARKER)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_refusal_is_recognised_as_one() {
+            assert!(is_refusal(&refuse("start: needs 9 GB")));
+            assert!(!is_refusal(&Error::Msg("shape mismatch".into())));
+        }
+    }
+}
+
 /// Read one tensor's shape from a safetensors file without loading any data.
 ///
 /// For deciding *which* model a checkpoint is before building it. The
@@ -301,8 +346,8 @@ pub mod ops {
             )));
         };
         if bytes > budget {
-            return Err(Error::Msg(format!(
-                "refusing to allocate: {what} = {} for a single call, over the {} budget, and \
+            return Err(crate::refusal::refuse(format!(
+                "allocate: {what} = {} for a single call, over the {} budget, and \
                  peak use is at least double that.\n\n\
                  For a VAE decode, attention is O(n^4) in the latent edge and activations are \
                  O(n^2), so the next size up costs 16x and 4x respectively. On a Metal build \
@@ -1016,8 +1061,61 @@ pub mod rng {
 }
 
 /// Assertions for the golden-tensor harness.
+/// Skip a test for want of reference data.
+///
+/// Takes the same arguments as `eprintln!`. Prints a uniform `SKIP:` line, and
+/// **panics instead** when `SD_REQUIRE_FIXTURES` is set — see
+/// [`testing::skip_without_fixtures`] for why that switch exists.
+///
+/// Use it only for *missing data*. Environmental skips — no GPU, a memory
+/// refusal, an unset `SD_TEST_*` path — stay plain `eprintln!`, because those
+/// are not something generating fixtures would fix.
+#[macro_export]
+macro_rules! skip_missing_fixture {
+    ($($arg:tt)*) => {
+        $crate::testing::skip_without_fixtures(&format!($($arg)*))
+    };
+}
+
 pub mod testing {
     use super::{DType, Result, Tensor};
+
+    /// Set this to turn every "no reference data" skip into a failure.
+    pub const REQUIRE_FIXTURES_ENV: &str = "SD_REQUIRE_FIXTURES";
+
+    /// Skip a test for want of reference data — loudly, and not at all when
+    /// [`REQUIRE_FIXTURES_ENV`] is set.
+    ///
+    /// # Why this exists
+    ///
+    /// Golden data is generated locally and gitignored, so every numerical
+    /// test returns early when it is absent. An early return is a **pass**,
+    /// and the measurement that prompted this is stark: renaming
+    /// `tests/golden` aside and running the suite gives *the same 362 passing
+    /// tests* as running it with every fixture in place. Nothing in the
+    /// output distinguishes "verified" from "did nothing", so a fresh clone,
+    /// a CI run, or a colleague who forgot to run the dumper all get a
+    /// perfect green board that checked no numbers at all.
+    ///
+    /// That is not hypothetical. Three tests in this workspace silently
+    /// stopped running when a symlink was renamed, and reported `ok`
+    /// throughout.
+    ///
+    /// So: skipping still works by default — the fixtures really are too
+    /// large to commit — but it is now *choosable*. `SD_REQUIRE_FIXTURES=1
+    /// cargo test` is the run that means something.
+    /// Backs [`crate::skip_missing_fixture`]; call the macro, not this.
+    #[doc(hidden)]
+    pub fn skip_without_fixtures(message: &str) {
+        assert!(
+            std::env::var_os(REQUIRE_FIXTURES_ENV).is_none(),
+            "{message}\n\n\
+             This test needs reference data and {REQUIRE_FIXTURES_ENV} is set, so \
+             skipping is a failure. Generate the fixtures, or unset the variable to \
+             go back to skipping."
+        );
+        eprintln!("SKIP: {message}");
+    }
 
     /// Maximum absolute difference between two tensors.
     pub fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f64> {
@@ -1251,10 +1349,7 @@ mod attention_budget_tests {
         let q = Tensor::zeros((1, 1, seq, 8), DType::F32, &dev)?;
         let err = naive_attention(&q, &q, &q, None)
             .expect_err("a 4.4 GiB score matrix is over the default budget");
-        assert!(
-            err.to_string().contains("refusing to allocate"),
-            "unexpected error: {err}"
-        );
+        assert!(crate::refusal::is_refusal(&err), "unexpected error: {err}");
         Ok(())
     }
 

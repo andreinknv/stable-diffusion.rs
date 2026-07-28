@@ -311,7 +311,9 @@ fn supplying_the_initial_latent_reproduces_the_seeded_run_exactly() {
     // sampler's own noise sequence, which is the part that is easy to get
     // wrong when the initial draw is skipped.
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP supplying_the_initial_latent_reproduces_the_seeded_run_exactly");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP supplying_the_initial_latent_reproduces_the_seeded_run_exactly"
+        );
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -337,7 +339,7 @@ fn a_different_initial_latent_gives_a_different_image() {
     // The other half: if the supplied latent were quietly ignored, the test
     // above would still pass. This one fails in that case.
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP a_different_initial_latent_gives_a_different_image");
+        sd_tensor::skip_missing_fixture!("SKIP a_different_initial_latent_gives_a_different_image");
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -368,7 +370,7 @@ fn generation_is_deterministic_across_runs() {
     // and an accident is what it would be without a test, since summation
     // order is the sort of thing that changes under a dependency bump.
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP generation_is_deterministic_across_runs");
+        sd_tensor::skip_missing_fixture!("SKIP generation_is_deterministic_across_runs");
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -410,7 +412,7 @@ fn control_maps_must_match_the_attached_controlnets() {
         std::env::var("SD_TEST_MODEL_DIR"),
         std::env::var("SD_TEST_CONTROLNET"),
     ) else {
-        eprintln!("SKIP control_maps_must_match_the_attached_controlnets");
+        sd_tensor::skip_missing_fixture!("SKIP control_maps_must_match_the_attached_controlnets");
         return;
     };
     use stable_diffusion_rs::pipeline::{Control, ControlConfig, Txt2ImgPipeline};
@@ -473,7 +475,9 @@ fn one_conditioning_selected_every_step_is_the_ordinary_run() {
     // bit-identically. Anything less would mean the conditioned path takes a
     // different code route, and the two would drift apart silently.
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP one_conditioning_selected_every_step_is_the_ordinary_run");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP one_conditioning_selected_every_step_is_the_ordinary_run"
+        );
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -503,7 +507,9 @@ fn gating_the_negative_prompt_to_a_window_changes_the_image() {
     // applying it throughout, so this is the test that proves per-step
     // conditioning actually reaches the model.
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP gating_the_negative_prompt_to_a_window_changes_the_image");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP gating_the_negative_prompt_to_a_window_changes_the_image"
+        );
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -551,7 +557,7 @@ fn a_cancelled_run_stops_and_says_where() {
     let _heavy = heavy();
     use stable_diffusion_rs::pipeline::{Cancel, PipelineError, Txt2ImgPipeline};
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP a_cancelled_run_stops_and_says_where");
+        sd_tensor::skip_missing_fixture!("SKIP a_cancelled_run_stops_and_says_where");
         return;
     };
     let dev = Device::Cpu;
@@ -593,7 +599,12 @@ fn a_textual_inversion_changes_the_prompt_it_appears_in() {
         std::env::var("SD_TEST_MODEL_DIR"),
         std::env::var("SD_TEST_EMBEDDING"),
     ) else {
-        eprintln!("SKIP a_textual_inversion_changes_the_prompt_it_appears_in");
+        // Permissive: `SD_TEST_EMBEDDING` points at a *downloaded* textual
+        // inversion, not at anything `dump_reference.py` produces, so
+        // `SD_REQUIRE_FIXTURES` cannot reasonably demand it.
+        eprintln!(
+            "SKIP a_textual_inversion_changes_the_prompt_it_appears_in: set SD_TEST_EMBEDDING"
+        );
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -633,7 +644,7 @@ fn a_prompt_without_the_trigger_is_unaffected() {
         std::env::var("SD_TEST_MODEL_DIR"),
         std::env::var("SD_TEST_EMBEDDING"),
     ) else {
-        eprintln!("SKIP a_prompt_without_the_trigger_is_unaffected");
+        eprintln!("SKIP a_prompt_without_the_trigger_is_unaffected: set SD_TEST_EMBEDDING");
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -666,7 +677,9 @@ fn an_embedding_of_the_wrong_width_is_refused() {
         std::env::var("SD_TEST_MODEL_DIR"),
         std::env::var("SD_TEST_EMBEDDING_WRONG_WIDTH"),
     ) else {
-        eprintln!("SKIP an_embedding_of_the_wrong_width_is_refused");
+        eprintln!(
+            "SKIP an_embedding_of_the_wrong_width_is_refused: set SD_TEST_EMBEDDING_WRONG_WIDTH"
+        );
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -691,7 +704,9 @@ fn an_embedding_of_the_wrong_width_is_refused() {
 fn hires_produces_the_larger_size_and_refuses_to_shrink() {
     let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP hires_produces_the_larger_size_and_refuses_to_shrink");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP hires_produces_the_larger_size_and_refuses_to_shrink"
+        );
         return;
     };
     use stable_diffusion_rs::pipeline::{HiresConfig, Strength, Txt2ImgPipeline, Upscale};
@@ -734,7 +749,7 @@ fn hires_at_strength_zero_is_the_first_pass_enlarged() {
     // an off-by-one in the schedule slice could run one step and go unnoticed.
     let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP hires_at_strength_zero_is_the_first_pass_enlarged");
+        sd_tensor::skip_missing_fixture!("SKIP hires_at_strength_zero_is_the_first_pass_enlarged");
         return;
     };
     use stable_diffusion_rs::pipeline::{HiresConfig, Strength, Txt2ImgPipeline, Upscale};
@@ -777,7 +792,9 @@ fn hires_at_strength_zero_is_the_first_pass_enlarged() {
 fn frames_are_generated_as_one_batch_and_differ_from_each_other() {
     let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP frames_are_generated_as_one_batch_and_differ_from_each_other");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP frames_are_generated_as_one_batch_and_differ_from_each_other"
+        );
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -819,7 +836,7 @@ fn a_one_frame_clip_is_the_ordinary_still_image() {
     // a regression in the path everything else uses.
     let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP a_one_frame_clip_is_the_ordinary_still_image");
+        sd_tensor::skip_missing_fixture!("SKIP a_one_frame_clip_is_the_ordinary_still_image");
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -851,7 +868,7 @@ fn a_batch_decode_matches_decoding_each_frame_alone() {
     // merely smaller.
     let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP a_batch_decode_matches_decoding_each_frame_alone");
+        sd_tensor::skip_missing_fixture!("SKIP a_batch_decode_matches_decoding_each_frame_alone");
         return;
     };
     use stable_diffusion_rs::pipeline::Txt2ImgPipeline;
@@ -893,7 +910,9 @@ fn a_region_with_an_empty_mask_leaves_the_base_untouched() {
     // that divides by the wrong thing would do.
     let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP a_region_with_an_empty_mask_leaves_the_base_untouched");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP a_region_with_an_empty_mask_leaves_the_base_untouched"
+        );
         return;
     };
     use stable_diffusion_rs::pipeline::{AreaConfig, Region, Txt2ImgPipeline};
@@ -931,7 +950,7 @@ fn a_full_mask_replaces_the_base_prompt_entirely() {
     // the two would differ.
     let _heavy = heavy();
     let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
-        eprintln!("SKIP a_full_mask_replaces_the_base_prompt_entirely");
+        sd_tensor::skip_missing_fixture!("SKIP a_full_mask_replaces_the_base_prompt_entirely");
         return;
     };
     use stable_diffusion_rs::pipeline::{AreaConfig, Region, Txt2ImgPipeline};
@@ -977,7 +996,9 @@ fn image_guidance_trades_fidelity_against_the_instruction() {
         std::env::var("SD_TEST_IP2P_DIR"),
         std::env::var("SD_TEST_IP2P_IMAGE"),
     ) else {
-        eprintln!("SKIP image_guidance_trades_fidelity_against_the_instruction");
+        // Permissive for the same reason as the embeddings: an
+        // InstructPix2Pix checkpoint is a download, not golden data.
+        eprintln!("SKIP image_guidance_trades_fidelity_against_the_instruction: set SD_TEST_IP2P_DIR and SD_TEST_IP2P_IMAGE");
         return;
     };
     use stable_diffusion_rs::pipeline::{InstructConfig, Txt2ImgPipeline};

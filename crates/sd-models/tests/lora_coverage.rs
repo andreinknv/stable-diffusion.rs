@@ -23,7 +23,7 @@ fn unet_path() -> PathBuf {
 fn weights() -> Option<HashMap<String, Tensor>> {
     let p = unet_path();
     if !p.exists() {
-        eprintln!("SKIP: no SD 1.5 UNet at {}", p.display());
+        sd_tensor::skip_missing_fixture!("SKIP: no SD 1.5 UNet at {}", p.display());
         return None;
     }
     Some(sd_tensor::safetensors::load(&p, &Device::Cpu).expect("loading UNet"))
@@ -32,7 +32,7 @@ fn weights() -> Option<HashMap<String, Tensor>> {
 #[test]
 fn every_lora_entry_finds_a_weight_in_the_unet() {
     if !lora_path().exists() {
-        eprintln!("SKIP: no LoRA fixture at {}", lora_path().display());
+        sd_tensor::skip_missing_fixture!("SKIP: no LoRA fixture at {}", lora_path().display());
         return;
     }
     let Some(mut w) = weights() else { return };
@@ -60,7 +60,7 @@ fn a_zero_multiplier_leaves_every_weight_untouched() {
     // be indistinguishable from not passing --lora at all, bit for bit. If it
     // is not, the merge is doing something other than adding a scaled delta.
     if !lora_path().exists() {
-        eprintln!("SKIP: no LoRA fixture.");
+        sd_tensor::skip_missing_fixture!("SKIP: no LoRA fixture.");
         return;
     }
     let Some(before) = weights() else { return };
@@ -90,7 +90,7 @@ fn a_nonzero_multiplier_changes_exactly_the_targeted_weights() {
     // something, and only to the layers it names. A merge that touched
     // everything would pass the coverage test and still be wrong.
     if !lora_path().exists() {
-        eprintln!("SKIP: no LoRA fixture.");
+        sd_tensor::skip_missing_fixture!("SKIP: no LoRA fixture.");
         return;
     }
     let Some(before) = weights() else { return };

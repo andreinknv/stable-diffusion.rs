@@ -28,7 +28,7 @@ fn gguf() -> PathBuf {
 fn t5_xxl_loads_from_gguf_and_encodes() {
     let path = gguf();
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no T5-XXL gguf at {}. Fetch \
              city96/t5-v1_1-xxl-encoder-gguf.",
             path.display()
@@ -43,7 +43,7 @@ fn t5_xxl_loads_from_gguf_and_encodes() {
     // is the honest outcome — the mapping this verifies is dtype-independent,
     // and the alternative is either a false failure or loading 18.8 GB at f32.
     if cfg!(feature = "accelerate") {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP t5_xxl_loads_from_gguf_and_encodes: this loads F16, and candle's \
              Accelerate CPU backend has no f16 matmul. Run it without the feature."
         );

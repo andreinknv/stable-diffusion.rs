@@ -62,7 +62,7 @@ fn golden_dir() -> PathBuf {
 fn refs() -> Option<HashMap<String, Tensor>> {
     let path = golden_dir().join("reference.safetensors");
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py unet_full --output tests/golden\n"
@@ -76,7 +76,7 @@ fn refs() -> Option<HashMap<String, Tensor>> {
 fn real_unet(dev: &Device) -> Option<UNet2DConditionModel> {
     let path = golden_dir().join("unet.safetensors");
     if !path.exists() {
-        eprintln!("SKIP: no unet.safetensors");
+        sd_tensor::skip_missing_fixture!("SKIP: no unet.safetensors");
         return None;
     }
     let vb = sd_loader::safetensors_var_builder(&[&path], DType::F32, dev)
@@ -287,7 +287,7 @@ fn a_quantised_ldm_unet_runs_through_the_name_map() {
     let gguf =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/gguf/sd15-q4_0.gguf");
     if !gguf.exists() {
-        eprintln!("SKIP: no sd15-q4_0.gguf");
+        sd_tensor::skip_missing_fixture!("SKIP: no sd15-q4_0.gguf");
         return;
     }
 
@@ -366,7 +366,7 @@ fn sd2_matches_diffusers_skip_for_skip() {
     let dev = Device::Cpu;
     let path = sd2_dir().join("reference.safetensors");
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no SD 2.x reference. Generate it with:\n\n    \
              python3 xtask/golden/dump_reference.py unet_full \
              --model-id friedrichor/stable-diffusion-2-1-realistic --output tests/golden\n"
@@ -376,7 +376,7 @@ fn sd2_matches_diffusers_skip_for_skip() {
     let refs = sd_tensor::safetensors::load(&path, &dev).expect("loading reference");
     let weights = sd2_dir().join("unet.safetensors");
     if !weights.exists() {
-        eprintln!("SKIP: no SD 2.x unet.safetensors");
+        sd_tensor::skip_missing_fixture!("SKIP: no SD 2.x unet.safetensors");
         return;
     }
     let vb = sd_loader::safetensors_var_builder(&[&weights], DType::F32, &dev).expect("weights");

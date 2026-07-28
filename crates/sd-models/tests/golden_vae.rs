@@ -87,7 +87,7 @@ fn sdxl_differs_from_sd15_only_in_latent_scaling() {
 fn decoder_matches_diffusers_reference() {
     let path = golden_path();
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP decoder_matches_diffusers_reference: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py vae --output tests/golden\n\
@@ -102,7 +102,7 @@ fn decoder_matches_diffusers_reference() {
     let vae_weights = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/vae_decoder/vae.safetensors");
     if !vae_weights.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: reference activations found but VAE weights are missing at {}.\n\
              Copy the SD 1.5 `vae/diffusion_pytorch_model.safetensors` there.",
             vae_weights.display()
@@ -181,7 +181,7 @@ fn an_oversized_decode_is_refused_before_it_allocates() {
         .forward(&z)
         .expect_err("a 9.0 GiB activation must be refused");
     assert!(
-        err.to_string().contains("refusing to allocate"),
+        sd_tensor::refusal::is_refusal(&err),
         "unexpected error: {err}"
     );
 }
@@ -217,14 +217,16 @@ fn encoder_matches_diffusers_reference() {
     let vae_weights = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/vae_decoder/vae.safetensors");
     if !path.exists() || !vae_weights.exists() {
-        eprintln!("SKIP encoder_matches_diffusers_reference: no reference data.");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP encoder_matches_diffusers_reference: no reference data."
+        );
         return;
     }
 
     let dev = Device::Cpu;
     let refs = sd_tensor::safetensors::load(&path, &dev).expect("loading reference tensors");
     let Some(image) = refs.get("encoder_input") else {
-        eprintln!("SKIP: reference predates the encoder; regenerate it.");
+        sd_tensor::skip_missing_fixture!("SKIP: reference predates the encoder; regenerate it.");
         return;
     };
     let expected = refs.get("encoder_moments").expect("encoder_moments");
@@ -263,7 +265,7 @@ fn a_quantised_ldm_checkpoint_decodes_through_the_name_map() {
     let gguf =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/gguf/sd15-q4_0.gguf");
     if !refs_path.exists() || !gguf.exists() {
-        eprintln!("SKIP: needs both the vae reference and sd15-q4_0.gguf");
+        sd_tensor::skip_missing_fixture!("SKIP: needs both the vae reference and sd15-q4_0.gguf");
         return;
     }
 

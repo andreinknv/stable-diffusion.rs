@@ -33,7 +33,7 @@ fn golden_dir() -> PathBuf {
 fn refs() -> Option<HashMap<String, Tensor>> {
     let path = golden_dir().join("reference.safetensors");
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py controlnet --output tests/golden\n"
@@ -46,7 +46,7 @@ fn refs() -> Option<HashMap<String, Tensor>> {
 fn real_controlnet(dev: &Device) -> Option<ControlNet> {
     let path = golden_dir().join("controlnet.safetensors");
     if !path.exists() {
-        eprintln!("SKIP: no controlnet.safetensors");
+        sd_tensor::skip_missing_fixture!("SKIP: no controlnet.safetensors");
         return None;
     }
     let vb = sd_loader::safetensors_var_builder(&[&path], DType::F32, dev)

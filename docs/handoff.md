@@ -24,14 +24,18 @@ mattered:
    schedule and the step-cache threshold band.
 5. **Run the gates before committing**: `cargo fmt --all`,
    `cargo clippy --workspace --all-targets --features metal -- -D warnings`,
-   `bash scripts/check-seam.sh`, `cargo test --release --workspace`.
+   `bash scripts/check-seam.sh`, `cargo test --release --workspace`. And at
+   least once per change that touches numbers, the run that actually verifies:
+   `SD_REQUIRE_FIXTURES=1 SD_TEST_MODEL_DIR=$(pwd)/models/sd15 cargo test
+   --release --workspace` — a plain run reports the same green with no
+   fixtures at all.
 6. **Check free memory before a large run.** Metal allocations are wired; an
    oversized one takes the machine, not the process.
 
 ## What this project does today
 
 Every capability below is verified against `diffusers`/`transformers` with a
-recorded number. **362 tests, all gates green**, plus 7 GPU smoke tests behind the `metal`
+recorded number. **374 tests, all gates green**, plus 7 GPU smoke tests behind the `metal`
 feature (`cargo test --features metal --test metal_smoke`) — they are not in
 the default count because a machine without a GPU cannot run them.
 
@@ -168,7 +172,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 362 tests, all gates green
+table is in [roadmap.md](roadmap.md). 374 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -1177,6 +1181,61 @@ native resolution instead put a 1024 VAE *encode* on the GPU — wired memory,
 the allocation class that has taken this machine down before — and did exactly
 that again.
 
+## The suite reported the same 362 green with no fixtures at all
+
+Measured, not suspected: renaming `tests/golden` aside and running the whole
+suite gave **362 passed, 0 failed** — identical to the run with every fixture
+in place. Golden data is gitignored and generated locally, every numerical test
+returns early when it is missing, and an early return is a pass. Nothing in the
+output separated "verified" from "did nothing".
+
+**`SD_REQUIRE_FIXTURES=1 cargo test` is now the run that means something.**
+Skipping still works by default, because the fixtures really are too large to
+commit; it is just no longer the only option. Every fixture-missing skip goes
+through `sd_tensor::skip_missing_fixture!`, which prints a uniform line and
+panics under the flag. Environmental skips — no GPU, a memory refusal, an unset
+`SD_TEST_*` — stay permissive, because generating fixtures would not fix them.
+
+Turning it on immediately found **18 pipeline property tests that had never
+run here**: determinism across runs, cancellation, textual inversion, hires,
+regional prompts, frame batching, instruct guidance. They gate on
+`SD_TEST_MODEL_DIR`, which nobody had set. They all pass — but nothing had
+been checking, and those are the properties this project most relies on.
+
+```bash
+SD_REQUIRE_FIXTURES=1 \
+  SD_TEST_MODEL_DIR=$(pwd)/models/sd15 \
+  SD_TEST_CONTROLNET=$(pwd)/tests/golden/controlnet/controlnet.safetensors \
+  cargo test --release --workspace
+```
+
+Note the **absolute** path: `cargo test -p <crate>` runs with the package
+directory as its working directory, so a relative `./models/sd15` silently
+resolves to nothing and every test skips again.
+
+**The line the flag draws** is between golden data `dump_reference.py`
+produces — which it demands — and third-party assets a user supplies, which it
+does not. A textual-inversion embedding and an InstructPix2Pix checkpoint are
+downloads this repository cannot generate, so those tests still skip
+permissively and say which variable to set. Demanding them would make the flag
+fail on every machine, and a gate that is always red gets ignored — the same
+reasoning that makes a memory refusal skip rather than fail in the GPU smoke
+test.
+
+## CPU against Metal, per module
+
+`metal_parity.rs` runs each architecture's forward on both devices and compares.
+Until now only the VAE decoder had this, and everything else was verified on
+CPU alone — which is how a Metal-only failure in the unCLIP prior passed nine
+golden tests. First measurements:
+
+```text
+  clip-l pooled     6.484e-7
+  sd15 unet         2.301e-6
+  unclip prior      4.049e-6
+  unclip unet       1.083e-4
+```
+
 ## Traps this codebase has already paid for
 
 Each of these cost real time. They generalise.
@@ -1239,6 +1298,15 @@ re-running took two minutes and showed it had never been needed — otherwise a
 module docs explaining why it was necessary, which the next person would have
 believed. Two simultaneous changes and one observation cannot tell you which
 one worked.
+
+**A helper used by five callers and covered by one test is covered by none**
+if the covered case is the one where the bug cannot appear. That is not a
+figure of speech — see the pooled-EOS entry below. The general defence is
+tests that assert *invariants between* modules rather than a module against
+saved tensors: `seam_invariants.rs` holds the ones that need no fixtures, so
+they run on a fresh clone. The most valuable of them asserts that unCLIP's
+class projection is exactly twice an image embedding, which is the property
+the published `-t2i-h` checkpoint violates.
 
 **`forward()` then `pooled()` encodes the prompt twice**, because
 `pooled_hidden` runs the encoder itself. SD 3 was doing exactly that for both

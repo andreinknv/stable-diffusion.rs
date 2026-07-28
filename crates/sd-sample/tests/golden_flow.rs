@@ -18,7 +18,7 @@ fn refs(dev: &Device) -> Option<std::collections::HashMap<String, sd_tensor::Ten
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/flow/reference.safetensors");
     if !p.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no flow reference. Generate with \
              `python3 xtask/golden/dump_reference.py flow --output tests/golden`"
         );

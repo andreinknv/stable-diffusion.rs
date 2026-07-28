@@ -36,7 +36,7 @@ macro_rules! refs_or_skip {
             golden(&format!("{}/vae.safetensors", $dir)),
         );
         if !r.exists() || !w.exists() {
-            eprintln!(
+            sd_tensor::skip_missing_fixture!(
                 "SKIP: no Flux VAE reference. Generate with \
                  `python3 xtask/golden/dump_reference.py flux_vae --output tests/golden`"
             );

@@ -24,7 +24,7 @@ fn golden_dir() -> PathBuf {
 fn refs(name: &str) -> Option<std::collections::HashMap<String, Tensor>> {
     let path = golden_dir().join(name);
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no {name}.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py unet_blocks --output tests/golden\n"
@@ -124,7 +124,7 @@ fn time_embedding_mlp_matches_diffusers() {
     };
     let weights = golden_dir().join("time_embedding.safetensors");
     if !weights.exists() {
-        eprintln!("SKIP: no time_embedding.safetensors");
+        sd_tensor::skip_missing_fixture!("SKIP: no time_embedding.safetensors");
         return;
     }
 
@@ -149,7 +149,7 @@ fn resnet_block_matches_diffusers() {
     };
     let weights = golden_dir().join("resnet.safetensors");
     if !weights.exists() {
-        eprintln!("SKIP: no resnet.safetensors");
+        sd_tensor::skip_missing_fixture!("SKIP: no resnet.safetensors");
         return;
     }
 

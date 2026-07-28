@@ -35,7 +35,7 @@ fn twenty_step_loop_matches_diffusers() {
     let refs_path = golden("flux_sampling/reference.safetensors");
     let weights = golden("flux/flux-mini.safetensors");
     if !refs_path.exists() || !weights.exists() {
-        eprintln!("SKIP: no Flux sampling reference; see the module docs");
+        sd_tensor::skip_missing_fixture!("SKIP: no Flux sampling reference; see the module docs");
         return;
     }
 
@@ -118,7 +118,7 @@ fn bottom_row_artifact_matches_the_reference() {
     let dev = Device::Cpu;
     let refs_path = golden("flux_sampling/reference.safetensors");
     if !refs_path.exists() {
-        eprintln!("SKIP: no Flux sampling reference");
+        sd_tensor::skip_missing_fixture!("SKIP: no Flux sampling reference");
         return;
     }
     let refs = sd_tensor::safetensors::load(&refs_path, &dev).unwrap();

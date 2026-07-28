@@ -18,6 +18,7 @@ pub mod controlnet;
 pub mod esrgan;
 pub mod flux;
 pub mod gligen;
+pub mod image;
 pub mod ip_adapter;
 pub mod prior;
 pub mod sd3;

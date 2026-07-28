@@ -59,7 +59,7 @@ const REGENERATE: &str = "SKIP: no unCLIP prior reference. Generate it with:\n\n
 fn refs(dev: &Device) -> Option<std::collections::HashMap<String, Tensor>> {
     let path = golden_dir().join("prior_reference.safetensors");
     if !path.exists() {
-        eprintln!("{REGENERATE}");
+        sd_tensor::skip_missing_fixture!("{REGENERATE}");
         return None;
     }
     Some(sd_tensor::safetensors::load(&path, dev).expect("reference"))
@@ -68,7 +68,7 @@ fn refs(dev: &Device) -> Option<std::collections::HashMap<String, Tensor>> {
 fn prior(dev: &Device) -> Option<PriorTransformer> {
     let weights = golden_dir().join("t2i_prior.safetensors");
     if !weights.exists() {
-        eprintln!("{REGENERATE}");
+        sd_tensor::skip_missing_fixture!("{REGENERATE}");
         return None;
     }
     let vb = sd_loader::safetensors_var_builder(&[&weights], DType::F32, dev).expect("weights");
@@ -316,7 +316,7 @@ fn the_attention_mask_is_derived_the_way_transformers_reports_it() {
     let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../models/unclip-t2i/prior_tokenizer/tokenizer.json");
     if !tokenizer_path.exists() {
-        eprintln!("{REGENERATE}");
+        sd_tensor::skip_missing_fixture!("{REGENERATE}");
         return;
     }
     let tokenizer =
@@ -355,7 +355,7 @@ fn the_prior_joins_to_its_own_image_half() {
     let normalizer_path = golden_dir().join("t2i_image_normalizer.safetensors");
     let unet_path = golden_dir().join("t2i_unet.safetensors");
     if !normalizer_path.exists() || !unet_path.exists() {
-        eprintln!("{REGENERATE}");
+        sd_tensor::skip_missing_fixture!("{REGENERATE}");
         return;
     }
 
@@ -404,7 +404,7 @@ fn the_priors_text_encoder_matches_transformers() {
     let Some(refs) = refs(&dev) else { return };
     let weights = golden_dir().join("t2i_prior_text_encoder.safetensors");
     if !weights.exists() {
-        eprintln!("{REGENERATE}");
+        sd_tensor::skip_missing_fixture!("{REGENERATE}");
         return;
     }
     let vb = sd_loader::safetensors_var_builder(&[&weights], DType::F32, &dev).expect("weights");

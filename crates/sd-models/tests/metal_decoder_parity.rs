@@ -45,7 +45,9 @@ fn metal_decode_matches_cpu_and_fails_loudly_when_it_cannot() {
         return;
     };
     let Some(w) = weights() else {
-        eprintln!("SKIP: no VAE weights; run xtask/golden/dump_reference.py vae");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP: no VAE weights; run xtask/golden/dump_reference.py vae"
+        );
         return;
     };
     let cpu = Device::Cpu;

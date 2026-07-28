@@ -143,7 +143,7 @@ fn every_vae_tensor_in_a_real_checkpoint_maps() {
     let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/gguf/sd15-q4_0.gguf");
     if !p.exists() {
-        eprintln!("SKIP: no sd15-q4_0.gguf; see xtask/golden/README.md");
+        sd_tensor::skip_missing_fixture!("SKIP: no sd15-q4_0.gguf; see xtask/golden/README.md");
         return;
     }
     let info = sd_loader::GgufInfo::open(&p).expect("reading the checkpoint");
@@ -311,7 +311,7 @@ fn every_unet_tensor_in_a_real_checkpoint_maps() {
     let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/gguf/sd15-q4_0.gguf");
     if !p.exists() {
-        eprintln!("SKIP: no sd15-q4_0.gguf");
+        sd_tensor::skip_missing_fixture!("SKIP: no sd15-q4_0.gguf");
         return;
     }
     let info = sd_loader::GgufInfo::open(&p).expect("reading");

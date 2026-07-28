@@ -17,7 +17,7 @@ fn refs() -> Option<HashMap<String, Tensor>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/samplers/reference.safetensors");
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py samplers --output tests/golden\n"

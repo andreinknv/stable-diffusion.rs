@@ -43,6 +43,14 @@ memmap2 = "0.9"
 # feature set pulls `onig`, which builds the oniguruma C library and would
 # undo this project's "no C toolchain" property. The pure-Rust path is enough
 # to load a tokenizer.json and encode.
+#
+# **Held at 0.22 to match candle, not through neglect.** candle-core 0.11.0
+# depends on tokenizers 0.22 itself, so asking for 0.23 here does not upgrade
+# anything — it compiles *both*, and 0.23 additionally makes a regex backend
+# mandatory, adding `fancy-regex` to the tree. Measured before reverting: the
+# 0.23 tokenizer produces byte-identical ids against the HuggingFace reference,
+# so the whole trade was two copies of a large crate for no observable change.
+# Revisit when candle moves.
 tokenizers = { version = "0.22", default-features = false }
 
 [profile.release]

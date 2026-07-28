@@ -50,7 +50,7 @@ fn gpu() -> Option<Device> {
 /// on the GPU" are different answers, and conflating them makes the smoke
 /// test noisy enough to be ignored — which is worse than not having it.
 fn refused_for_memory(e: &stable_diffusion_rs::pipeline::PipelineError) -> bool {
-    e.to_string().contains("refusing to")
+    e.is_memory_refusal()
 }
 
 fn tiny(seed: u64) -> Txt2ImgConfig {
@@ -106,7 +106,7 @@ fn every_diffusers_layout_model_runs_on_the_gpu() {
     for (i, name) in DIFFUSERS_LAYOUT.iter().enumerate() {
         let dir = models_dir().join(name);
         if !dir.join("unet").exists() {
-            eprintln!("SKIP {name}: not present");
+            sd_tensor::skip_missing_fixture!("SKIP {name}: not present");
             continue;
         }
         let pipeline = match Txt2ImgPipeline::load(&dir, &dev) {
@@ -146,7 +146,7 @@ fn the_gligen_grounding_path_runs_on_the_gpu() {
     let Some(dev) = gpu() else { return };
     let dir = models_dir().join("gligen");
     if !dir.join("unet").exists() {
-        eprintln!("SKIP: no gligen model");
+        sd_tensor::skip_missing_fixture!("SKIP: no gligen model");
         return;
     }
     use stable_diffusion_rs::pipeline::{GroundedBox, GroundingConfig};
@@ -179,7 +179,7 @@ fn the_quantised_path_runs_on_the_gpu() {
     let Some(dev) = gpu() else { return };
     let flux = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/flux");
     if !flux.join("flux-schnell-q4_k_s.gguf").exists() {
-        eprintln!("SKIP: no quantised Flux checkpoint");
+        sd_tensor::skip_missing_fixture!("SKIP: no quantised Flux checkpoint");
         return;
     }
     let paths = stable_diffusion_rs::pipeline::paths_in(&flux);
@@ -284,7 +284,7 @@ fn the_unclip_prior_path_runs_on_the_gpu() {
     let Some(dev) = gpu() else { return };
     let dir = models_dir().join("unclip-t2i");
     if !dir.join("prior").exists() {
-        eprintln!("SKIP: no unclip-t2i model");
+        sd_tensor::skip_missing_fixture!("SKIP: no unclip-t2i model");
         return;
     }
     let pipeline = match Txt2ImgPipeline::load(&dir, &dev) {

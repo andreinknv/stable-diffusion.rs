@@ -39,7 +39,7 @@ fn matches_transformers() {
     let refs_path = golden_dir().join("reference.safetensors");
     let weights = golden_dir().join("image_encoder.safetensors");
     if !refs_path.exists() || !weights.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data. Generate it with:\n\n    \
              python3 xtask/golden/dump_reference.py clip_vision --output tests/golden\n"
         );
@@ -76,7 +76,7 @@ fn one_token_is_added_to_the_patch_grid() {
     let dev = Device::Cpu;
     let weights = golden_dir().join("image_encoder.safetensors");
     if !weights.exists() {
-        eprintln!("SKIP one_token_is_added_to_the_patch_grid");
+        sd_tensor::skip_missing_fixture!("SKIP one_token_is_added_to_the_patch_grid");
         return;
     }
     let vb = sd_loader::safetensors_var_builder(&[&weights], DType::F32, &dev).expect("weights");
@@ -95,7 +95,7 @@ fn the_projected_embedding_is_narrower_than_the_tower() {
     let dev = Device::Cpu;
     let weights = golden_dir().join("image_encoder.safetensors");
     if !weights.exists() {
-        eprintln!("SKIP the_projected_embedding_is_narrower_than_the_tower");
+        sd_tensor::skip_missing_fixture!("SKIP the_projected_embedding_is_narrower_than_the_tower");
         return;
     }
     let vb = sd_loader::safetensors_var_builder(&[&weights], DType::F32, &dev).expect("weights");

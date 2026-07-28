@@ -95,6 +95,10 @@ impl Placement {
     }
 
     /// Stream the diffusion model's blocks instead of holding them resident.
+    ///
+    /// Consuming: dropping the result leaves the placement resident and the
+    /// call does nothing, which is a silent 6 GB rather than an error.
+    #[must_use]
     pub fn with_streamed_diffusion(mut self) -> Self {
         self.diffusion = Residency::Streamed;
         self
@@ -110,6 +114,7 @@ impl Placement {
     /// The stage with the best ratio of memory held to time spent: used once,
     /// then resident for every remaining step. Conditioning is a few hundred
     /// KB, so the tensors that cross back to the compute device are small.
+    #[must_use]
     pub fn with_text_encoders_on(mut self, device: &Device) -> Self {
         self.text_encoders = device.clone();
         self
@@ -121,6 +126,7 @@ impl Placement {
     /// stack, so moving it to the CPU trades a real speed-up for the memory.
     /// Offered because on a small GPU the decode is often the allocation that
     /// does not fit, and a slow image beats no image.
+    #[must_use]
     pub fn with_vae_on(mut self, device: &Device) -> Self {
         self.vae = device.clone();
         self

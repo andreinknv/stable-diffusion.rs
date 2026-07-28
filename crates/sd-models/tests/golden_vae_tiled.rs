@@ -20,7 +20,9 @@ fn decoder(dev: &Device) -> Option<AutoencoderKlDecoder> {
     let w = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/vae_decoder/vae.safetensors");
     if !w.exists() {
-        eprintln!("SKIP: no VAE weights; run xtask/golden/dump_reference.py vae");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP: no VAE weights; run xtask/golden/dump_reference.py vae"
+        );
         return None;
     }
     let vb = sd_loader::safetensors_var_builder(&[&w], DType::F32, dev).expect("weights");
@@ -132,7 +134,9 @@ fn encoder(dev: &Device) -> Option<AutoencoderKlEncoder> {
     let w = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/vae_decoder/vae.safetensors");
     if !w.exists() {
-        eprintln!("SKIP: no VAE weights; run xtask/golden/dump_reference.py vae");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP: no VAE weights; run xtask/golden/dump_reference.py vae"
+        );
         return None;
     }
     let vb = sd_loader::safetensors_var_builder(&[&w], DType::F32, dev).expect("weights");

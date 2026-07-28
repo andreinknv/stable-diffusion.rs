@@ -36,6 +36,7 @@ use sd_tensor::{DType, Device, Module, Result, Tensor, VarBuilder};
 
 use super::text_encoder::ClipEncoderLayer;
 use super::{ClipActivation, ClipTextConfig};
+use crate::image::UnitImage;
 
 /// Geometry of the vision tower.
 #[derive(Debug, Clone)]
@@ -256,12 +257,15 @@ impl ClipVisionEncoder {
 pub const CLIP_MEAN: [f32; 3] = [0.481_454_67, 0.457_827_5, 0.408_210_73];
 pub const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
-/// Normalise a `[b, 3, h, w]` image in `[0, 1]` for the vision tower.
+/// Normalise an image for the vision tower.
 ///
-/// Takes `[0, 1]`, not the `[-1, 1]` used elsewhere in this crate, because
-/// that is the range CLIP's preprocessing is defined against and converting in
-/// the caller is where the sign gets lost.
-pub fn preprocess(image: &Tensor) -> Result<Tensor> {
+/// Takes [`UnitImage`] rather than a bare tensor: `[0, 1]`, not the `[-1, 1]`
+/// used everywhere a VAE is involved. The two are the same shape and dtype, so
+/// this used to be a comment — and a signed image handed here is *accepted*,
+/// producing an embedding of the right shape describing the wrong picture.
+/// Now the caller has to say which range it has.
+pub fn preprocess(image: &UnitImage) -> Result<Tensor> {
+    let image = image.tensor();
     let device = image.device();
     let mean = Tensor::from_slice(&CLIP_MEAN, (1, 3, 1, 1), device)?;
     let std = Tensor::from_slice(&CLIP_STD, (1, 3, 1, 1), device)?;

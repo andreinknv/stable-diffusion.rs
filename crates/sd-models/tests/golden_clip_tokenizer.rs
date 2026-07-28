@@ -25,7 +25,7 @@ fn golden_dir() -> PathBuf {
 fn tokenizer() -> Option<ClipTokenizer> {
     let path = golden_dir().join("tokenizer.json");
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no tokenizer at {}.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py clip_tokenizer --output tests/golden\n",
@@ -111,7 +111,7 @@ fn matches_huggingface_reference() {
     let dir = golden_dir();
     let reference = dir.join("reference.json");
     if !reference.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP matches_huggingface_reference: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py clip_tokenizer --output tests/golden\n\

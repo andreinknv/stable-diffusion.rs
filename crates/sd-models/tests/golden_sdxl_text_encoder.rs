@@ -47,7 +47,7 @@ fn sdxl_second_encoder_matches_transformers() {
     let refs_path = golden_dir().join("reference.safetensors");
     let weights = golden_dir().join("text_encoder_2.safetensors");
     if !refs_path.exists() || !weights.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py sdxl_text_encoder_2 \

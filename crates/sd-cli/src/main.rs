@@ -1621,8 +1621,11 @@ fn main() -> Result<()> {
         } => {
             // [0, 1], not [-1, 1]: Real-ESRGAN was trained on the unsigned
             // range, unlike everything else here.
-            let tensor = sd::image_io::load_rgb_unit(&input, &dev)
+            let image = sd::image_io::load_rgb_unit(&input, &dev)
                 .with_context(|| format!("reading {input}"))?;
+            // ESRGAN takes the unsigned range, which is why the loader hands
+            // back a `UnitImage` rather than a bare tensor.
+            let tensor = image.tensor();
             let (_, _, h, w) = tensor.dims4()?;
 
             tracing::info!(
@@ -1638,7 +1641,7 @@ fn main() -> Result<()> {
             )
             .with_context(|| format!("loading Real-ESRGAN from {model}"))?;
             let net = sd::models::esrgan::RealEsrgan::new(vb).context("building Real-ESRGAN")?;
-            let out = net.upscale_tiled(&tensor).context("upscaling")?;
+            let out = net.upscale_tiled(tensor).context("upscaling")?;
 
             // Back to the [-1, 1] convention save_png expects.
             let signed = ((out * 2.0)? - 1.0)?;

@@ -26,7 +26,7 @@ fn sd3_transformer_matches_diffusers() {
     let refs_path = golden("sd3_transformer/reference.safetensors");
     let weights = golden("sd35/sd35-medium.safetensors");
     if !refs_path.exists() || !weights.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no SD 3.5 reference. Generate with \
              `python3 xtask/golden/dump_reference.py sd3 --output tests/golden`"
         );

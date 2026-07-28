@@ -81,7 +81,7 @@ fn fixtures(
     let refs_path = golden_dir().join("reference.safetensors");
     let weights = golden_dir().join(weights);
     if !refs_path.exists() || !weights.exists() {
-        eprintln!("{REGENERATE}");
+        sd_tensor::skip_missing_fixture!("{REGENERATE}");
         return None;
     }
     Some((

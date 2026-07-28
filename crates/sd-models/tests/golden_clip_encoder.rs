@@ -179,7 +179,7 @@ fn matches_transformers_reference() {
     let refs_path = dir.join("reference.safetensors");
     let weights_path = dir.join("clip.safetensors");
     if !refs_path.exists() || !weights_path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP matches_transformers_reference: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py clip_encoder --output tests/golden\n\
@@ -273,7 +273,7 @@ fn a_quantised_ldm_text_encoder_matches_the_reference() {
     let gguf =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/gguf/sd15-q4_0.gguf");
     if !refs_path.exists() || !gguf.exists() {
-        eprintln!("SKIP: needs the clip reference and sd15-q4_0.gguf");
+        sd_tensor::skip_missing_fixture!("SKIP: needs the clip reference and sd15-q4_0.gguf");
         return;
     }
 

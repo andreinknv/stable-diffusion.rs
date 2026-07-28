@@ -26,7 +26,7 @@ fn golden_dir() -> PathBuf {
 fn refs() -> Option<HashMap<String, Tensor>> {
     let path = golden_dir().join("reference.safetensors");
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py unet_attention --output tests/golden\n"
@@ -40,7 +40,7 @@ fn refs() -> Option<HashMap<String, Tensor>> {
 fn weights(dev: &Device) -> Option<VarBuilder<'static>> {
     let path = golden_dir().join("attention.safetensors");
     if !path.exists() {
-        eprintln!("SKIP: no attention.safetensors");
+        sd_tensor::skip_missing_fixture!("SKIP: no attention.safetensors");
         return None;
     }
     Some(

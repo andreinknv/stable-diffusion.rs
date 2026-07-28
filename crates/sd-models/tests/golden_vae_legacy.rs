@@ -55,7 +55,7 @@ fn decoder_matches_diffusers_from_an_unmodified_checkpoint() {
     let refs_path = golden_dir().join("reference.safetensors");
     let legacy_weights = golden_dir().join("vae_legacy.safetensors");
     if !refs_path.exists() || !legacy_weights.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py vae --output tests/golden\n"

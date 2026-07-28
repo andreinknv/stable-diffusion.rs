@@ -49,7 +49,7 @@ fn quantisation_cost_by_tower() {
     ];
     let present: Vec<_> = quants.iter().filter(|(_, p)| p.exists()).collect();
     if present.is_empty() {
-        eprintln!("SKIP: no gguf fixtures; see xtask/golden/README.md");
+        sd_tensor::skip_missing_fixture!("SKIP: no gguf fixtures; see xtask/golden/README.md");
         return;
     }
 
@@ -58,7 +58,7 @@ fn quantisation_cost_by_tower() {
         sd_tensor::safetensors::load(golden("clip_encoder/reference.safetensors"), &dev);
     let unet_refs = sd_tensor::safetensors::load(golden("unet_full/reference.safetensors"), &dev);
     let (Ok(vae_refs), Ok(clip_refs), Ok(unet_refs)) = (vae_refs, clip_refs, unet_refs) else {
-        eprintln!("SKIP: golden references missing");
+        sd_tensor::skip_missing_fixture!("SKIP: golden references missing");
         return;
     };
 

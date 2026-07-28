@@ -169,7 +169,7 @@ fn fixture(name: &str) -> Option<std::path::PathBuf> {
         .join("../../tests/golden/gguf")
         .join(name);
     if !p.exists() {
-        eprintln!("SKIP: no {name}; see xtask/golden/README.md");
+        sd_tensor::skip_missing_fixture!("SKIP: no {name}; see xtask/golden/README.md");
         return None;
     }
     Some(p)

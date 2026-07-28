@@ -78,7 +78,7 @@ fn matches_the_reference_rrdbnet() {
     let refs_path = golden_dir().join("reference.safetensors");
     let weights = golden_dir().join("esrgan_x4.safetensors");
     if !refs_path.exists() || !weights.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data. Generate it with:\n\n    \
              python3 xtask/golden/dump_reference.py esrgan --output tests/golden\n"
         );

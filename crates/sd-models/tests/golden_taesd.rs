@@ -66,7 +66,7 @@ fn golden_dir(name: &str) -> PathBuf {
 fn refs_for(name: &str) -> Option<HashMap<String, Tensor>> {
     let path = golden_dir(name).join("reference.safetensors");
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py taesd --model-id madebyollin/{name} \
@@ -84,7 +84,7 @@ fn refs() -> Option<HashMap<String, Tensor>> {
 fn real_for(dev: &Device, name: &str, channels: usize) -> Option<TinyAutoencoder> {
     let path = golden_dir(name).join("weights.safetensors");
     if !path.exists() {
-        eprintln!("SKIP: no {name} weights");
+        sd_tensor::skip_missing_fixture!("SKIP: no {name} weights");
         return None;
     }
     let vb = sd_loader::safetensors_var_builder(&[&path], DType::F32, dev).expect("loading TAESD");

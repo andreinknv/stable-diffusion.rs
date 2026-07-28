@@ -15,7 +15,7 @@
 //! starts — once per generation, not per operation — so the deterministic
 //! tests stay deterministic.
 
-use crate::{Error, Result};
+use crate::Result;
 
 /// Fraction of currently-available memory a single job may plan to use.
 ///
@@ -152,8 +152,8 @@ pub fn check_against(bytes: u64, available: Option<u64>, fraction: f64, what: &s
     if bytes <= ceiling {
         return Ok(());
     }
-    Err(Error::Msg(format!(
-        "refusing to start: {what} needs about {}, and only {} is free right now \
+    Err(crate::refusal::refuse(format!(
+        "start: {what} needs about {}, and only {} is free right now \
          ({:.0}% of it is {}).\n\n\
          This is a check against the machine's current state, not against a fixed \
          limit — something else may be using the memory. Close it, use a smaller \

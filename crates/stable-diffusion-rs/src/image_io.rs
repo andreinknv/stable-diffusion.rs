@@ -1,5 +1,6 @@
 //! Converting model output tensors to image files.
 
+use sd_models::image::UnitImage;
 use sd_tensor::{DType, Result, Tensor};
 
 /// Convert a decoder output `[b, 3, h, w]` in `[-1, 1]` to RGB8 bytes.
@@ -99,7 +100,7 @@ pub fn load_mask<P: AsRef<std::path::Path>>(
 pub fn load_rgb_unit<P: AsRef<std::path::Path>>(
     path: P,
     device: &sd_tensor::Device,
-) -> Result<Tensor> {
+) -> Result<UnitImage> {
     let img = image::open(path.as_ref())
         .map_err(|e| sd_tensor::Error::Msg(format!("failed to read image: {e}")))?
         .to_rgb8();
@@ -109,6 +110,7 @@ pub fn load_rgb_unit<P: AsRef<std::path::Path>>(
         .permute((2, 0, 1))?
         .contiguous()?
         .unsqueeze(0)
+        .map(UnitImage::new)
 }
 
 /// [`load_rgb_unit`], resized to an exact size.
@@ -121,7 +123,7 @@ pub fn load_rgb_unit_resized<P: AsRef<std::path::Path>>(
     width: u32,
     height: u32,
     device: &sd_tensor::Device,
-) -> Result<Tensor> {
+) -> Result<UnitImage> {
     let img = image::open(path.as_ref())
         .map_err(|e| sd_tensor::Error::Msg(format!("failed to read image: {e}")))?
         .resize_exact(width, height, image::imageops::FilterType::Lanczos3)
@@ -131,6 +133,7 @@ pub fn load_rgb_unit_resized<P: AsRef<std::path::Path>>(
         .permute((2, 0, 1))?
         .contiguous()?
         .unsqueeze(0)
+        .map(UnitImage::new)
 }
 
 /// Read a reference image the way CLIP's own preprocessing does: `[1, 3, e, e]`
@@ -152,7 +155,7 @@ pub fn load_clip_square<P: AsRef<std::path::Path>>(
     path: P,
     edge: u32,
     device: &sd_tensor::Device,
-) -> Result<Tensor> {
+) -> Result<UnitImage> {
     let img = image::open(path.as_ref())
         .map_err(|e| sd_tensor::Error::Msg(format!("failed to read image: {e}")))?;
     let (w, h) = (img.width().max(1), img.height().max(1));
@@ -183,6 +186,7 @@ pub fn load_clip_square<P: AsRef<std::path::Path>>(
         .permute((2, 0, 1))?
         .contiguous()?
         .unsqueeze(0)
+        .map(UnitImage::new)
 }
 
 /// Resize a `[1, 3, h, w]` image in `[-1, 1]`, via Lanczos in pixel space.
@@ -383,13 +387,13 @@ mod tests {
         assert_eq!(cropped.dims(), &[1, 3, 224, 224]);
         // Source columns 112..336 are all white, so no red survives.
         assert!(
-            max_red_excess(&cropped) < 0.05,
+            max_red_excess(cropped.tensor()) < 0.05,
             "the cropped frame still contains edge content"
         );
 
         let squashed = load_rgb_unit_resized(&wide, 224, 224, &dev).expect("squash");
         assert!(
-            max_red_excess(&squashed) > 0.5,
+            max_red_excess(squashed.tensor()) > 0.5,
             "the squashed frame should still contain the red stripe"
         );
         let _ = std::fs::remove_file(&wide);
@@ -405,7 +409,7 @@ mod tests {
         let out = load_clip_square(&square, 224, &dev).expect("crop");
         assert_eq!(out.dims(), &[1, 3, 224, 224]);
         assert!(
-            max_red_excess(&out) > 0.5,
+            max_red_excess(out.tensor()) > 0.5,
             "a square reference must not be cropped"
         );
         let _ = std::fs::remove_file(&square);

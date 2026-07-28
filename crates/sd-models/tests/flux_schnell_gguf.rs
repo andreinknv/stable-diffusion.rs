@@ -23,7 +23,9 @@ fn gguf() -> PathBuf {
 fn schnell_geometry_is_read_from_the_file() {
     let path = gguf();
     if !path.exists() {
-        eprintln!("SKIP: no Flux schnell gguf; fetch city96/FLUX.1-schnell-gguf");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP: no Flux schnell gguf; fetch city96/FLUX.1-schnell-gguf"
+        );
         return;
     }
     let (double, single) = sd_loader::flux_block_counts(&path).unwrap();
@@ -49,7 +51,7 @@ fn schnell_geometry_is_read_from_the_file() {
 fn schnell_loads_quantised_and_runs() {
     let path = gguf();
     if !path.exists() {
-        eprintln!("SKIP: no Flux schnell gguf");
+        sd_tensor::skip_missing_fixture!("SKIP: no Flux schnell gguf");
         return;
     }
 
@@ -122,12 +124,12 @@ fn schnell_loads_quantised_and_runs() {
 fn schnell_rejects_a_guidance_scale() {
     let path = gguf();
     if !path.exists() {
-        eprintln!("SKIP: no Flux schnell gguf");
+        sd_tensor::skip_missing_fixture!("SKIP: no Flux schnell gguf");
         return;
     }
     let dev = Device::Cpu;
     let Ok(weights) = sd_loader::flux_qtensors_from_gguf(&path, &dev) else {
-        eprintln!("SKIP: guard declined");
+        sd_tensor::skip_missing_fixture!("SKIP: guard declined");
         return;
     };
     let cfg = FluxConfig::schnell();

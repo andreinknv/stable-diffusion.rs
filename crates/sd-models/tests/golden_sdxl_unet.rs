@@ -18,7 +18,7 @@ fn golden_dir() -> PathBuf {
 fn refs() -> Option<HashMap<String, Tensor>> {
     let path = golden_dir().join("reference.safetensors");
     if !path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data.\n\
              Generate it with:\n\
              \n    python3 xtask/golden/dump_reference.py sdxl_unet --output tests/golden\n"
@@ -72,7 +72,7 @@ fn sdxl_unet_matches_diffusers() {
     let Some(refs) = refs() else { return };
     let weights = golden_dir().join("unet.safetensors");
     if !weights.exists() {
-        eprintln!("SKIP: no unet.safetensors");
+        sd_tensor::skip_missing_fixture!("SKIP: no unet.safetensors");
         return;
     }
 

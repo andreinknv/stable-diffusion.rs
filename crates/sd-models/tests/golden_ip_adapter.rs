@@ -47,7 +47,7 @@ fn the_projection_makes_four_tokens() {
     let refs_path = golden_dir().join("reference.safetensors");
     let ip_path = golden_dir().join("ip-adapter_sd15.safetensors");
     if !refs_path.exists() || !ip_path.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data. Generate it with:\n\n    \
              python3 xtask/golden/dump_reference.py ip_adapter --output tests/golden\n"
         );
@@ -77,7 +77,9 @@ fn a_controlled_unet_matches_diffusers() {
     let refs_path = golden_dir().join("reference.safetensors");
     let ip_path = golden_dir().join("ip-adapter_sd15.safetensors");
     if !refs_path.exists() || !ip_path.exists() || !unet_weights().exists() {
-        eprintln!("SKIP a_controlled_unet_matches_diffusers: missing reference or UNet weights");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP a_controlled_unet_matches_diffusers: missing reference or UNet weights"
+        );
         return;
     }
     let refs = sd_tensor::safetensors::load(&refs_path, &dev).expect("reference");
@@ -117,7 +119,7 @@ fn scale_zero_is_exactly_the_uncontrolled_unet() {
     let refs_path = golden_dir().join("reference.safetensors");
     let ip_path = golden_dir().join("ip-adapter_sd15.safetensors");
     if !refs_path.exists() || !ip_path.exists() || !unet_weights().exists() {
-        eprintln!("SKIP scale_zero_is_exactly_the_uncontrolled_unet");
+        sd_tensor::skip_missing_fixture!("SKIP scale_zero_is_exactly_the_uncontrolled_unet");
         return;
     }
     let refs = sd_tensor::safetensors::load(&refs_path, &dev).expect("reference");

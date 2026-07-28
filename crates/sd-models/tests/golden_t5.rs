@@ -23,7 +23,7 @@ fn golden(name: &str) -> PathBuf {
 fn load(dev: &Device) -> Option<(HashMap<String, Tensor>, VarBuilder<'static>)> {
     let (r, w) = (golden("reference.safetensors"), golden("t5.safetensors"));
     if !r.exists() || !w.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no T5 reference. Generate with \
              `python3 xtask/golden/dump_reference.py t5 --output tests/golden`"
         );

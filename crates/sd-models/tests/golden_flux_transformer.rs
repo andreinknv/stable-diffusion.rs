@@ -27,7 +27,7 @@ fn flux_transformer_matches_diffusers() {
     let refs_path = golden("flux_transformer/reference.safetensors");
     let weights = golden("flux/flux-mini.safetensors");
     if !refs_path.exists() || !weights.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no Flux transformer reference. Generate with \
              `python3 xtask/golden/dump_reference.py flux_transformer --output tests/golden`"
         );

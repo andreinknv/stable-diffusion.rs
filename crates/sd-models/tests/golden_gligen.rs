@@ -29,7 +29,7 @@ fn matches_the_reference_projection() {
     let refs_path = golden_dir().join("reference.safetensors");
     let weights = golden_dir().join("gligen_unet.safetensors");
     if !refs_path.exists() || !weights.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data. Generate it with:\n\n    \
              python3 xtask/golden/dump_reference.py gligen --output tests/golden\n"
         );
@@ -57,7 +57,7 @@ fn a_masked_slot_uses_the_learned_null_not_zeros() {
     let refs_path = golden_dir().join("reference.safetensors");
     let weights = golden_dir().join("gligen_unet.safetensors");
     if !refs_path.exists() || !weights.exists() {
-        eprintln!("SKIP a_masked_slot_uses_the_learned_null_not_zeros");
+        sd_tensor::skip_missing_fixture!("SKIP a_masked_slot_uses_the_learned_null_not_zeros");
         return;
     }
     let refs = sd_tensor::safetensors::load(&refs_path, &dev).expect("reference");
@@ -122,11 +122,15 @@ fn a_grounded_unet_matches_diffusers() {
             .then(|| sd_tensor::safetensors::load(&refs_path, &dev).expect("reference")),
         gligen_unet(&dev),
     ) else {
-        eprintln!("SKIP a_grounded_unet_matches_diffusers: missing fixtures");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP a_grounded_unet_matches_diffusers: missing fixtures"
+        );
         return;
     };
     if !refs.contains_key("unet_grounded") {
-        eprintln!("SKIP: reference predates the grounded dump; regenerate it");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP: reference predates the grounded dump; regenerate it"
+        );
         return;
     }
 
@@ -156,11 +160,11 @@ fn without_grounding_tokens_the_fusers_do_nothing() {
             .then(|| sd_tensor::safetensors::load(&refs_path, &dev).expect("reference")),
         gligen_unet(&dev),
     ) else {
-        eprintln!("SKIP without_grounding_tokens_the_fusers_do_nothing");
+        sd_tensor::skip_missing_fixture!("SKIP without_grounding_tokens_the_fusers_do_nothing");
         return;
     };
     if !refs.contains_key("unet_plain") {
-        eprintln!("SKIP: reference predates the grounded dump");
+        sd_tensor::skip_missing_fixture!("SKIP: reference predates the grounded dump");
         return;
     }
 

@@ -26,7 +26,7 @@ fn matches_the_reference_motion_module() {
     let refs_path = golden_dir().join("reference.safetensors");
     let weights = golden_dir().join("motion_adapter.safetensors");
     if !refs_path.exists() || !weights.exists() {
-        eprintln!(
+        sd_tensor::skip_missing_fixture!(
             "SKIP: no reference data. Generate it with:\n\n    \
              python3 xtask/golden/dump_reference.py motion --output tests/golden\n"
         );
@@ -59,7 +59,7 @@ fn a_change_in_one_frame_reaches_the_others() {
     let dev = Device::Cpu;
     let weights = golden_dir().join("motion_adapter.safetensors");
     if !weights.exists() {
-        eprintln!("SKIP a_change_in_one_frame_reaches_the_others");
+        sd_tensor::skip_missing_fixture!("SKIP a_change_in_one_frame_reaches_the_others");
         return;
     }
     let vb = sd_loader::safetensors_var_builder(&[&weights], DType::F32, &dev).expect("weights");
@@ -110,12 +110,16 @@ fn a_unet_with_motion_modules_matches_diffusers() {
     let refs_path = golden_dir().join("reference.safetensors");
     let adapter = golden_dir().join("motion_adapter.safetensors");
     if !refs_path.exists() || !adapter.exists() || !unet_weights().exists() {
-        eprintln!("SKIP a_unet_with_motion_modules_matches_diffusers: missing weights");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP a_unet_with_motion_modules_matches_diffusers: missing weights"
+        );
         return;
     }
     let refs = sd_tensor::safetensors::load(&refs_path, &dev).expect("reference");
     if !refs.contains_key("unet_output") {
-        eprintln!("SKIP: reference predates the whole-UNet dump; regenerate it");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP: reference predates the whole-UNet dump; regenerate it"
+        );
         return;
     }
 
@@ -181,7 +185,9 @@ fn a_pipeline_step_matches_diffusers_at_sixteen_frames() {
     let step = golden_dir().join("pipeline_step.safetensors");
     let adapter = golden_dir().join("motion_adapter.safetensors");
     if !step.exists() || !adapter.exists() || !unet_weights().exists() {
-        eprintln!("SKIP a_pipeline_step_matches_diffusers_at_sixteen_frames: missing fixtures");
+        sd_tensor::skip_missing_fixture!(
+            "SKIP a_pipeline_step_matches_diffusers_at_sixteen_frames: missing fixtures"
+        );
         return;
     }
     let refs = sd_tensor::safetensors::load(&step, &dev).expect("step reference");

@@ -6,6 +6,7 @@ use sd_models::clip::{
     preprocess, ClipTextConfig, ClipTextEncoder, ClipTokenizer, ClipVisionConfig, ClipVisionEncoder,
 };
 use sd_models::controlnet::ControlNet;
+use sd_models::image::UnitImage;
 use sd_models::ip_adapter::{ImageProjModel, NUM_TOKENS};
 use sd_models::prior::{PriorConfig, PriorScheduler, PriorTransformer};
 use sd_models::unclip::NoiseAugmentor;
@@ -445,6 +446,20 @@ pub enum PipelineError {
     Tensor(#[from] sd_tensor::Error),
 }
 
+impl PipelineError {
+    /// Whether this is the memory guard declining rather than a fault.
+    ///
+    /// Exposed so callers do not have to match on message text. The GPU smoke
+    /// test skips on a refusal and fails on anything else, and getting that
+    /// backwards makes the suite go red whenever the machine is busy — which
+    /// teaches people to ignore it.
+    pub fn is_memory_refusal(&self) -> bool {
+        // The marker rather than a literal: one definition, in the module
+        // that produces refusals.
+        self.to_string().contains(sd_tensor::refusal::MARKER)
+    }
+}
+
 /// What a progress callback is told after each denoising step.
 ///
 /// A struct rather than positional arguments because the interesting field is
@@ -666,6 +681,97 @@ struct Areas {
     /// `(mask, context)` per region. Masks are `[1, 1, lh, lw]` at *latent*
     /// resolution, contexts already doubled for the guidance batch.
     regions: Vec<(Tensor, Tensor)>,
+}
+
+/// One denoising run: what it starts from and everything optional about it.
+///
+/// **The point is that adding the next conditioning does not add a twelfth
+/// parameter.** This began as five wrapper methods forwarding positionally
+/// into an eleven-argument `denoise_inner`, each behind its own
+/// `#[allow(clippy::too_many_arguments)]`, and every new capability — a
+/// ControlNet, regions, unCLIP's class labels — widened all of them. Adding a
+/// field here costs one line and cannot be passed in the wrong position.
+struct Denoise<'a> {
+    cfg: &'a Txt2ImgConfig,
+    sigmas: &'a [f64],
+    /// One or more conditionings; `select` picks between them per step.
+    contexts: &'a [Tensor],
+    select: Option<&'a mut dyn FnMut(usize, usize) -> usize>,
+    /// Hold a region at the original — inpainting.
+    keep: Option<Keep<'a>>,
+    control: Option<Hints>,
+    areas: Option<Areas>,
+    /// unCLIP's augmented image embedding, already doubled for guidance.
+    class_labels: Option<Tensor>,
+}
+
+impl<'a> Denoise<'a> {
+    /// The plain run: text conditioning and nothing else.
+    fn new(cfg: &'a Txt2ImgConfig, sigmas: &'a [f64], contexts: &'a [Tensor]) -> Self {
+        Self {
+            cfg,
+            sigmas,
+            contexts,
+            select: None,
+            keep: None,
+            control: None,
+            areas: None,
+            class_labels: None,
+        }
+    }
+
+    fn selecting(mut self, select: Option<&'a mut dyn FnMut(usize, usize) -> usize>) -> Self {
+        self.select = select;
+        self
+    }
+
+    fn keeping(mut self, keep: Option<Keep<'a>>) -> Self {
+        self.keep = keep;
+        self
+    }
+
+    fn controlled(mut self, control: Option<Hints>) -> Self {
+        self.control = control;
+        self
+    }
+
+    fn over_areas(mut self, areas: Areas) -> Self {
+        self.areas = Some(areas);
+        self
+    }
+
+    fn conditioned_on_image(mut self, class_labels: Tensor) -> Self {
+        self.class_labels = Some(class_labels);
+        self
+    }
+}
+
+/// Where one sampler step is: the latent, the model's estimate, and the two
+/// sigmas it moves between.
+///
+/// Grouped because the five travelled together through a twelve-argument
+/// signature, and `sigma` and `sigma_next` are the same type in the same order
+/// — the one pair a positional call can silently swap.
+struct StepPoint<'a> {
+    latent: &'a Tensor,
+    denoised: &'a Tensor,
+    sigma: f64,
+    sigma_next: f64,
+    t: f64,
+}
+
+/// The shape a sampler draws noise in.
+#[derive(Clone, Copy)]
+struct LatentShape {
+    frames: usize,
+    height: usize,
+    width: usize,
+}
+
+impl LatentShape {
+    fn dims(self) -> (usize, usize, usize, usize) {
+        (self.frames, 4, self.height, self.width)
+    }
 }
 
 /// The control maps for one run, already doubled for the guidance batch.
@@ -1308,14 +1414,11 @@ impl Txt2ImgPipeline {
         let sigmas = self.sigmas_for(base.sampler, base.steps);
         let latent = (rng.randn((cfg.base.frames.max(1), 4, lh, lw), &self.device)? * sigmas[0])?;
 
-        let latent = self.denoise_controlled(
-            base,
+        let latent = self.denoise(
             latent,
-            &sigmas,
-            &context,
+            Denoise::new(base, &sigmas, std::slice::from_ref(&context))
+                .controlled(Some(Hints { maps })),
             &mut rng,
-            None,
-            Some(Hints { maps }),
             progress,
         )?;
         self.decode(&latent)
@@ -1483,9 +1586,12 @@ impl Txt2ImgPipeline {
 
     /// Turn a reference image into the tokens the UNet attends over.
     ///
-    /// `image` is `[1, 3, h, w]` in `[0, 1]`, resized to the tower's 224 by the
-    /// caller. Returns `[1, 4, 768]`, ready to be appended to a context.
-    pub fn image_tokens(&self, image: &Tensor) -> Result<Tensor, PipelineError> {
+    /// `image` is the reference at the tower's 224, from
+    /// [`crate::image_io::load_clip_square`]. The [`UnitImage`] is the point:
+    /// CLIP wants `[0, 1]` where everything touching a VAE is `[-1, 1]`, and
+    /// the signed one is *accepted* here — it just describes a different
+    /// picture.
+    pub fn image_tokens(&self, image: &UnitImage) -> Result<Tensor, PipelineError> {
         let (vision, proj) = self.ip.as_ref().ok_or(PipelineError::NoIpAdapter)?;
         let embeds = vision.image_embeds(&preprocess(image)?)?;
         Ok(proj.forward(&embeds)?)
@@ -1499,7 +1605,7 @@ impl Txt2ImgPipeline {
         &self,
         prompt: &str,
         negative_prompt: &str,
-        image: &Tensor,
+        image: &UnitImage,
     ) -> Result<Conditioning, PipelineError> {
         let base = self.encode_conditioning(prompt, negative_prompt)?;
         let tokens = self.image_tokens(image)?;
@@ -1582,12 +1688,9 @@ impl Txt2ImgPipeline {
             self.encode_conditioning(&second.prompt, &second.negative_prompt)?
                 .context,
         ];
-        let latent = self.denoise_selecting(
-            &second,
+        let latent = self.denoise(
             latent,
-            &sigmas[start..],
-            &contexts,
-            None,
+            Denoise::new(&second, &sigmas[start..], &contexts),
             &mut rng,
             progress,
         )?;
@@ -1873,9 +1976,9 @@ impl Txt2ImgPipeline {
 
     /// The augmented image embedding a reference image produces.
     ///
-    /// `image` is `[1, 3, h, w]` in `[0, 1]`, resized to the tower's 224 by the
-    /// caller — the same convention [`Self::image_tokens`] takes. `noise` is
-    /// `[1, embed_dim]`, supplied so the caller owns its seed sequence.
+    /// `image` is the reference at the tower's 224, the same convention
+    /// [`Self::image_tokens`] takes. `noise` is `[1, embed_dim]`, supplied so
+    /// the caller owns its seed sequence.
     ///
     /// Exposed because it is the only interesting intermediate here: an
     /// unCLIP run is an ordinary SD 2.x run with this vector added into every
@@ -1884,7 +1987,7 @@ impl Txt2ImgPipeline {
     /// than the pipeline's opinion of it.
     pub fn image_conditioning(
         &self,
-        image: &Tensor,
+        image: &UnitImage,
         noise_level: usize,
         noise: &Tensor,
     ) -> Result<Tensor, PipelineError> {
@@ -1970,12 +2073,10 @@ impl Txt2ImgPipeline {
         let (lh, lw) = (base.height / 8, base.width / 8);
         let latent = (rng.randn((frames, 4, lh, lw), &self.device)? * sigmas[0])?;
 
-        let latent = self.denoise_unclip(
-            base,
+        let latent = self.denoise(
             latent,
-            &sigmas,
-            &context,
-            class_labels,
+            Denoise::new(base, &sigmas, std::slice::from_ref(&context))
+                .conditioned_on_image(class_labels),
             &mut rng,
             progress,
         )?;
@@ -2056,20 +2157,24 @@ impl Txt2ImgPipeline {
         let latent = {
             let _guard = sd_models::unet::gligen::with_objs(objs);
             self.denoise(
-                base,
                 latent,
-                &sigmas[..=grounded_steps],
-                &context,
+                Denoise::new(
+                    base,
+                    &sigmas[..=grounded_steps],
+                    std::slice::from_ref(&context),
+                ),
                 &mut rng,
                 progress,
             )?
         };
         let latent = if grounded_steps < base.steps {
             self.denoise(
-                base,
                 latent,
-                &sigmas[grounded_steps..],
-                &context,
+                Denoise::new(
+                    base,
+                    &sigmas[grounded_steps..],
+                    std::slice::from_ref(&context),
+                ),
                 &mut rng,
                 progress,
             )?
@@ -2144,17 +2249,11 @@ impl Txt2ImgPipeline {
         let mut rng = SeededRng::new(base.seed);
         let latent = (rng.randn((frames, 4, lh, lw), &self.device)? * sigmas[0])?;
 
-        let latent = self.denoise_inner(
-            base,
+        let contexts = [context];
+        let latent = self.denoise(
             latent,
-            &sigmas,
-            &[context],
-            None,
+            Denoise::new(base, &sigmas, &contexts).over_areas(Areas { regions }),
             &mut rng,
-            None,
-            None,
-            Some(Areas { regions }),
-            None,
             progress,
         )?;
         self.decode(&latent)
@@ -2333,8 +2432,12 @@ impl Txt2ImgPipeline {
             None => drawn,
         };
 
-        let latent =
-            self.denoise_selecting(cfg, latent, &sigmas, &contexts, select, &mut rng, progress)?;
+        let latent = self.denoise(
+            latent,
+            Denoise::new(cfg, &sigmas, &contexts).selecting(select),
+            &mut rng,
+            progress,
+        )?;
 
         // `decode_tiled` applies the scaling factor, like `decode`, and falls
         // through to a whole-image decode for latents that already fit — so
@@ -2399,16 +2502,15 @@ impl Txt2ImgPipeline {
         let noise = rng.randn((1, 4, lh, lw), &self.device)?;
         let latent = (&init + (noise * sigmas[start])?)?;
 
-        let latent = self.denoise_keeping(
-            base,
+        let latent = self.denoise(
             latent,
-            &sigmas[start..],
-            &context,
+            Denoise::new(base, &sigmas[start..], std::slice::from_ref(&context)).keeping(Some(
+                Keep {
+                    mask: &mask,
+                    init: &init,
+                },
+            )),
             &mut rng,
-            Some(Keep {
-                mask: &mask,
-                init: &init,
-            }),
             progress,
         )?;
         let decoded = self.decode(&latent)?;
@@ -2439,149 +2541,69 @@ impl Txt2ImgPipeline {
     /// `sigmas` is a full ladder of `n + 1` boundaries; img2img passes a
     /// suffix of one. `rng` is threaded in rather than created here so the
     /// caller controls draw order, which is what makes a seed reproducible.
-    #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
-        cfg: &Txt2ImgConfig,
         latent: Tensor,
-        sigmas: &[f64],
-        context: &Tensor,
+        run: Denoise<'_>,
         rng: &mut SeededRng,
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
-        self.denoise_keeping(cfg, latent, sigmas, context, rng, None, progress)
+        self.denoise_inner(latent, run, rng, progress)
     }
 
-    /// [`Self::denoise`], optionally holding a region at the original.
-    #[allow(clippy::too_many_arguments)]
-    fn denoise_keeping(
-        &self,
-        cfg: &Txt2ImgConfig,
-        latent: Tensor,
-        sigmas: &[f64],
-        context: &Tensor,
-        rng: &mut SeededRng,
-        keep: Option<Keep<'_>>,
-        progress: ProgressFn<'_>,
-    ) -> Result<Tensor, PipelineError> {
-        self.denoise_controlled(cfg, latent, sigmas, context, rng, keep, None, progress)
-    }
-
-    /// [`Self::denoise`], choosing the conditioning per step.
-    #[allow(clippy::too_many_arguments)]
-    fn denoise_selecting(
-        &self,
-        cfg: &Txt2ImgConfig,
-        latent: Tensor,
-        sigmas: &[f64],
-        contexts: &[Tensor],
-        select: Option<&mut dyn FnMut(usize, usize) -> usize>,
-        rng: &mut SeededRng,
-        progress: ProgressFn<'_>,
-    ) -> Result<Tensor, PipelineError> {
-        self.denoise_inner(
-            cfg, latent, sigmas, contexts, select, rng, None, None, None, None, progress,
-        )
-    }
-
-    /// [`Self::denoise`], conditioned on an image embedding as well as text.
-    #[allow(clippy::too_many_arguments)]
-    fn denoise_unclip(
-        &self,
-        cfg: &Txt2ImgConfig,
-        latent: Tensor,
-        sigmas: &[f64],
-        context: &Tensor,
-        class_labels: Tensor,
-        rng: &mut SeededRng,
-        progress: ProgressFn<'_>,
-    ) -> Result<Tensor, PipelineError> {
-        let contexts = [context.clone()];
-        self.denoise_inner(
-            cfg,
-            latent,
-            sigmas,
-            &contexts,
-            None,
-            rng,
-            None,
-            None,
-            None,
-            Some(class_labels),
-            progress,
-        )
-    }
-
-    /// [`Self::denoise_keeping`], optionally under a ControlNet.
-    #[allow(clippy::too_many_arguments)]
-    fn denoise_controlled(
-        &self,
-        cfg: &Txt2ImgConfig,
-        latent: Tensor,
-        sigmas: &[f64],
-        context: &Tensor,
-        rng: &mut SeededRng,
-        keep: Option<Keep<'_>>,
-        control: Option<Hints>,
-        progress: ProgressFn<'_>,
-    ) -> Result<Tensor, PipelineError> {
-        let contexts = [context.clone()];
-        self.denoise_inner(
-            cfg, latent, sigmas, &contexts, None, rng, keep, control, None, None, progress,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     /// One sampler step, shared by the ordinary path and the cached one.
     ///
     /// Extracted rather than duplicated: a cached step differs only in *where
     /// the prediction came from*, and two copies of the sampler match would
     /// drift the moment a sampler is added.
-    #[allow(clippy::too_many_arguments)]
     fn step(
         &self,
         cfg: &Txt2ImgConfig,
         dpm: &mut DpmSolverPlusPlus2M,
-        latent: &Tensor,
-        denoised: &Tensor,
-        sigma: f64,
-        sigma_next: f64,
-        t: f64,
+        at: StepPoint<'_>,
         rng: &mut SeededRng,
-        frames: usize,
-        lh: usize,
-        lw: usize,
+        shape: LatentShape,
     ) -> Result<Tensor, PipelineError> {
+        let StepPoint {
+            latent,
+            denoised,
+            sigma,
+            sigma_next,
+            t,
+        } = at;
+        let draw = shape.dims();
         Ok(match cfg.sampler {
             SamplerKind::EulerAncestral => {
-                let noise = rng.randn((frames, 4, lh, lw), &self.device)?;
+                let noise = rng.randn(draw, &self.device)?;
                 euler_ancestral_step(latent, denoised, sigma, sigma_next, &noise)?
             }
             SamplerKind::DpmPlusPlus2M => dpm.step(latent, denoised, sigma, sigma_next)?,
             SamplerKind::Lcm => {
                 // Fresh noise each step: LCM re-noises rather than
                 // integrating, so a reused draw correlates the steps.
-                let noise = rng.randn((frames, 4, lh, lw), &self.device)?;
+                let noise = rng.randn(draw, &self.device)?;
                 lcm_step(latent, denoised, sigma, sigma_next, t, &noise)?
             }
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn denoise_inner(
         &self,
-        cfg: &Txt2ImgConfig,
         mut latent: Tensor,
-        sigmas: &[f64],
-        contexts: &[Tensor],
-        mut select: Option<&mut dyn FnMut(usize, usize) -> usize>,
+        run: Denoise<'_>,
         rng: &mut SeededRng,
-        keep: Option<Keep<'_>>,
-        control: Option<Hints>,
-        areas: Option<Areas>,
-        class_labels: Option<Tensor>,
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
+        let Denoise {
+            cfg,
+            sigmas,
+            contexts,
+            mut select,
+            keep,
+            control,
+            areas,
+            class_labels,
+        } = run;
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
         let steps = sigmas.len().saturating_sub(1);
         let mut dpm = DpmSolverPlusPlus2M::new();
@@ -2589,6 +2611,11 @@ impl Txt2ImgPipeline {
         // thing every path here already agrees on, and a caller supplying its
         // own through `run_with_latent` sets the count by doing so.
         let frames = latent.dim(0)?;
+        let shape = LatentShape {
+            frames,
+            height: lh,
+            width: lw,
+        };
         // Reused prediction, and the drift accumulated since it was computed.
         let mut cached: Option<Tensor> = None;
         let mut previous = latent.clone();
@@ -2657,7 +2684,17 @@ impl Txt2ImgPipeline {
                 let noise_pred = cached.clone().expect("checked");
                 let denoised = self.prediction.denoise(&latent, &noise_pred, sigma)?;
                 latent = self.step(
-                    cfg, &mut dpm, &latent, &denoised, sigma, sigma_next, t, rng, frames, lh, lw,
+                    cfg,
+                    &mut dpm,
+                    StepPoint {
+                        latent: &latent,
+                        denoised: &denoised,
+                        sigma,
+                        sigma_next,
+                        t,
+                    },
+                    rng,
+                    shape,
                 )?;
                 progress(Progress {
                     step: i + 1,
@@ -2774,7 +2811,17 @@ impl Txt2ImgPipeline {
             let denoised = self.prediction.denoise(&latent, &noise_pred, sigma)?;
 
             latent = self.step(
-                cfg, &mut dpm, &latent, &denoised, sigma, sigma_next, t, rng, frames, lh, lw,
+                cfg,
+                &mut dpm,
+                StepPoint {
+                    latent: &latent,
+                    denoised: &denoised,
+                    sigma,
+                    sigma_next,
+                    t,
+                },
+                rng,
+                shape,
             )?;
 
             // Restore everything outside the mask to the original, noised to
@@ -2854,7 +2901,12 @@ impl Txt2ImgPipeline {
         let noise = rng.randn((1, 4, lh, lw), &self.device)?;
         let latent = (latent + (noise * sigmas[start])?)?;
 
-        let latent = self.denoise(base, latent, &sigmas[start..], &context, &mut rng, progress)?;
+        let latent = self.denoise(
+            latent,
+            Denoise::new(base, &sigmas[start..], std::slice::from_ref(&context)),
+            &mut rng,
+            progress,
+        )?;
         self.decode(&latent)
     }
 }
