@@ -93,3 +93,74 @@ fn a_change_in_one_frame_reaches_the_others() {
         "a change in frame 0 did not reach frame 2; is the attention temporal?"
     );
 }
+
+// -- the wiring, not just the module ---------------------------------------
+
+fn unet_weights() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/unet_full/unet.safetensors")
+}
+
+#[test]
+fn a_unet_with_motion_modules_matches_diffusers() {
+    // This is the test the module-level comparison cannot substitute for.
+    // Twenty-one modules go in, one after each resnet, and *where* each lands
+    // is invisible to a per-module check — every insertion order keeps every
+    // shape valid. Only an end-to-end comparison says the order is right.
+    let dev = Device::Cpu;
+    let refs_path = golden_dir().join("reference.safetensors");
+    let adapter = golden_dir().join("motion_adapter.safetensors");
+    if !refs_path.exists() || !adapter.exists() || !unet_weights().exists() {
+        eprintln!("SKIP a_unet_with_motion_modules_matches_diffusers: missing weights");
+        return;
+    }
+    let refs = sd_tensor::safetensors::load(&refs_path, &dev).expect("reference");
+    if !refs.contains_key("unet_output") {
+        eprintln!("SKIP: reference predates the whole-UNet dump; regenerate it");
+        return;
+    }
+
+    let motion_vb =
+        sd_loader::safetensors_var_builder(&[&adapter], DType::F32, &dev).expect("adapter");
+    let vb = sd_loader::safetensors_var_builder(&[&unet_weights()], DType::F32, &dev)
+        .expect("unet weights");
+    let unet = sd_models::unet::UNet2DConditionModel::new_with_motion(
+        &sd_models::unet::UNetConfig::sd15(),
+        vb,
+        motion_vb,
+    )
+    .expect("building a UNet with motion modules");
+
+    // Frames ride on the batch, and the count is ambient for the run.
+    let frames = refs["unet_sample"].dim(0).unwrap();
+    let _guard = sd_models::unet::motion::with_frames(frames);
+
+    let out = unet
+        .forward(
+            &refs["unet_sample"],
+            &refs["unet_timestep"],
+            &refs["unet_text"],
+        )
+        .expect("forward");
+    assert_eq!(out.dims(), refs["unet_output"].dims());
+    let excess = testing::allclose_excess(&out, &refs["unet_output"], RTOL).expect("compare");
+    assert!(excess <= ATOL, "motion UNet: excess {excess:.3e}");
+    println!("motion unet excess {excess:.3e}");
+}
+
+#[test]
+fn the_module_paths_are_one_per_resnet_in_construction_order() {
+    // Pinned because it is derived from the checkpoint's layout rather than
+    // from anything visible here, and because `down_blocks.3` having motion
+    // modules while having no attentions is the whole tell that these attach
+    // to resnets.
+    let names = sd_models::unet::motion::MotionSource::sd15_names();
+    assert_eq!(names.len(), 21, "two per down block, one mid, three per up");
+    assert_eq!(names[0], "down_blocks.0.motion_modules.0");
+    assert_eq!(names[7], "down_blocks.3.motion_modules.1");
+    assert_eq!(
+        names[8], "mid_block.motion_modules.0",
+        "mid comes after down"
+    );
+    assert_eq!(names[9], "up_blocks.0.motion_modules.0");
+    assert_eq!(names[20], "up_blocks.3.motion_modules.2");
+}

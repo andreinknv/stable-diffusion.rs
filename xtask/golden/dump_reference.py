@@ -1324,13 +1324,14 @@ def dump_motion(output: pathlib.Path, model_id: str) -> None:
     sample5 = torch.randn(1, 4, nframes, 32, 32, generator=gen2)
     sample_flat = sample5.permute(0, 2, 1, 3, 4).reshape(nframes, 4, 32, 32).contiguous()
     timestep = torch.tensor([500.0])
-    text = torch.randn(1, 77, 768, generator=gen2)
+    # One row per *frame*, not per batch entry. UNetMotionModel does not
+    # repeat the conditioning itself — passing [1, 77, 768] here fails inside
+    # the spatial cross-attention with a 2048-vs-1024 mismatch, because the
+    # hidden states carry frames on the batch and the text does not.
+    text_flat = torch.randn(nframes, 77, 768, generator=gen2)
     with torch.no_grad():
-        out5 = motion_unet(sample5, timestep, encoder_hidden_states=text).sample
+        out5 = motion_unet(sample5, timestep, encoder_hidden_states=text_flat).sample
     unet_out = out5.permute(0, 2, 1, 3, 4).reshape(nframes, 4, 32, 32).contiguous()
-    # The text is repeated per frame internally; this port passes it already
-    # repeated, so dump the repeated form.
-    text_flat = text.repeat_interleave(nframes, dim=0).contiguous()
 
     tensors = {
         "hidden": hidden.contiguous(),

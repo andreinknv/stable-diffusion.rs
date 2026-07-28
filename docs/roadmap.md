@@ -142,7 +142,7 @@ Remaining milestone 2 work:
 
 SD 2.x · SD 3 · Flux (schnell, dev) · ControlNet · LoRA · TAESD ·
 ESRGAN upscaling · inpainting  —  ✅ Flux (flux-mini), ✅ T5 text encoder,
-✅ LoRA (SD 1.5 dense path), ✅ LCM sampling, ✅ inpainting, ✅ ControlNet, ✅ TAESD, ✅ SD 2.x, ✅ ESRGAN upscaling, ✅ IP-Adapter, ✅ seamless tiling, ✅ textual inversion, ✅ two-pass (hires), ✅ checkpoint merging
+✅ LoRA (SD 1.5 dense path), ✅ LCM sampling, ✅ inpainting, ✅ ControlNet, ✅ TAESD, ✅ SD 2.x, ✅ ESRGAN upscaling, ✅ IP-Adapter, ✅ seamless tiling, ✅ textual inversion, ✅ two-pass (hires), ✅ checkpoint merging, ✅ motion modules (model side)
 
 This is the phase that took upstream years, and it parallelizes well: each
 architecture is independent and verifiable against its own golden data.

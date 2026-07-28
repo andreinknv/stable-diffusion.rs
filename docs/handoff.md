@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 319 tests, all gates green
+table is in [roadmap.md](roadmap.md). 321 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -136,9 +136,16 @@ guidance must be ~1, because the distillation folded one in already; and the
 timesteps are a fixed subset of the distillation ladder
 (`[999, 759, 519, 279]` at four steps), not an even spread.
 
-**AnimateDiff motion modules are ported and verified** at **2.662e-7**, and
-**wired into the UNet** — though the wiring itself is not yet verified at UNet
-level, so treat it as untrusted until it is. See [Next](#next).
+**AnimateDiff motion modules are ported, wired and verified** — the module at
+**2.662e-7**, and the whole UNet with all 21 inserted at **5.440e-6**.
+`UNet2DConditionModel::new_with_motion` installs them through the same
+construction-scoped thread-local `unet::ip` uses, one after each resnet, and
+refuses unless all 21 are consumed.
+
+The end-to-end comparison is the one that matters: *where* each module lands is
+invisible to a per-module check, since every insertion order keeps every shape
+valid. The order turned out right — down, then mid, then up, matching this
+UNet's own construction order, unlike the IP-Adapter's index list.
 
 A motion module is a small transformer whose attention runs across *frames*
 rather than pixels, and our own `Attention` and `FeedForward` are reused
@@ -657,37 +664,28 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. Verify the wired motion modules, then batch the pipeline
+### 1. Batch the pipeline, so motion modules can actually be used
 
-**The module is verified at 2.662e-7 and the wiring is written**, but the
-wiring is **not yet verified at UNet level** — which by this project's own
-standard means it is not done. Treat it as untrusted until the reference below
-passes.
+The model side is done and verified (above). What is missing is that **a clip
+is a batch**: 16 frames is a batch of 16, and the pipeline assumes batch 1
+throughout — the latent draw, the CFG concatenation, the timestep tensor, the
+decode.
 
-The wiring: `UNet2DConditionModel::new_with_motion` installs 21 modules — one
-after each resnet, via the same construction-scoped thread-local `unet::ip`
-uses — and refuses unless all 21 are consumed. Down blocks and up blocks run
-theirs after the attention and before pushing the skip; the mid block runs its
-single one between attention and second resnet. With no adapter installed the
-`motion` vectors are empty, so a still-image UNet carries and costs nothing —
-which is why this could land without risk to anything else.
+That is the same change a batched still-image path needs, so it is worth doing
+as *batching* rather than as an animation special case. Once it lands, a run
+is: `motion::with_frames(n)`, a latent of `[n, 4, h, w]`, conditioning repeated
+per frame, and the existing loop.
 
-**What is left, in order:**
+Two things already in place that make it smaller than it looks:
+`Progress::denoised` and `run_with_latent` mean a caller can already drive
+frames explicitly, and `motion::with_frames` already carries the count to all
+21 modules.
 
-1. **Get the reference dump working.** `dump_reference.py motion` builds the
-   whole-UNet half via `UNetMotionModel.from_unet2d`, and it currently fails
-   with a 2048-vs-1024 mismatch inside the time embedding at
-   `unet_motion_model.py:501`. Probably the timestep needs one entry per batch
-   entry, or `from_unet2d` needs different arguments. The module-level half of
-   that dump works and is what produced 2.662e-7.
-2. **Compare the UNet end to end.** Insertion order is exactly the kind of
-   thing that is silent when wrong — as the IP-Adapter index mapping was, and
-   as three separate details of the motion module itself were.
-3. **Batch the pipeline.** A 16-frame clip is a batch of 16, and the pipeline
-   assumes batch 1 throughout: the latent draw, the CFG concatenation, the
-   timestep tensor, the decode. This is the largest single piece and it is the
-   same change a batched still-image path needs, so it is worth doing
-   deliberately rather than as an animation special case.
+The trap to expect: **conditioning is per frame, not per batch entry.** The
+reference `UNetMotionModel` does *not* repeat it internally — passing one row
+where frames expect `n` fails inside the spatial cross-attention with a
+2048-vs-1024 mismatch, which is what stalled the verification of this the
+first time round.
 
 ### ~~2. TAESD and step previews~~ — both done
 
