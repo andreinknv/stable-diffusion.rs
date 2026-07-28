@@ -164,3 +164,49 @@ fn the_module_paths_are_one_per_resnet_in_construction_order() {
     assert_eq!(names[9], "up_blocks.0.motion_modules.0");
     assert_eq!(names[20], "up_blocks.3.motion_modules.2");
 }
+
+#[test]
+fn a_pipeline_step_matches_diffusers_at_sixteen_frames() {
+    // Captured by hooking `AnimateDiffPipeline`'s own UNet call rather than
+    // reconstructing it: three attempts to rebuild the call by hand got the
+    // conditioning shape wrong, and the tensors the pipeline actually passes
+    // are not in doubt.
+    //
+    // What this pins that the two-frame comparison does not: the *pipeline's*
+    // shapes and layout. 16 frames under guidance is a batch of 32, laid out
+    // [uncond frames..., cond frames...] with the conditioning repeated to
+    // match. Both halves of that convention are load-bearing and neither is
+    // checked by a UNet called with hand-made inputs.
+    let dev = Device::Cpu;
+    let step = golden_dir().join("pipeline_step.safetensors");
+    let adapter = golden_dir().join("motion_adapter.safetensors");
+    if !step.exists() || !adapter.exists() || !unet_weights().exists() {
+        eprintln!("SKIP a_pipeline_step_matches_diffusers_at_sixteen_frames: missing fixtures");
+        return;
+    }
+    let refs = sd_tensor::safetensors::load(&step, &dev).expect("step reference");
+    let motion_vb =
+        sd_loader::safetensors_var_builder(&[&adapter], DType::F32, &dev).expect("adapter");
+    let vb = sd_loader::safetensors_var_builder(&[&unet_weights()], DType::F32, &dev)
+        .expect("unet weights");
+    let unet = sd_models::unet::UNet2DConditionModel::new_with_motion(
+        &sd_models::unet::UNetConfig::sd15(),
+        vb,
+        motion_vb,
+    )
+    .expect("building");
+
+    // The guidance batch is 2 * frames; the frame count is the half.
+    let batch = refs["sample"].dim(0).unwrap();
+    let frames = batch / 2;
+    assert_eq!(frames, 16);
+    let _guard = sd_models::unet::motion::with_frames(frames);
+
+    let out = unet
+        .forward(&refs["sample"], &refs["timestep"], &refs["encoder"])
+        .expect("forward");
+    assert_eq!(out.dims(), refs["raw"].dims());
+    let excess = testing::allclose_excess(&out, &refs["raw"], RTOL).expect("compare");
+    assert!(excess <= ATOL, "pipeline step: excess {excess:.3e}");
+    println!("pipeline-step excess {excess:.3e}");
+}

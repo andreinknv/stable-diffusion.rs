@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 324 tests, all gates green
+table is in [roadmap.md](roadmap.md). 325 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -188,8 +188,9 @@ a fixed palette.
 The second pass draws from `seed + 1`, so the two passes do not draw the same
 noise for differently-sized latents.
 
-**AnimateDiff is wired end to end but does not yet render well** — see
-[Next](#next) for exactly what is established and what is not.
+**AnimateDiff is wired end to end and verified through the UNet at the
+pipeline's own shapes** (1.125e-5), but a clip does not yet render well. The
+model is exonerated; see [Next](#next) for where that leaves it.
 
 **A clip is a batch of frames**, `--frames 8`. The pipeline no longer assumes
 batch 1: the latent draw, the guidance concatenation, the timestep tensor and
@@ -698,45 +699,42 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. AnimateDiff end to end — plumbing works, image quality does not
+### 1. AnimateDiff: the model is exonerated, look at the loop or the settings
 
-**Verified:** the motion module at 2.662e-7, and the wired UNet at 5.440e-6.
-`--motion-adapter` reaches the UNet, all 21 modules attach, and the coherence
-effect is measurable. **Not verified:** that a clip looks right. It does not
-yet, and I did not find out why.
-
-Adjacent-frame difference at 16 frames, 256 px, seed 12 — lower is more
-coherent:
+**Three comparisons now pass**, each covering something the last did not:
 
 ```text
-  no adapter, euler_a     104.2
-  adapter,    euler_a      73.4
-  adapter,    dpmpp2m      49.1
+  motion module alone                    2.662e-7
+  wired UNet, 2 frames, hand-made input  5.440e-6
+  a real pipeline step, 16 frames        1.125e-5
 ```
 
-Monotone in the right direction, and `dpmpp2m` helps because euler-ancestral
-draws fresh *independent* noise per frame every step, which fights the very
-coupling the modules add. But the frames are still degraded — recognisable
-structure at 16 frames, mush at 4.
+The third was captured by *hooking* `AnimateDiffPipeline`'s own UNet call
+rather than reconstructing it — three attempts to rebuild that call by hand
+got the conditioning shape wrong, and the tensors the pipeline actually passes
+are not in doubt. It pins the pipeline's real shapes and layout: 16 frames
+under guidance is a batch of 32, laid out `[uncond frames..., cond frames...]`
+with the conditioning **repeated to match** (the reference does repeat it, and
+`repeat_interleave` gives exactly that order).
 
-**Two things are already ruled out, so do not re-run them:**
+So the model, the frame layout and the guidance assembly are all correct, and
+whatever is wrong is **after** the UNet: the sampling loop, the schedule
+mapping, or the run settings.
 
-- **It is not the frame count alone.** At 4 frames `diffusers`' own
-  `AnimateDiffPipeline` produces the *same* noise, with the same prompt and
-  seed. AnimateDiff v2 is trained for 16; 4 is simply outside what it does.
-  That the port reproduces the reference's failure mode is mild evidence for
-  the port.
-- **It is not the beta schedule.** I guessed linear, tried it, saw no
-  improvement, and checked: `AnimateDiffPipeline` defaults to `scaled_linear`,
-  which is what this already uses. Reverted.
+**The most likely confound, and the cheapest thing to check next:** every
+16-frame run so far was at **256 px**, because 16 frames at 512 under guidance
+is a batch of 32 at 4096 tokens and I did not want to risk the memory. SD 1.5
+composes badly at 256 regardless of motion, so those images may be wrong for a
+reason that has nothing to do with AnimateDiff. **Run diffusers' own pipeline
+at 16 frames, 256 px and look at its output.** If it is mush too, this port
+already matches and the answer is resolution; if it is clean, the fault is in
+the loop.
 
-**What I would try next, in order:** compare our latent against
-`AnimateDiffPipeline`'s after *one* step with identical inputs — that
-localises to the loop rather than the model, which the 5.440e-6 UNet
-comparison already exonerates. Then guidance scale and step count, which
-AnimateDiff is sensitive to. The reference pipeline also applies
-`free_init`/no special scaling by default, so an unnoticed normalisation is
-plausible.
+After that: our sampler is k-diffusion (variance-exploding sigmas, input
+scaled by `1/sqrt(sigma^2+1)`) where the reference uses PNDM in the
+variance-preserving parameterisation. That mapping is exercised by every
+working still-image path, so it is unlikely — but it is the next thing after
+resolution.
 
 ### ~~2. TAESD and step previews~~ — both done
 
