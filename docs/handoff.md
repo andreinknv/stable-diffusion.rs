@@ -193,7 +193,26 @@ through the UNet at the pipeline's own shapes (1.125e-5), and the output now
 tracks the reference — see [Next](#next) for the beta-schedule trap that made
 this look broken for a long time.
 
-**GLIGEN's model side is complete and verified**: the grounding projection at
+**GLIGEN generates from boxes**, `sdrs ground --box "0.05,0.4,0.45,0.95=a
+wooden bench"`. The only conditioning here that addresses *placement*: text
+cannot do it reliably and a ControlNet needs a picture of the layout.
+Coordinates are **relative**, not pixels — both are plausible readings of four
+numbers, so the type says so and the CLI refuses anything outside `0..1`.
+
+Swapping two boxes moves the objects (`assets/gligen-*.png`): the tree sits
+centre-right with one layout and hard left with the other, same seed and
+prompt.
+
+**Grounding runs for the first 30 % of the schedule, then stops.** Not a flag
+inside the loop — the denoise is called twice, with the guard held across the
+first call only, because the guard *is* the mechanism. Holding it throughout
+costs image quality for placement already achieved, which is what the paper
+calls scheduled sampling.
+
+Phrases are **pooled** CLIP embeddings, one per box, not 77-token sequences:
+grounding is about what a phrase means as a whole.
+
+**GLIGEN's model side is verified**: the grounding projection at
 **7.629e-6**, and a **grounded UNet at 1.419e-6** with all 16 fusers in place.
 Pipeline wiring is what remains; see [Next](#next).
 
@@ -798,25 +817,12 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. Wire GLIGEN into the pipeline
+### ~~1. GLIGEN~~ — done end to end
 
-The model side is done and verified (above). What is left is the run:
-
-- **Phrase embeddings.** One per box, from CLIP. GLIGEN uses the *pooled*
-  embedding per phrase, so `ClipTextEncoder::pooled_hidden` is the entry point
-  rather than the 77-token sequence.
-- **A `Grounding` config** — boxes in `[0, 1]` as `xyxy`, phrases, and a
-  scheduled-sampling fraction. Boxes are relative, not pixels, which is worth
-  stating in the type since both are plausible.
-- **The loop**: build tokens once with `PositionNet`, hold
-  `gligen::with_objs` for the first `fraction * steps` steps, drop it, finish.
-  The guard already makes that a two-line change.
-- Tokens must be doubled for the guidance batch, like every other conditioning
-  here.
-
-The checkpoint is a **whole SD 1.5 UNet plus fusers**, not an adapter, so it
-loads as its own model — `Txt2ImgPipeline::load` on its directory already
-builds the fusers, since they are found by name.
+Nothing left. What remains of the breadth issue is unCLIP and hypernetworks,
+neither of which is a small addition: unCLIP needs its own checkpoints rather
+than an adapter, and hypernetworks predate LoRA and are little used. Video,
+audio and 3D the issue itself calls separate decisions.
 
 ### ~~2. TAESD and step previews~~ — both done
 

@@ -36,7 +36,7 @@
 use std::cell::RefCell;
 
 use sd_tensor::nn::{layer_norm, linear, LayerNorm, LayerNormConfig, Linear, VarBuilder};
-use sd_tensor::{DType, Module, Result, Tensor};
+use sd_tensor::{Module, Result, Tensor};
 
 use super::attention::{Attention, FeedForward};
 
@@ -93,9 +93,10 @@ impl Fuser {
 
     /// `vb` is the *block's* builder; the fuser is at `fuser` beneath it.
     pub fn new(dim: usize, cross_dim: usize, heads: usize, vb: VarBuilder) -> Result<Self> {
-        let gate = |name: &str| -> Result<f64> {
-            vb.get((), name)?.to_dtype(DType::F64)?.to_scalar::<f64>()
-        };
+        // Read as f32 and widen here: Metal has no f64, so converting the
+        // tensor first fails on the GPU path while working fine on CPU — the
+        // kind of difference that only shows up on one backend.
+        let gate = |name: &str| -> Result<f64> { Ok(vb.get((), name)?.to_scalar::<f32>()? as f64) };
         Ok(Self {
             linear: linear(cross_dim, dim, vb.pp("linear"))?,
             // Self-attention over the concatenation, so no cross dimension.

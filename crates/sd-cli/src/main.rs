@@ -308,6 +308,54 @@ enum Command {
         output: String,
     },
 
+    /// Place objects by bounding box (GLIGEN).
+    ///
+    /// The only conditioning here that addresses *placement*: text cannot do
+    /// it reliably and a ControlNet needs a picture of the layout. Needs a
+    /// GLIGEN checkpoint, not an ordinary SD 1.5 one.
+    #[command(name = "ground")]
+    Ground {
+        #[arg(long)]
+        model: String,
+
+        #[arg(long)]
+        prompt: String,
+
+        /// `x0,y0,x1,y1=phrase`, coordinates in 0..1 rather than pixels.
+        /// Repeatable.
+        #[arg(long, value_name = "BOX=PHRASE")]
+        r#box: Vec<String>,
+
+        /// Fraction of the schedule to ground for. GLIGEN grounds early and
+        /// finishes free; holding it throughout costs image quality.
+        #[arg(long, default_value_t = 0.3)]
+        grounding_fraction: f64,
+
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        #[arg(long, default_value_t = 7.5)]
+        cfg_scale: f64,
+
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        #[arg(long, default_value = "euler_a")]
+        sampler: String,
+
+        #[arg(long, short, default_value = "grounded.png")]
+        output: String,
+    },
+
     /// Edit an image by instruction: "change the sky to sunset".
     ///
     /// Different from img2img, which takes a description of the *result* and a
@@ -1196,6 +1244,74 @@ fn main() -> Result<()> {
                 .context("running SD 3")?;
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             tracing::info!(elapsed = ?t1.elapsed(), output = %output, "done");
+        }
+
+        Command::Ground {
+            model,
+            prompt,
+            r#box,
+            grounding_fraction,
+            negative_prompt,
+            width,
+            height,
+            steps,
+            cfg_scale,
+            seed,
+            sampler,
+            output,
+        } => {
+            let boxes = r#box
+                .iter()
+                .map(|spec| {
+                    let (coords, phrase) = spec.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!("--box wants x0,y0,x1,y1=phrase, got `{spec}`")
+                    })?;
+                    let v: Vec<f32> = coords
+                        .split(',')
+                        .map(|c| c.trim().parse::<f32>())
+                        .collect::<Result<_, _>>()
+                        .map_err(|_| anyhow::anyhow!("`{coords}` is not four numbers"))?;
+                    let bbox: [f32; 4] = v.try_into().map_err(|_| {
+                        anyhow::anyhow!("a box is four numbers in 0..1, got `{coords}`")
+                    })?;
+                    if bbox.iter().any(|c| !(0.0..=1.0).contains(c)) {
+                        anyhow::bail!("box coordinates are relative (0..1), got `{coords}`");
+                    }
+                    tracing::info!(bbox = ?bbox, phrase = %phrase, "grounded box");
+                    Ok(sd::pipeline::GroundedBox {
+                        bbox,
+                        phrase: phrase.to_string(),
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
+            let cfg = sd::pipeline::GroundingConfig {
+                base: Txt2ImgConfig {
+                    prompt,
+                    negative_prompt,
+                    width,
+                    height,
+                    steps,
+                    cfg_scale,
+                    seed,
+                    sampler: parse_sampler(&sampler)?,
+                    frames: 1,
+                    cancel: None,
+                },
+                boxes,
+                grounding_fraction,
+            };
+            let started = std::time::Instant::now();
+            let mut report = |p: sd::pipeline::Progress| {
+                tracing::info!(step = p.step, total = p.total, "denoise");
+            };
+            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
+                .with_context(|| format!("loading pipeline from {model}"))?;
+            let img = pipeline
+                .run_grounded_with_progress(&cfg, &mut report)
+                .context("running grounded generation")?;
+            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
+            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
         }
 
         Command::Instruct {

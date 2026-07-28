@@ -78,6 +78,35 @@ pub struct InstructConfig {
     pub image_guidance: f64,
 }
 
+/// One grounded object: a phrase and where to put it.
+#[derive(Debug, Clone)]
+pub struct GroundedBox {
+    /// `[x0, y0, x1, y1]` in **`[0, 1]`**, not pixels. Relative because the
+    /// model was trained that way and because a box should survive a change of
+    /// resolution — and because both are plausible readings of four numbers,
+    /// which is why the type says so.
+    pub bbox: [f32; 4],
+    pub phrase: String,
+}
+
+/// Generation grounded on boxes: "put this thing *here*".
+///
+/// The only conditioning here that addresses *placement*. Text cannot do it
+/// reliably and a ControlNet needs a picture of the layout; this takes the
+/// boxes directly.
+#[derive(Debug, Clone)]
+pub struct GroundingConfig {
+    pub base: Txt2ImgConfig,
+    pub boxes: Vec<GroundedBox>,
+    /// Fraction of the schedule to ground for. 0.3 is the published default.
+    ///
+    /// **Not 1.0.** GLIGEN grounds early, while composition is being decided,
+    /// then finishes free — holding the model to the boxes all the way through
+    /// costs image quality for placement it has already achieved. This is the
+    /// "scheduled sampling" the paper describes.
+    pub grounding_fraction: f64,
+}
+
 /// One region of the canvas, with its own prompt.
 #[derive(Debug, Clone)]
 pub struct Region {
@@ -309,6 +338,13 @@ pub enum PipelineError {
         got: usize,
         want: usize,
     },
+    #[error(
+        "this checkpoint has no GLIGEN grounding.\n\n\
+         Grounding lives inside the UNet's transformer blocks, so it needs a GLIGEN \
+         checkpoint rather than an adapter — an ordinary SD 1.5 UNet has no fusers and \
+         would ignore the boxes silently."
+    )]
+    NoGrounding,
     #[error("cancelled after {completed} of {total} steps")]
     Cancelled { completed: usize, total: usize },
     #[error("tensor: {0}")]
@@ -506,6 +542,8 @@ pub struct Txt2ImgPipeline {
     controlnets: Vec<ControlNet>,
     /// What the UNet's output means. See [`Prediction`].
     prediction: Prediction,
+    /// GLIGEN's grounding projection, when the checkpoint carries one.
+    position_net: Option<sd_models::gligen::PositionNet>,
     /// Textual-inversion embeddings, spliced into prompts by trigger word.
     embeddings: Vec<sd_loader::embedding::Embedding>,
     /// The image tower and projection, when an IP-Adapter is attached. The
@@ -747,6 +785,20 @@ impl Txt2ImgPipeline {
             (None, None) => UNet2DConditionModel::new(&unet_cfg, vb)?,
         };
 
+        // GLIGEN's grounding projection lives in the UNet file alongside the
+        // fusers, so it is found the same way they are: by name, present or
+        // absent. A checkpoint without grounding simply has no `position_net`.
+        let unet_vb = sd_loader::safetensors_var_builder(&[&unet_path], DType::F32, device)?;
+        let position_net = if unet_vb.contains_tensor("position_net.null_positive_feature") {
+            Some(sd_models::gligen::PositionNet::new(
+                768,
+                unet_cfg.cross_attention_dim,
+                unet_vb.pp("position_net"),
+            )?)
+        } else {
+            None
+        };
+
         let vb = sd_loader::safetensors_var_builder(&[&vae_path], DType::F32, device)?;
         let vae = AutoencoderKlDecoder::new(&VaeConfig::sd15(), vb).map_err(|source| {
             PipelineError::VaeWeights {
@@ -789,6 +841,7 @@ impl Txt2ImgPipeline {
             controlnets: Vec::new(),
             prediction,
             embeddings: Vec::new(),
+            position_net,
             ip: None,
         })
     }
@@ -852,6 +905,7 @@ impl Txt2ImgPipeline {
             controlnets: Vec::new(),
             prediction: Prediction::Epsilon,
             embeddings: Vec::new(),
+            position_net: None,
             ip: None,
         })
     }
@@ -1396,6 +1450,103 @@ impl Txt2ImgPipeline {
                 denoised: &denoised,
             });
         }
+        self.decode(&latent)
+    }
+
+    /// Generate with objects placed by bounding box.
+    ///
+    /// Needs a GLIGEN checkpoint — an ordinary SD 1.5 UNet has no fusers, and
+    /// grounding it would silently do nothing, so that is refused rather than
+    /// ignored.
+    pub fn run_grounded(&self, cfg: &GroundingConfig) -> Result<Tensor, PipelineError> {
+        self.run_grounded_with_progress(cfg, &mut |_| {})
+    }
+
+    /// [`Self::run_grounded`], reporting progress after each step.
+    pub fn run_grounded_with_progress(
+        &self,
+        cfg: &GroundingConfig,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let base = &cfg.base;
+        if base.width % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("width", base.width));
+        }
+        if base.height % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("height", base.height));
+        }
+        if base.steps == 0 {
+            return Err(PipelineError::NoSteps);
+        }
+        let position_net = self
+            .position_net
+            .as_ref()
+            .ok_or(PipelineError::NoGrounding)?;
+        if cfg.boxes.is_empty() {
+            return Err(PipelineError::Tensor(sd_tensor::Error::Msg(
+                "run_grounded needs at least one box".to_string(),
+            )));
+        }
+
+        // One row per box: the *pooled* phrase embedding, not the 77-token
+        // sequence. GLIGEN grounds on what a phrase means as a whole.
+        let n = cfg.boxes.len();
+        let mut phrase_rows = Vec::with_capacity(n);
+        let mut coords = Vec::with_capacity(n * 4);
+        for grounded in &cfg.boxes {
+            let ids = self.tokenizer.encode(&grounded.phrase)?;
+            let ids = Tensor::from_vec(ids, (1, self.tokenizer.max_length()), &self.device)?;
+            phrase_rows.push(self.text_encoder.pooled_hidden(&ids)?);
+            coords.extend_from_slice(&grounded.bbox);
+        }
+        let phrases = Tensor::cat(&phrase_rows, 0)?.reshape((1, n, 768))?;
+        let boxes = Tensor::from_vec(coords, (1, n, 4), &self.device)?;
+        // Every slot is real here, so every mask is 1. The learned nulls exist
+        // for callers batching a fixed number of slots.
+        let masks = Tensor::ones((1, n), DType::F32, &self.device)?;
+
+        let objs = position_net.forward(&boxes, &masks, &phrases)?;
+        // Doubled for the guidance batch, like every other conditioning here.
+        let objs = Tensor::cat(&[&objs, &objs], 0)?;
+
+        let cond = self.encode(&base.prompt)?;
+        let uncond = self.encode(&base.negative_prompt)?;
+        let context = Tensor::cat(&[&uncond, &cond], 0)?;
+
+        let sigmas = self.sigmas_for(base.sampler, base.steps);
+        let (lh, lw) = (base.height / 8, base.width / 8);
+        let mut rng = SeededRng::new(base.seed);
+        let latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+
+        // Grounded for the first fraction, free for the rest. Two calls rather
+        // than a flag inside the loop: the guard *is* the mechanism, and
+        // dropping it is how grounding turns off.
+        let grounded_steps = ((base.steps as f64 * cfg.grounding_fraction.clamp(0.0, 1.0)).round()
+            as usize)
+            .min(base.steps);
+        let latent = {
+            let _guard = sd_models::unet::gligen::with_objs(objs);
+            self.denoise(
+                base,
+                latent,
+                &sigmas[..=grounded_steps],
+                &context,
+                &mut rng,
+                progress,
+            )?
+        };
+        let latent = if grounded_steps < base.steps {
+            self.denoise(
+                base,
+                latent,
+                &sigmas[grounded_steps..],
+                &context,
+                &mut rng,
+                progress,
+            )?
+        } else {
+            latent
+        };
         self.decode(&latent)
     }
 
