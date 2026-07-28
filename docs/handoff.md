@@ -188,9 +188,10 @@ a fixed palette.
 The second pass draws from `seed + 1`, so the two passes do not draw the same
 noise for differently-sized latents.
 
-**AnimateDiff is wired end to end and verified through the UNet at the
-pipeline's own shapes** (1.125e-5), but a clip does not yet render well. The
-model is exonerated; see [Next](#next) for where that leaves it.
+**AnimateDiff renders**, `--motion-adapter <file> --frames 16`. Verified
+through the UNet at the pipeline's own shapes (1.125e-5), and the output now
+tracks the reference — see [Next](#next) for the beta-schedule trap that made
+this look broken for a long time.
 
 **A clip is a batch of frames**, `--frames 8`. The pipeline no longer assumes
 batch 1: the latent draw, the guidance concatenation, the timestep tensor and
@@ -699,56 +700,44 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### 1. AnimateDiff: the model is exonerated, look at the loop or the settings
+### ~~1. AnimateDiff~~ — the answer was the beta schedule
 
-**Three comparisons now pass**, each covering something the last did not:
+**A motion adapter needs a `linear` beta schedule, not SD 1.5's
+scaled-linear**, and nothing warns you: it loads cleanly onto the wrong one
+and renders noise. `diffusers`' documentation says the checkpoints "can be
+sensitive to the beta schedule" and recommends linear; the effect is not
+subtle.
 
-```text
-  motion module alone                    2.662e-7
-  wired UNet, 2 frames, hand-made input  5.440e-6
-  a real pipeline step, 16 frames        1.125e-5
-```
-
-The third was captured by *hooking* `AnimateDiffPipeline`'s own UNet call
-rather than reconstructing it — three attempts to rebuild that call by hand
-got the conditioning shape wrong, and the tensors the pipeline actually passes
-are not in doubt. It pins the pipeline's real shapes and layout: 16 frames
-under guidance is a batch of 32, laid out `[uncond frames..., cond frames...]`
-with the conditioning **repeated to match** (the reference does repeat it, and
-`repeat_interleave` gives exactly that order).
-
-So the model, the frame layout and the guidance assembly are all correct, and
-whatever is wrong is **after** the UNet: the sampling loop, the schedule
-mapping, or the run settings.
-
-**Resolution is ruled out, and the reference fails harder than this port does.**
-Measured, 16 frames, seed 12, same prompt:
+Measured, 16 frames, 256 px, seed 12, same prompt:
 
 ```text
-                        adjacent-frame diff   per-frame std
-  diffusers @ 256              109.6              102.7
-  this port  @ 256, dpmpp2m     49.1               69.5
-  this port  @ 512, dpmpp2m     (still noise)
+                                     adj    std
+  diffusers, PNDM / scaled-linear   109.6  102.7   banded mush
+  diffusers, DDIM / linear           59.0   85.0   a recognisable car
+  this port, dpmpp2m / scaled-linear 49.1   69.5   mush
+  this port, dpmpp2m / linear        57.0   92.1   a coastal road scene
 ```
 
-So `diffusers`' own `AnimateDiffPipeline` produces black-and-white banded mush
-at 256 — worse than this port's output at the same settings — and moving to
-512 did not fix this port either. 256 was never a fair test of anything, and
-512 is not the answer on its own.
+The port now tracks the reference. `Txt2ImgPipeline` switches to linear
+whenever a motion adapter is attached, so a caller cannot get this wrong.
 
-**The one experiment still missing is `diffusers` at 16 frames, 512 px.** It
-was started and is slow on CPU; if it renders a clean car then there is a real
-bug in this port's sampling loop and the way to find it is to bisect by
-comparing latents after N steps (the one-step comparison already passes at
-1.125e-5, so N > 1). If it produces mush too, this port matches the reference
-and the fault is in how these particular weights are being driven — prompt,
-guidance, step count — rather than in any code here.
+**How this was nearly missed, which is the part worth keeping.** The linear
+schedule was my *first* hypothesis. I tested it at **4 frames**, saw no
+improvement, and rejected it — but 4 frames produces noise on its own, so the
+test could not have shown anything. Then I "confirmed" the rejection by
+noting that `AnimateDiffPipeline` defaults to scaled-linear, which is true and
+irrelevant: the pipeline inherits SD 1.5's scheduler unless you override it,
+which the documented example does. A correct observation about the reference,
+used to support a conclusion it did not support.
 
-After that: our sampler is k-diffusion (variance-exploding sigmas, input
-scaled by `1/sqrt(sigma^2+1)`) where the reference uses PNDM in the
-variance-preserving parameterisation. That mapping is exercised by every
-working still-image path, so it is unlikely — but it is the next thing after
-resolution.
+Two lessons: a null result from a confounded test is not a null result, and
+"what does the reference default to" is a different question from "what does
+the reference recommend".
+
+**What is still open** is only quality at scale: everything above is 256 px,
+where SD 1.5 composes poorly regardless. 16 frames at 512 runs (421 s, batch
+of 32) but has not been re-run since the schedule fix. That is the image worth
+capturing.
 
 ### ~~2. TAESD and step previews~~ — both done
 

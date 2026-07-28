@@ -688,7 +688,20 @@ impl Txt2ImgPipeline {
             unet,
             decoder: Decoder::Vae(Box::new(vae)),
             vae_encoder,
-            schedule: Schedule::sd15(),
+            // **AnimateDiff needs a linear beta schedule**, not SD 1.5's
+            // scaled-linear. diffusers' own documentation says the checkpoints
+            // "can be sensitive to the beta schedule" and recommends linear,
+            // and it is not a small effect: the *reference* pipeline, run with
+            // SD 1.5's default PNDM/scaled-linear, produces black-and-white
+            // banded mush at 16 frames, and a recognisable car with
+            // DDIM/linear at otherwise identical settings.
+            //
+            // Worth knowing because nothing warns you: a motion adapter loads
+            // cleanly onto the wrong schedule and renders noise.
+            schedule: match motion_vb {
+                Some(_) => Schedule::new(1000, 0.00085, 0.012, sd_sample::BetaSchedule::Linear),
+                None => Schedule::sd15(),
+            },
             device: device.clone(),
             controlnets: Vec::new(),
             prediction,
