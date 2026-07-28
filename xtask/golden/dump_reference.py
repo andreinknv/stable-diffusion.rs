@@ -1357,6 +1357,58 @@ def dump_motion(output: pathlib.Path, model_id: str) -> None:
         print(f"  {k:<8} {tuple(v.shape)}")
 
 
+def dump_gligen(output: pathlib.Path, model_id: str) -> None:
+    """GLIGEN's grounding projection, and the checkpoint converted.
+
+    The UNet ships as a pickled .bin, so this converts it -- the only reason
+    the Rust side needs a Python step. The reference itself is `position_net`
+    in isolation, because the axis order inside the Fourier embedding is the
+    part that is easy to get wrong and produces a working shape either way.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers.models.embeddings import GLIGENTextBoundingboxProjection
+    from safetensors.torch import save_file
+
+    out = output / "gligen"
+    out.mkdir(parents=True, exist_ok=True)
+
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    src = hf_hub_download(repo_id=model_id, filename="unet/diffusion_pytorch_model.bin")
+    print(f"converting {src}")
+    state = torch.load(src, map_location="cpu", weights_only=True)
+    state = {k: v.contiguous().float() for k, v in state.items()}
+    save_file(state, str(out / "gligen_unet.safetensors"))
+
+    net = GLIGENTextBoundingboxProjection(positive_len=768, out_dim=768)
+    net.load_state_dict(
+        {k[len("position_net."):]: v for k, v in state.items() if k.startswith("position_net.")}
+    )
+    net.eval()
+
+    gen = torch.Generator().manual_seed(SEED)
+    boxes = torch.rand(1, 3, 4, generator=gen)
+    # One slot masked off, so the learned nulls are exercised rather than
+    # assumed -- a reference where every mask is 1 would not test them.
+    masks = torch.tensor([[1.0, 1.0, 0.0]])
+    phrases = torch.randn(1, 3, 768, generator=gen)
+
+    with torch.no_grad():
+        objs = net(boxes, masks, phrases)
+
+    tensors = {
+        "boxes": boxes.contiguous(), "masks": masks.contiguous(),
+        "phrases": phrases.contiguous(), "objs": objs.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    print(f"\\nwrote {out / 'reference.safetensors'}")
+    for k, v in sorted(tensors.items()):
+        print(f"  {k:<8} {tuple(v.shape)}")
+    print(f"converted {len(state)} tensors")
+
+
 SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
 
 
@@ -1699,6 +1751,10 @@ def main() -> None:
     )
     unet_full.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    gl = sub.add_parser("gligen", help="dump GLIGEN grounding references")
+    gl.add_argument("--model-id", default="masterful/gligen-1-4-generation-text-box")
+    gl.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     mo = sub.add_parser("motion", help="dump AnimateDiff motion module references")
     mo.add_argument("--model-id", default="guoyww/animatediff-motion-adapter-v1-5-2")
     mo.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -1744,7 +1800,9 @@ def main() -> None:
     gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
     args = ap.parse_args()
-    if args.component == "motion":
+    if args.component == "gligen":
+        dump_gligen(args.output, args.model_id)
+    elif args.component == "motion":
         dump_motion(args.output, args.model_id)
     elif args.component == "ip_adapter":
         dump_ip_adapter(args.output, args.model_id)

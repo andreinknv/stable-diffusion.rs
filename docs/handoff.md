@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 328 tests, all gates green
+table is in [roadmap.md](roadmap.md). 332 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -192,6 +192,28 @@ noise for differently-sized latents.
 through the UNet at the pipeline's own shapes (1.125e-5), and the output now
 tracks the reference — see [Next](#next) for the beta-schedule trap that made
 this look broken for a long time.
+
+**GLIGEN's grounding projection is ported and verified** at **7.629e-6** — the
+half that turns `(box, phrase)` pairs into tokens. The gated attention that
+consumes them is not done; see [Next](#next).
+
+Boxes are expanded into sinusoids at eight frequencies, the timestep-embedding
+trick applied to space. **The axis order is the whole subtlety**: the axes are
+`(coordinate, frequency, sin/cos)` and flatten as
+`(frequency, sin/cos, coordinate)`. Every permutation produces 64 numbers and
+loads against the same weights; only one lines up with what the MLP was
+trained on, and the rest give grounding tokens that are wrong without being
+malformed. That is what the golden comparison is for.
+
+**A masked slot uses a *learned* null, not zeros** — both for the phrase and
+the position. Padding with zeros reads as "a phrase whose embedding happens to
+be zero", which is a different thing and one the model was never shown. The
+reference masks one of three slots off so this is exercised rather than
+assumed, and a second test pins that a masked slot does not depend on its
+contents.
+
+The checkpoint ships as a pickled `.bin`, so `dump_reference.py gligen`
+converts the whole UNet to safetensors as a side effect — 966 tensors.
 
 **Instruction editing works**, `sdrs instruct --prompt "make it winter with
 snow" --init-image X`. Different from img2img: that takes a description of the
@@ -759,44 +781,37 @@ small: pre-allocate each block's buffers once and reuse them across steps
 lock before either — this was diagnosed by reading candle's source, not by
 profiling it.
 
-### ~~1. AnimateDiff~~ — the answer was the beta schedule
+### 1. Finish GLIGEN: the gated self-attention
 
-**A motion adapter needs a `linear` beta schedule, not SD 1.5's
-scaled-linear**, and nothing warns you: it loads cleanly onto the wrong one
-and renders noise. `diffusers`' documentation says the checkpoints "can be
-sensitive to the beta schedule" and recommends linear; the effect is not
-subtle.
-
-Measured, 16 frames, 256 px, seed 12, same prompt:
+The grounding tokens are done and verified at 7.629e-6 (above). What consumes
+them is a **`fuser` in each of the 16 transformer blocks**, between `attn1` and
+`attn2`:
 
 ```text
-                                     adj    std
-  diffusers, PNDM / scaled-linear   109.6  102.7   banded mush
-  diffusers, DDIM / linear           59.0   85.0   a recognisable car
-  this port, dpmpp2m / scaled-linear 49.1   69.5   mush
-  this port, dpmpp2m / linear        57.0   92.1   a coastal road scene
+  x = x + tanh(alpha_attn)  * attn(norm1([x ; objs]))[:, :n_visual]
+  x = x + tanh(alpha_dense) * ff(norm2(x))
 ```
 
-The port now tracks the reference. `Txt2ImgPipeline` switches to linear
-whenever a motion adapter is attached, so a caller cannot get this wrong.
+Each fuser carries `linear` (768 -> block width, projecting the tokens),
+`attn`, `ff`, `norm1`, `norm2`, and two **scalar** gates `alpha_attn` and
+`alpha_dense`. The `tanh` on the gates means an untrained fuser is an exact
+identity, which is how these are trained against a frozen base — and it also
+gives a free test: zero the gates and the UNet must be bit-identical to the
+same UNet without grounding.
 
-**How this was nearly missed, which is the part worth keeping.** The linear
-schedule was my *first* hypothesis. I tested it at **4 frames**, saw no
-improvement, and rejected it — but 4 frames produces noise on its own, so the
-test could not have shown anything. Then I "confirmed" the rejection by
-noting that `AnimateDiffPipeline` defaults to scaled-linear, which is true and
-irrelevant: the pipeline inherits SD 1.5's scheduler unless you override it,
-which the documented example does. A correct observation about the reference,
-used to support a conclusion it did not support.
+Install them the way `unet::ip` installs IP weights: a construction-scoped
+thread-local pulled as each block is built. **One per cross-attention block,
+16 of them**, and unlike the IP-Adapter's list they are named by path
+(`down_blocks.0.attentions.0.transformer_blocks.0.fuser`) so no index mapping
+is needed — which removes the trap that cost the most time there.
 
-Two lessons: a null result from a confounded test is not a null result, and
-"what does the reference default to" is a different question from "what does
-the reference recommend".
+Then: phrase embeddings come from CLIP per phrase (pooled), and GLIGEN applies
+grounding only for the first fraction of the schedule — "scheduled sampling",
+typically 30 %. Verify end to end against `StableDiffusionGLIGENPipeline`,
+since where a fuser lands is silent when wrong.
 
-**What is still open** is only quality at scale: everything above is 256 px,
-where SD 1.5 composes poorly regardless. 16 frames at 512 runs (421 s, batch
-of 32) but has not been re-run since the schedule fix. That is the image worth
-capturing.
+Note the checkpoint is a **whole SD 1.5 UNet** plus fusers, not an adapter, so
+it loads as its own model rather than attaching to one.
 
 ### ~~2. TAESD and step previews~~ — both done
 
