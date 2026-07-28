@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 325 tests, all gates green
+table is in [roadmap.md](roadmap.md). 327 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -192,6 +192,34 @@ noise for differently-sized latents.
 through the UNet at the pipeline's own shapes (1.125e-5), and the output now
 tracks the reference — see [Next](#next) for the beta-schedule trap that made
 this look broken for a long time.
+
+**Regional prompts work**, `sdrs area --region mask.png=prompt` (repeatable).
+Each region contributes its own noise prediction, blended by its mask —
+composed *before* sampling, so the regions see each other rather than being
+generated separately and composited, which leaves visible joins.
+
+**The control is real but soft, and that is inherent.** Two complementary
+half-masks with irreconcilable prompts ("red brick wall" over "green grass")
+put brick where the mask says and ground below
+(`assets/area-conditioning-brick-over-ground.png`), but the model still
+resolves the whole frame into one coherent scene. It has to: each step blends
+predictions, then the *next* step's UNet sees a single latent and re-imposes
+global structure. Anyone expecting a hard partition will be disappointed, and
+that is a property of prediction-blending rather than of this implementation.
+
+Two invariants are exact and tested, and they are what pin the normalisation:
+an **empty mask is bit-identical to a plain run**, and a **full mask is
+bit-identical to a plain run of that region's prompt**. Either would break if
+the base leaked in at the wrong weight.
+
+**The mask is mean-pooled to the latent grid, not max-pooled** — the opposite
+of `latent_mask` for inpainting, and deliberately. An inpaint needs a cell
+freed if *any* pixel under it is free; a region boundary should fade across
+the cell it straddles. Reusing the inpaint pooling would give every region an
+8-pixel-wide hard edge.
+
+Cost is one UNet call per region per step on top of the base, which is
+inherent to conditioning spatially.
 
 **A clip is a batch of frames**, `--frames 8`. The pipeline no longer assumes
 batch 1: the latent draw, the guidance concatenation, the timestep tensor and

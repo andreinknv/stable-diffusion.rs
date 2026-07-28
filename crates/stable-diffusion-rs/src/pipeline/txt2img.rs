@@ -57,6 +57,30 @@ pub struct HiresConfig {
     pub upscale: Upscale,
 }
 
+/// One region of the canvas, with its own prompt.
+#[derive(Debug, Clone)]
+pub struct Region {
+    /// `[1, 1, height, width]` in `[0, 1]` at **pixel** resolution, like a
+    /// ControlNet hint. Downsampled to the latent grid by **mean** pooling,
+    /// not max: a region boundary should fade over a latent cell rather than
+    /// claim it outright, which is the opposite of what an inpainting mask
+    /// wants and is worth not copying by reflex.
+    pub mask: Tensor,
+    pub conditioning: Conditioning,
+}
+
+/// A generation with different prompts in different places.
+///
+/// Composed *before* sampling, by blending each region's noise prediction —
+/// not by generating separately and compositing, which produces visible joins
+/// because neither half ever saw the other.
+#[derive(Debug, Clone)]
+pub struct AreaConfig {
+    /// The prompt outside every region, and the run's other settings.
+    pub base: Txt2ImgConfig,
+    pub regions: Vec<Region>,
+}
+
 /// A cancellation token, shared with whatever wants to stop a generation.
 ///
 /// A token rather than a callback return value, so the ordinary
@@ -410,6 +434,36 @@ fn repeat_per_frame(context: &Tensor, frames: usize) -> Result<Tensor, PipelineE
     rows.extend(std::iter::repeat_n(uncond, frames));
     rows.extend(std::iter::repeat_n(cond, frames));
     Ok(Tensor::cat(&rows, 0)?)
+}
+
+/// Downsample a pixel-resolution region mask to the latent grid.
+///
+/// **Mean**, where an inpainting mask uses max. The reason is the opposite of
+/// the one there: an inpaint needs a latent cell freed if *any* pixel under it
+/// is free, while a region boundary should fade across the cell it straddles.
+/// Reusing `latent_mask` here would give every region a hard edge at latent
+/// resolution — 8 pixels wide in the output.
+fn area_mask(mask_px: &Tensor, lh: usize, lw: usize) -> Result<Tensor, PipelineError> {
+    let (_, _, h, w) = mask_px.dims4()?;
+    if h != lh * 8 || w != lw * 8 {
+        return Err(PipelineError::Tensor(sd_tensor::Error::Msg(format!(
+            "region mask is {h}x{w}, expected {}x{}",
+            lh * 8,
+            lw * 8
+        ))));
+    }
+    Ok(mask_px
+        .reshape((1, 1, lh, 8, lw, 8))?
+        .mean(5)?
+        .mean(3)?
+        .contiguous()?)
+}
+
+/// Regional prompts for one run.
+struct Areas {
+    /// `(mask, context)` per region. Masks are `[1, 1, lh, lw]` at *latent*
+    /// resolution, contexts already doubled for the guidance batch.
+    regions: Vec<(Tensor, Tensor)>,
 }
 
 /// The control maps for one run, already doubled for the guidance batch.
@@ -1202,6 +1256,86 @@ impl Txt2ImgPipeline {
         self.decode(&latent)
     }
 
+    /// Generate with different prompts in different regions.
+    ///
+    /// Each region contributes a noise prediction of its own, blended by its
+    /// mask. Where masks overlap they average; where none covers, the base
+    /// prompt applies alone.
+    ///
+    /// **Costs one UNet call per region per step**, on top of the base — three
+    /// regions is four times the work. That is inherent to conditioning
+    /// spatially rather than a shortcoming of this implementation, and it is
+    /// why the base prediction is computed once and reused.
+    pub fn run_area(&self, cfg: &AreaConfig) -> Result<Tensor, PipelineError> {
+        self.run_area_with_progress(cfg, &mut |_| {})
+    }
+
+    /// [`Self::run_area`], reporting progress after each step.
+    pub fn run_area_with_progress(
+        &self,
+        cfg: &AreaConfig,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let base = &cfg.base;
+        if base.width % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("width", base.width));
+        }
+        if base.height % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("height", base.height));
+        }
+        if base.steps == 0 {
+            return Err(PipelineError::NoSteps);
+        }
+
+        let frames = base.frames.max(1);
+        let (lh, lw) = (base.height / 8, base.width / 8);
+
+        let regions = cfg
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(i, region)| {
+                let d = region.mask.dims4()?;
+                if d.2 != base.height || d.3 != base.width {
+                    return Err(PipelineError::Tensor(sd_tensor::Error::Msg(format!(
+                        "region {i} mask is {}x{}, expected {}x{} — masks are at pixel \
+                         resolution, not latent",
+                        d.2, d.3, base.height, base.width
+                    ))));
+                }
+                Ok((
+                    area_mask(&region.mask, lh, lw)?,
+                    repeat_per_frame(&region.conditioning.context, frames)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, PipelineError>>()?;
+
+        let context = repeat_per_frame(
+            &self
+                .encode_conditioning(&base.prompt, &base.negative_prompt)?
+                .context,
+            frames,
+        )?;
+
+        let sigmas = self.sigmas_for(base.sampler, base.steps);
+        let mut rng = SeededRng::new(base.seed);
+        let latent = (rng.randn((frames, 4, lh, lw), &self.device)? * sigmas[0])?;
+
+        let latent = self.denoise_inner(
+            base,
+            latent,
+            &sigmas,
+            &[context],
+            None,
+            &mut rng,
+            None,
+            None,
+            Some(Areas { regions }),
+            progress,
+        )?;
+        self.decode(&latent)
+    }
+
     /// Encode a prompt pair once, for reuse across a sequence.
     ///
     /// Uncond first, then cond — the order the guidance split in the sampling
@@ -1511,7 +1645,7 @@ impl Txt2ImgPipeline {
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
         self.denoise_inner(
-            cfg, latent, sigmas, contexts, select, rng, None, None, progress,
+            cfg, latent, sigmas, contexts, select, rng, None, None, None, progress,
         )
     }
 
@@ -1530,7 +1664,7 @@ impl Txt2ImgPipeline {
     ) -> Result<Tensor, PipelineError> {
         let contexts = [context.clone()];
         self.denoise_inner(
-            cfg, latent, sigmas, &contexts, None, rng, keep, control, progress,
+            cfg, latent, sigmas, &contexts, None, rng, keep, control, None, progress,
         )
     }
 
@@ -1545,6 +1679,7 @@ impl Txt2ImgPipeline {
         rng: &mut SeededRng,
         keep: Option<Keep<'_>>,
         control: Option<Hints>,
+        areas: Option<Areas>,
         progress: ProgressFn<'_>,
     ) -> Result<Tensor, PipelineError> {
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
@@ -1631,6 +1766,49 @@ impl Txt2ImgPipeline {
             let out_uncond = out.narrow(0, 0, frames)?;
             let out_cond = out.narrow(0, frames, frames)?;
             let noise_pred = (&out_uncond + ((out_cond - &out_uncond)? * cfg.cfg_scale)?)?;
+
+            // Regional prompts. Each region is a second prediction from its own
+            // conditioning, blended in where its mask says so.
+            //
+            // A prediction per region per step, so `n` regions cost `n + 1`
+            // UNet calls — the honest price of the feature, and the reason the
+            // base prediction is reused rather than recomputed.
+            let noise_pred = match &areas {
+                Some(areas) if !areas.regions.is_empty() => {
+                    let mut weighted: Option<Tensor> = None;
+                    let mut total: Option<Tensor> = None;
+                    for (mask, context) in &areas.regions {
+                        let region_out = self.unet.forward(&latent_in, &timestep, context)?;
+                        let u = region_out.narrow(0, 0, frames)?;
+                        let c = region_out.narrow(0, frames, frames)?;
+                        let pred = (&u + ((c - &u)? * cfg.cfg_scale)?)?;
+
+                        let contribution = pred.broadcast_mul(mask)?;
+                        weighted = Some(match weighted {
+                            None => contribution,
+                            Some(acc) => (acc + contribution)?,
+                        });
+                        total = Some(match total {
+                            None => mask.clone(),
+                            Some(acc) => (acc + mask)?,
+                        });
+                    }
+                    let (weighted, total) = (
+                        weighted.expect("at least one region"),
+                        total.expect("at least one region"),
+                    );
+                    // Where masks overlap, average them; where none covers,
+                    // fall back to the base prompt entirely. `coverage` is the
+                    // total clamped to 1 so a single mask replaces the base
+                    // rather than merely outvoting it.
+                    let coverage = total.clamp(0.0, 1.0)?;
+                    let divisor = total.clamp(1.0, f64::INFINITY)?;
+                    let regional = weighted.broadcast_div(&divisor)?;
+                    ((noise_pred.broadcast_mul(&(1.0 - &coverage)?)?)
+                        + regional.broadcast_mul(&coverage)?)?
+                }
+                _ => noise_pred,
+            };
 
             // The UNet predicts noise; the samplers want x0.
             let denoised = self.prediction.denoise(&latent, &noise_pred, sigma)?;

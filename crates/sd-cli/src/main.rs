@@ -308,6 +308,50 @@ enum Command {
         output: String,
     },
 
+    /// Generate with different prompts in different regions.
+    ///
+    /// Each `--region` is `MASK=PROMPT`, where MASK is an image whose white
+    /// area is where the prompt applies. Composed *before* sampling, so the
+    /// regions see each other and the joins are not visible — unlike
+    /// generating separately and compositing.
+    #[command(name = "area")]
+    Area {
+        #[arg(long)]
+        model: String,
+
+        /// The prompt outside every region.
+        #[arg(long)]
+        prompt: String,
+
+        /// `mask.png=a prompt for that area`. Repeatable.
+        #[arg(long, value_name = "MASK=PROMPT")]
+        region: Vec<String>,
+
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        #[arg(long, default_value_t = 7.5)]
+        cfg_scale: f64,
+
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        #[arg(long, default_value = "euler_a")]
+        sampler: String,
+
+        #[arg(long, short, default_value = "area.png")]
+        output: String,
+    },
+
     /// Merge two checkpoints by weighted average.
     ///
     /// `(1 - alpha) * a + alpha * b`, tensor by tensor. Only meaningful
@@ -1101,6 +1145,67 @@ fn main() -> Result<()> {
                 .context("running SD 3")?;
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             tracing::info!(elapsed = ?t1.elapsed(), output = %output, "done");
+        }
+
+        Command::Area {
+            model,
+            prompt,
+            region,
+            negative_prompt,
+            width,
+            height,
+            steps,
+            cfg_scale,
+            seed,
+            sampler,
+            output,
+        } => {
+            if region.is_empty() {
+                anyhow::bail!("--area needs at least one --region MASK=PROMPT");
+            }
+            let started = std::time::Instant::now();
+            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
+                .with_context(|| format!("loading pipeline from {model}"))?;
+
+            let base = Txt2ImgConfig {
+                prompt,
+                negative_prompt,
+                width,
+                height,
+                steps,
+                cfg_scale,
+                seed,
+                sampler: parse_sampler(&sampler)?,
+                frames: 1,
+                cancel: None,
+            };
+            let regions = region
+                .iter()
+                .map(|spec| {
+                    let (mask_path, text) = spec.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!("--region wants MASK=PROMPT, got `{spec}`")
+                    })?;
+                    // White is where the prompt applies, matching the inpaint
+                    // mask convention rather than inventing a second one.
+                    let mask =
+                        sd::image_io::load_mask(mask_path, width as u32, height as u32, &dev)
+                            .with_context(|| format!("reading {mask_path}"))?;
+                    tracing::info!(mask = %mask_path, prompt = %text, "region");
+                    Ok(sd::pipeline::Region {
+                        mask,
+                        conditioning: pipeline.encode_conditioning(text, &base.negative_prompt)?,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
+            let mut report = |p: sd::pipeline::Progress| {
+                tracing::info!(step = p.step, total = p.total, "denoise");
+            };
+            let img = pipeline
+                .run_area_with_progress(&sd::pipeline::AreaConfig { base, regions }, &mut report)
+                .context("running area conditioning")?;
+            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
+            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
         }
 
         Command::Merge {

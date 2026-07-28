@@ -881,3 +881,86 @@ fn a_batch_decode_matches_decoding_each_frame_alone() {
         assert_eq!(a, b, "frame {i} differed between batch and single decode");
     }
 }
+
+// -- area conditioning ----------------------------------------------------
+
+#[test]
+fn a_region_with_an_empty_mask_leaves_the_base_untouched() {
+    // Coverage 0 means the base prompt alone, and it must be *bit-identical*
+    // to a plain run — not merely close. That is what fails if the blend
+    // leaks the region's prediction in at zero weight, which a normalisation
+    // that divides by the wrong thing would do.
+    let _heavy = heavy();
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP a_region_with_an_empty_mask_leaves_the_base_untouched");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::{AreaConfig, Region, Txt2ImgPipeline};
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+
+    let mut base = tiny_config(51);
+    base.steps = 2;
+    let plain = pipeline.run(&base).expect("plain");
+
+    let blank = Tensor::zeros((1, 1, base.height, base.width), DType::F32, &dev).unwrap();
+    let area = pipeline
+        .run_area(&AreaConfig {
+            base: base.clone(),
+            regions: vec![Region {
+                mask: blank,
+                conditioning: pipeline
+                    .encode_conditioning("something else entirely", "")
+                    .expect("encode"),
+            }],
+        })
+        .expect("area");
+
+    let a = plain.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = area.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(a, b, "an empty region changed the image");
+}
+
+#[test]
+fn a_full_mask_replaces_the_base_prompt_entirely() {
+    // The other end: a mask covering everything gives that region's prompt
+    // alone, so it must match a plain run of *that* prompt bit for bit. This
+    // is what pins the normalisation — if the base leaked in at any weight,
+    // the two would differ.
+    let _heavy = heavy();
+    let Ok(dir) = std::env::var("SD_TEST_MODEL_DIR") else {
+        eprintln!("SKIP a_full_mask_replaces_the_base_prompt_entirely");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::{AreaConfig, Region, Txt2ImgPipeline};
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+
+    let mut base = tiny_config(52);
+    base.steps = 2;
+    let mut other = base.clone();
+    other.prompt = "a lighthouse".into();
+    let direct = pipeline.run(&other).expect("direct");
+
+    let full = Tensor::ones((1, 1, base.height, base.width), DType::F32, &dev).unwrap();
+    let area = pipeline
+        .run_area(&AreaConfig {
+            base,
+            regions: vec![Region {
+                mask: full,
+                conditioning: pipeline
+                    .encode_conditioning(&other.prompt, "")
+                    .expect("encode"),
+            }],
+        })
+        .expect("area");
+
+    let a = direct.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let b = area.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(
+        a, b,
+        "a full-coverage region did not replace the base prompt"
+    );
+}
