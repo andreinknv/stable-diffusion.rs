@@ -964,3 +964,58 @@ fn a_full_mask_replaces_the_base_prompt_entirely() {
         "a full-coverage region did not replace the base prompt"
     );
 }
+
+#[test]
+fn image_guidance_trades_fidelity_against_the_instruction() {
+    // The axis that makes this different from img2img: raising it holds more
+    // of the source. A monotone relationship, checked at three points —
+    // testing one value would pass with the parameter ignored, and testing two
+    // could pass on noise.
+    let _heavy = heavy();
+    let (Ok(dir), Ok(src)) = (
+        std::env::var("SD_TEST_IP2P_DIR"),
+        std::env::var("SD_TEST_IP2P_IMAGE"),
+    ) else {
+        eprintln!("SKIP image_guidance_trades_fidelity_against_the_instruction");
+        return;
+    };
+    use stable_diffusion_rs::pipeline::{InstructConfig, Txt2ImgPipeline};
+    let dev = Device::Cpu;
+    let pipeline =
+        Txt2ImgPipeline::load(std::path::Path::new(&dir), &dev).expect("loading pipeline");
+
+    let mut base = tiny_config(61);
+    base.steps = 4;
+    base.prompt = "make it winter with snow".into();
+
+    let source = stable_diffusion_rs::image_io::load_image(
+        &src,
+        base.width as u32,
+        base.height as u32,
+        &dev,
+    )
+    .expect("source");
+    let source = source.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+    let distance = |g: f64| {
+        let out = pipeline
+            .run_instruct(&InstructConfig {
+                base: base.clone(),
+                init_image: std::path::PathBuf::from(&src),
+                image_guidance: g,
+            })
+            .expect("instruct");
+        let v = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        v.iter()
+            .zip(&source)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / v.len() as f32
+    };
+
+    let (low, mid, high) = (distance(1.0), distance(1.5), distance(2.5));
+    assert!(
+        low > mid && mid > high,
+        "image guidance is not monotone: {low:.3} {mid:.3} {high:.3}"
+    );
+}

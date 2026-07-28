@@ -308,6 +308,57 @@ enum Command {
         output: String,
     },
 
+    /// Edit an image by instruction: "change the sky to sunset".
+    ///
+    /// Different from img2img, which takes a description of the *result* and a
+    /// strength. This takes a description of the **change**, and holds the
+    /// rest of the image through the model's own conditioning rather than by
+    /// stopping the schedule early.
+    #[command(name = "instruct")]
+    Instruct {
+        /// An InstructPix2Pix checkpoint (8-channel UNet), e.g.
+        /// `timbrooks/instruct-pix2pix`.
+        #[arg(long)]
+        model: String,
+
+        /// The instruction, not a description of the result.
+        #[arg(long)]
+        prompt: String,
+
+        #[arg(long)]
+        init_image: String,
+
+        /// How strongly to keep the source image. 1.5 is the published
+        /// default; higher holds more of the original.
+        #[arg(long, default_value_t = 1.5)]
+        image_guidance: f64,
+
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+
+        /// How strongly to follow the instruction. 7.5 is the default.
+        #[arg(long, default_value_t = 7.5)]
+        cfg_scale: f64,
+
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        #[arg(long, default_value = "euler_a")]
+        sampler: String,
+
+        #[arg(long, short, default_value = "edited.png")]
+        output: String,
+    },
+
     /// Generate with different prompts in different regions.
     ///
     /// Each `--region` is `MASK=PROMPT`, where MASK is an image whose white
@@ -1145,6 +1196,50 @@ fn main() -> Result<()> {
                 .context("running SD 3")?;
             sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
             tracing::info!(elapsed = ?t1.elapsed(), output = %output, "done");
+        }
+
+        Command::Instruct {
+            model,
+            prompt,
+            init_image,
+            image_guidance,
+            negative_prompt,
+            width,
+            height,
+            steps,
+            cfg_scale,
+            seed,
+            sampler,
+            output,
+        } => {
+            let cfg = sd::pipeline::InstructConfig {
+                base: Txt2ImgConfig {
+                    prompt,
+                    negative_prompt,
+                    width,
+                    height,
+                    steps,
+                    cfg_scale,
+                    seed,
+                    sampler: parse_sampler(&sampler)?,
+                    frames: 1,
+                    cancel: None,
+                },
+                init_image: std::path::PathBuf::from(&init_image),
+                image_guidance,
+            };
+            tracing::info!(model = %model, init = %init_image, image_guidance, "instruct");
+            let started = std::time::Instant::now();
+            let mut report = |p: sd::pipeline::Progress| {
+                tracing::info!(step = p.step, total = p.total, "denoise");
+            };
+            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
+                .with_context(|| format!("loading pipeline from {model}"))?;
+            let img = pipeline
+                .run_instruct_with_progress(&cfg, &mut report)
+                .context("running instruct")?;
+            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
+            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
         }
 
         Command::Area {

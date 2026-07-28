@@ -15,8 +15,8 @@ pub use sd3::{sd3_paths_in, Sd3Paths, Sd3Pipeline, Sd3RunConfig};
 pub use sdxl::SdxlPipeline;
 pub use txt2img::{
     sigma_to_timestep, AreaConfig, Cancel, Conditioning, Control, ControlConfig, HiresConfig,
-    Img2ImgConfig, InpaintConfig, PipelineError, Prediction, Progress, ProgressFn, Region,
-    SamplerKind, Strength, Txt2ImgConfig, Txt2ImgPipeline, Upscale,
+    Img2ImgConfig, InpaintConfig, InstructConfig, PipelineError, Prediction, Progress, ProgressFn,
+    Region, SamplerKind, Strength, Txt2ImgConfig, Txt2ImgPipeline, Upscale,
 };
 
 /// Whichever decoder a pipeline is using.

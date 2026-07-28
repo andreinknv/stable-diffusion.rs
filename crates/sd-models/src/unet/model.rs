@@ -69,6 +69,22 @@ impl UNetConfig {
         }
     }
 
+    /// InstructPix2Pix.
+    ///
+    /// SD 1.5 exactly, except that `conv_in` takes **8 channels**: the noisy
+    /// latent concatenated with the *source image's* latent. That is the whole
+    /// architectural difference — the edit instruction rides on the ordinary
+    /// text conditioning, and everything downstream of `conv_in` is unchanged.
+    ///
+    /// The extra four channels are why this cannot be detected from the cross
+    /// attention like SD 2.x is: `conv_in`'s own shape is the tell.
+    pub fn instruct_pix2pix() -> Self {
+        Self {
+            in_channels: 8,
+            ..Self::sd15()
+        }
+    }
+
     /// SD 2.x.
     ///
     /// SD 1.5's block geometry with a wider text encoder behind it: the cross

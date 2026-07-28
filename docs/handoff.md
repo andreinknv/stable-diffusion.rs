@@ -116,7 +116,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 327 tests, all gates green
+table is in [roadmap.md](roadmap.md). 328 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -192,6 +192,37 @@ noise for differently-sized latents.
 through the UNet at the pipeline's own shapes (1.125e-5), and the output now
 tracks the reference — see [Next](#next) for the beta-schedule trap that made
 this look broken for a long time.
+
+**Instruction editing works**, `sdrs instruct --prompt "make it winter with
+snow" --init-image X`. Different from img2img: that takes a description of the
+*result* plus a strength, this takes a description of the **change**, and the
+source is held by the model's own conditioning rather than by stopping the
+schedule early. `assets/instructpix2pix-crab-winter.png` — the same crab, in
+the same pose, in a snowed-over scene.
+
+**Three predictions per step, not two.** Ordinary guidance contrasts a prompt
+against nothing; this contrasts three things so that instruction adherence and
+image fidelity become independent axes:
+
+```text
+  pred = uncond + text_scale * (text - image) + image_scale * (image - uncond)
+```
+
+The rows are `[text+image, uncond+image, uncond+zeros]`, and the **zeroed
+image latent in the third row** is what makes the middle term mean "what the
+image contributes" rather than "what the prompt contributes".
+
+`--image-guidance` is measurably a second axis — mean distance from the source
+at 1.0 / 1.5 / 2.5 is **65.7 / 44.4 / 30.6**, monotone, and there is a test
+that checks all three rather than one (one would pass with the parameter
+ignored, two could pass on noise).
+
+**Two traps, both silent.** The 8-channel `conv_in` is detected from its own
+shape, since it is invisible in the cross attention that identifies SD 2.x.
+And the source latent is **not scaled by 0.18215** — every other latent here
+is, but InstructPix2Pix was trained on the raw encoder output, and scaling it
+multiplies the conditioning by 5.5 and returns a plausible image that ignores
+the source.
 
 **Regional prompts work**, `sdrs area --region mask.png=prompt` (repeatable).
 Each region contributes its own noise prediction, blended by its mask —

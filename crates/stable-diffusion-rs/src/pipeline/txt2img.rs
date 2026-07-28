@@ -57,6 +57,27 @@ pub struct HiresConfig {
     pub upscale: Upscale,
 }
 
+/// An instruction-guided edit: "change the sky to sunset".
+///
+/// Distinct from img2img, which takes a *description of the result* and a
+/// strength. This takes a description of the **change**, and the source image
+/// conditions the model through the UNet's extra four input channels rather
+/// than by being partially noised — so the untouched parts are held by the
+/// conditioning rather than by stopping the schedule early.
+#[derive(Debug, Clone)]
+pub struct InstructConfig {
+    pub base: Txt2ImgConfig,
+    pub init_image: PathBuf,
+    /// How strongly to follow the *instruction*. `base.cfg_scale` is reused
+    /// for this, as in every other config here.
+    ///
+    /// How strongly to keep the **source image**. Raising it holds more of the
+    /// original; lowering it lets the edit roam. 1.5 is the published default,
+    /// and it is a genuinely separate axis from text guidance — which is why
+    /// this model needs three predictions per step rather than two.
+    pub image_guidance: f64,
+}
+
 /// One region of the canvas, with its own prompt.
 #[derive(Debug, Clone)]
 pub struct Region {
@@ -589,6 +610,14 @@ impl Txt2ImgPipeline {
     /// Falls back to SD 1.5 when the tensor is absent, which keeps every
     /// existing checkpoint loading exactly as before.
     fn detect_variant(unet_path: &Path) -> (UNetConfig, ClipTextConfig) {
+        // `conv_in` first: InstructPix2Pix is SD 1.5 with **eight** input
+        // channels rather than four — the noisy latent concatenated with the
+        // source image's — and that is invisible in the cross attention.
+        if let Ok(Some(shape)) = sd_tensor::tensor_shape(unet_path, "conv_in.weight") {
+            if shape.get(1) == Some(&8) {
+                return (UNetConfig::instruct_pix2pix(), ClipTextConfig::sd15());
+            }
+        }
         const CROSS_KEY: &str = "down_blocks.0.attentions.0.transformer_blocks.0.attn2.to_k.weight";
         match sd_tensor::tensor_shape(unet_path, CROSS_KEY) {
             Ok(Some(shape)) if shape.last() == Some(&1024) => {
@@ -1253,6 +1282,120 @@ impl Txt2ImgPipeline {
             &mut rng,
             progress,
         )?;
+        self.decode(&latent)
+    }
+
+    /// Edit an image by instruction.
+    ///
+    /// **Three predictions per step, not two.** Ordinary guidance contrasts a
+    /// prompt against nothing; this contrasts three things — the instruction
+    /// with the image, the image with nothing — so that text adherence and
+    /// image fidelity can be traded independently:
+    ///
+    /// ```text
+    ///   pred = uncond
+    ///        + text_scale  * (text  - image)
+    ///        + image_scale * (image - uncond)
+    /// ```
+    ///
+    /// The batch rows are `[text+image, uncond+image, uncond+zeros]`, and the
+    /// third row's *zeroed* image latent is what makes the middle term mean
+    /// "what the image contributes" rather than "what the prompt contributes".
+    pub fn run_instruct(&self, cfg: &InstructConfig) -> Result<Tensor, PipelineError> {
+        self.run_instruct_with_progress(cfg, &mut |_| {})
+    }
+
+    /// [`Self::run_instruct`], reporting progress after each step.
+    pub fn run_instruct_with_progress(
+        &self,
+        cfg: &InstructConfig,
+        progress: ProgressFn<'_>,
+    ) -> Result<Tensor, PipelineError> {
+        let base = &cfg.base;
+        if base.width % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("width", base.width));
+        }
+        if base.height % 8 != 0 {
+            return Err(PipelineError::NotMultipleOfEight("height", base.height));
+        }
+        if base.steps == 0 {
+            return Err(PipelineError::NoSteps);
+        }
+
+        let cond = self.encode(&base.prompt)?;
+        let uncond = self.encode(&base.negative_prompt)?;
+        // Instruction, then uncond twice — matching the three rows below.
+        let context = Tensor::cat(&[&cond, &uncond, &uncond], 0)?;
+
+        let image = crate::image_io::load_image(
+            &cfg.init_image,
+            base.width as u32,
+            base.height as u32,
+            &self.device,
+        )?;
+        // **Not scaled by 0.18215.** Every other latent in this crate is; this
+        // one is not, because InstructPix2Pix was trained on the unscaled
+        // encoder output. Scaling it multiplies the conditioning by 5.5 and
+        // returns a plausible image that ignores the source.
+        let (image_latents, _) = self.vae_encoder.encode_dist(&image)?;
+        let zeros = image_latents.zeros_like()?;
+        // The third row sees no image at all, which is what makes it the true
+        // unconditional.
+        let image_rows = Tensor::cat(&[&image_latents, &image_latents, &zeros], 0)?;
+
+        let sigmas = self.sigmas_for(base.sampler, base.steps);
+        let (lh, lw) = (base.height / 8, base.width / 8);
+        let mut rng = SeededRng::new(base.seed);
+        let mut latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+
+        let steps = sigmas.len().saturating_sub(1);
+        let mut dpm = DpmSolverPlusPlus2M::new();
+        for i in 0..steps {
+            if base.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                return Err(PipelineError::Cancelled {
+                    completed: i,
+                    total: steps,
+                });
+            }
+            let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+
+            let latent_in = Tensor::cat(&[&latent, &latent, &latent], 0)?;
+            let latent_in = (latent_in / (sigma * sigma + 1.0).sqrt())?;
+            // The source image joins on the **channel** axis, which is what
+            // the extra four input channels are for.
+            let latent_in = Tensor::cat(&[&latent_in, &image_rows], 1)?;
+
+            let t = sigma_to_timestep(&self.schedule, sigma);
+            let timestep = Tensor::from_vec(vec![t as f32; 3], 3, &self.device)?;
+            let out = self.unet.forward(&latent_in, &timestep, &context)?;
+
+            let (text, img, uncond_out) = (
+                out.narrow(0, 0, 1)?,
+                out.narrow(0, 1, 1)?,
+                out.narrow(0, 2, 1)?,
+            );
+            let noise_pred = ((&uncond_out + ((&text - &img)? * base.cfg_scale)?)?
+                + ((&img - &uncond_out)? * cfg.image_guidance)?)?;
+
+            let denoised = self.prediction.denoise(&latent, &noise_pred, sigma)?;
+            latent = match base.sampler {
+                SamplerKind::EulerAncestral => {
+                    let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+                    euler_ancestral_step(&latent, &denoised, sigma, sigma_next, &noise)?
+                }
+                SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next)?,
+                SamplerKind::Lcm => {
+                    let noise = rng.randn((1, 4, lh, lw), &self.device)?;
+                    lcm_step(&latent, &denoised, sigma, sigma_next, t, &noise)?
+                }
+            };
+            progress(Progress {
+                step: i + 1,
+                total: steps,
+                sigma,
+                denoised: &denoised,
+            });
+        }
         self.decode(&latent)
     }
 
