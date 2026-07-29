@@ -461,9 +461,10 @@ pub enum PipelineError {
         "the prior emits a {got}-wide embedding but this checkpoint's image half takes \
          {want}.\n\n\
          The two must come from the same unCLIP checkpoint. Karlo's prior is ViT-L (768) \
-         and there are unCLIP models built on ViT-H (1024) — and the published \
-         `diffusers/stable-diffusion-2-1-unclip-t2i-h` pairs exactly those two, so it \
-         cannot run at all. `-t2i-l` is the consistent one."
+         and there are unCLIP models built on ViT-H (1024). The published \
+         `diffusers/stable-diffusion-2-1-unclip-t2i-h` mirror pairs exactly those two, \
+         which looks like an assembly slip rather than a design; `-t2i-l` is the \
+         consistent pairing and is what this expects."
     )]
     PriorWidth { got: usize, want: usize },
     #[error(

@@ -33,3 +33,51 @@ diffusers
     Used as the numerical reference implementation for the golden-tensor test
     harness (see xtask/golden/). Module layouts and parameter naming follow
     diffusers conventions so that pretrained weights load unmodified.
+
+--------------------------------------------------------------------------
+transformers
+    https://github.com/huggingface/transformers
+    Apache License 2.0, Copyright (c) HuggingFace Inc.
+
+    Used as the numerical reference for the CLIP text and vision towers, the
+    T5 encoder, and the tokenizers. Parameter naming in `sd-models/clip` and
+    `sd-models/t5` follows transformers conventions (`q_proj`, `layer_norm1`)
+    rather than diffusers', because that is the layout those checkpoints ship
+    in.
+
+--------------------------------------------------------------------------
+tokenizers
+    https://github.com/huggingface/tokenizers
+    Apache License 2.0, Copyright (c) HuggingFace Inc.
+
+    Used to load and apply CLIP's BPE tokenizer from `tokenizer.json`.
+
+--------------------------------------------------------------------------
+Model weights and methods
+
+    This project implements inference for models it does not own. The weights,
+    architectures and training methods belong to their authors and are subject
+    to their own licences, which are not affected by this project's:
+
+      Stable Diffusion 1.5 / 2.x / XL / 3.5   Stability AI and collaborators
+      FLUX.1                                  Black Forest Labs
+      Karlo / unCLIP prior                    kakaobrain
+      CLIP                                    OpenAI; OpenCLIP contributors
+      T5                                      Google Research
+      Real-ESRGAN                             Xintao Wang and collaborators
+      TAESD                                   Ollin Boer Bohan
+      ControlNet                              Lvmin Zhang and collaborators
+      IP-Adapter                              Tencent AI Lab
+      GLIGEN, AnimateDiff, LCM, LoRA, TeaCache, and the other methods
+      implemented here are their respective authors' research.
+
+    Anyone using this project is responsible for complying with the licence of
+    whichever checkpoint they load.
+
+--------------------------------------------------------------------------
+Quantised checkpoints and open mirrors
+
+    Several models are only testable on modest hardware because other people
+    publish quantised conversions and ungated mirrors — city96's GGUF
+    conversions in particular. Those redistributions carry the original
+    models' licences.

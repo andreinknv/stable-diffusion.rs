@@ -195,8 +195,11 @@ the noise level's sinusoid is evaluated at arguments as large as the level, so
 rounding its frequency to f32 costs `250 * 6e-8` in the argument and `cos`
 passes that straight through.
 
-This is the phase that took upstream years, and it parallelizes well: each
-architecture is independent and verifiable against its own golden data.
+This breadth exists because `diffusers` and the model authors built it
+first; what is happening here is a port, against their implementations as the
+reference. It parallelizes well — each architecture is independent and
+verifiable against its own golden data — which is a property of the problem,
+not a comment on the people who solved it originally.
 
 **Flux runs.** `flux-mini` (3.2B) renders at 512x512 in 212 s on CPU —
 `assets/flux-mini-512-crab.png`. Every component is verified separately:
@@ -317,7 +320,8 @@ SD 3 ships `CLIPTextModelWithProjection` and Flux ships a plain
 `CLIPTextModel`. Neither distinction produces an error if got wrong — only a
 worse image. Conveniently, k-quants suit these models far better than they suit SD 1.5 —
 their hidden sizes are multiples of 256, so nothing falls back to F16, which
-is why city96 can publish `Q4_K` for SD 3.5 and nobody can for SD 1.5.
+is why `Q4_K` is publishable for SD 3.5 and not for SD 1.5 — a property of
+  the tensor shapes, not of anyone's tooling.
 
 ## Deliberately not doing
 
@@ -561,6 +565,18 @@ clearly available twice:
   already does. A reproducer is four lines: quantise any weight, `narrow` an
   activation off dim 0, and compare against `force_contiguous()` of the same
   view. `--example metal_check` contains it.
+- **candle: the Metal convolution silently corrupts past `i32::MAX` im2col
+  elements.** A 3x3 convolution over `out_h * out_w` positions at 64 channels
+  builds an im2col matrix of `out_h * out_w * 64 * 9` elements; past
+  `i32::MAX` the kernel returns a dark, horizontally banded image with no
+  error and no failed command buffer. The boundary is measured, not inferred:
+  correct at 1928 px output (2,141,097,984 elements), corrupt at 1936
+  (2,158,903,296), and `sqrt(i32::MAX / (64*9)) = 1930`. CPU renders the same
+  input correctly, which is what identifies it. Likely a 32-bit index in the
+  im2col kernel; the reproducer is one large `conv2d` on Metal compared
+  against the same call on CPU. Worked around here by tiling
+  (`upscale_tiled`), which is the right thing for memory anyway but should not
+  be load-bearing for correctness.
 - **candle: implement f16 matmul in the Accelerate CPU backend.** Today it
   bails outright (`cpu_backend/mod.rs:1497`), which means `--features
   accelerate` — worth 1.7-1.9x on CPU — cannot be used with any f16 model.
