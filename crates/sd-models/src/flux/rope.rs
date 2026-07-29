@@ -45,6 +45,112 @@ fn rope_axis(pos: &Tensor, dim: usize, theta: f64) -> Result<Tensor> {
     stacked.reshape(shape)
 }
 
+/// The rotary tables for one run: `cos` and `sin`, `[batch, seq, dim/2]`.
+///
+/// A pair rather than the 2x2 matrix form, because that is what the fused
+/// kernel takes and building the matrix only to narrow it apart again costs
+/// four times the memory for the same numbers. Carried as one value so the
+/// block signatures keep taking a single positional-embedding argument.
+#[derive(Debug, Clone)]
+pub struct Rope {
+    pub cos: Tensor,
+    pub sin: Tensor,
+}
+
+impl Rope {
+    /// Reassemble the `[.., n, dim/2, 2, 2]` rotation matrices.
+    ///
+    /// Only for the `SD_FLUX_ROPE=matrix` comparison path — the fused kernel
+    /// never needs them, which is most of why it is faster.
+    pub fn matrix(&self) -> Result<Tensor> {
+        let stacked = Tensor::stack(&[&self.cos, &self.sin.neg()?, &self.sin, &self.cos], 3)?;
+        let mut shape = self.cos.dims().to_vec();
+        shape.extend_from_slice(&[2, 2]);
+        stacked.reshape(shape)?.unsqueeze(1)
+    }
+}
+
+/// `(cos, sin)` for one axis, `[.., n, dim/2]` each.
+///
+/// The same angles [`rope_axis`] computes, kept as two vectors instead of
+/// assembled into a rotation matrix. That is all the fused kernel wants, and
+/// building the 2x2 only to narrow it back apart is four times the memory for
+/// the same numbers.
+fn rope_axis_cos_sin(pos: &Tensor, dim: usize, theta: f64) -> Result<(Tensor, Tensor)> {
+    let device = pos.device();
+    let half = dim / 2;
+    let omega: Vec<f32> = (0..half)
+        .map(|i| (1.0 / theta.powf(2.0 * i as f64 / dim as f64)) as f32)
+        .collect();
+    let omega = Tensor::from_vec(omega, (1, half), device)?.to_dtype(DType::F32)?;
+
+    let pos = pos.to_dtype(DType::F32)?;
+    let mut shape = pos.dims().to_vec();
+    let flat = pos.flatten_all()?.reshape((pos.elem_count(), 1))?;
+    let angles = flat.broadcast_mul(&omega)?;
+    shape.push(half);
+    Ok((
+        angles.cos()?.reshape(shape.clone())?,
+        angles.sin()?.reshape(shape)?,
+    ))
+}
+
+/// [`embed_nd`] as the `(cos, sin)` pair a fused kernel takes.
+///
+/// Each is `[batch, seq, head_dim/2]`, which is the shape
+/// [`sd_tensor::ops::rope_interleaved`] wants.
+pub fn embed_nd_cos_sin(ids: &Tensor, axes_dim: &[usize], theta: f64) -> Result<Rope> {
+    let n_axes = ids.dim(ids.rank() - 1)?;
+    if n_axes != axes_dim.len() {
+        return Err(sd_tensor::Error::Msg(format!(
+            "ids carry {n_axes} axes but axes_dim has {} entries",
+            axes_dim.len()
+        )));
+    }
+    let mut coses = Vec::with_capacity(n_axes);
+    let mut sines = Vec::with_capacity(n_axes);
+    for (i, &dim) in axes_dim.iter().enumerate() {
+        let pos = ids.narrow(ids.rank() - 1, i, 1)?.squeeze(ids.rank() - 1)?;
+        let (c, s) = rope_axis_cos_sin(&pos, dim, theta)?;
+        coses.push(c);
+        sines.push(s);
+    }
+    // Concatenated along the frequency axis, exactly as the 2x2 form is.
+    let last = coses[0].rank() - 1;
+    Ok(Rope {
+        cos: Tensor::cat(&coses, last)?.contiguous()?,
+        sin: Tensor::cat(&sines, last)?.contiguous()?,
+    })
+}
+
+/// Apply rotary embeddings through candle's fused kernel.
+///
+/// **26x faster than [`apply_rope`] at Flux's 1024 shape**, 20x at 512, and
+/// they agree to 5.3e-8 — measured by `--example rope_path`, synchronising
+/// inside the timed region because Metal queues work and a naive timer
+/// measures enqueue. The 2x2 form spends its time in strided narrows and
+/// broadcast multiplies over several intermediates; this is one pass.
+///
+/// `pe` comes from [`embed_nd_cos_sin`]; `q` and `k` are
+/// `[b, heads, seq, head_dim]`.
+pub fn apply_rope_fused(q: &Tensor, k: &Tensor, pe: &Rope) -> Result<(Tensor, Tensor)> {
+    // `SD_FLUX_ROPE=matrix` forces the old 2x2 path, so the two can be
+    // measured against each other in a real run rather than only in a
+    // microbenchmark. Kept for the same reason `SD_STREAM_SYNC_EVERY` is: the
+    // interesting number is end to end, and this machine is noisy enough that
+    // it has to be measured by alternating rather than once.
+    if std::env::var_os("SD_FLUX_ROPE").is_some_and(|v| v == "matrix") {
+        return apply_rope(q, k, &pe.matrix()?);
+    }
+    // The kernel indexes its input directly, so a view will not do.
+    let q = q.contiguous()?;
+    let k = k.contiguous()?;
+    Ok((
+        sd_tensor::ops::rope_interleaved(&q, &pe.cos, &pe.sin)?,
+        sd_tensor::ops::rope_interleaved(&k, &pe.cos, &pe.sin)?,
+    ))
+}
+
 /// Rotary embeddings for `[batch, seq, n_axes]` integer coordinates.
 ///
 /// Returns `[batch, 1, seq, head_dim/2, 2, 2]`; the singleton broadcasts over

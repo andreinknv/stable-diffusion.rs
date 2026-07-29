@@ -1160,19 +1160,35 @@ entirely untested, so that visit should cover both.
   `ControlConfig::controls` is a `Vec<Control>` and the corrections are summed
   before the UNet sees them. The entry outlived the work; see the section
   above for why summing is the right composition.
-- `candle_nn::rotary_emb::{rope, rope_i, rope_thd}` — fused RoPE. All three
-  exist in candle-nn 0.11. **Established by reading, not yet by running: the
-  form maps onto `rope_i`, not `rope`.** Flux rotates *interleaved adjacent
-  pairs* — `flux::rope` reshapes to `[.., dim/2, 2]` and narrows both halves —
-  which is `rope_i`'s convention; `rope` splits the head in half instead. And
-  the explicit 2x2 is `[[cos, -sin], [sin, cos]]`, so the `cos`/`sin` those
-  functions want are its first column. The axis-wise frequencies concatenate
-  along the frequency axis and fit `(t, dim/2)` unchanged. What is still
-  unmeasured is whether it is *faster* on these shapes — see the entry above
-  for how badly that assumption has gone before.
-- `candle_nn::ops::{pixel_shuffle, pixel_unshuffle}` — patchify/unpatchify by
-  another name. Both present in candle-nn 0.11 (`ops.rs`). Same caveat: the
-  shapes line up, the speed is unmeasured.
+- ~~`candle_nn::rotary_emb::{rope, rope_i, rope_thd}`~~ **Done — `rope_i`, and
+  it is worth 1.35x on a whole Flux run.** Flux rotates *interleaved adjacent
+  pairs*, which is `rope_i`'s convention; `rope` splits the head in half and is
+  a different function on the same shapes. The old form built an explicit 2x2
+  `[[cos, -sin], [sin, cos]]` per frequency and then narrowed it back apart —
+  four times the memory for the same numbers, and several strided passes where
+  the kernel does one.
+
+  Measured by `--example rope_path`, minimum of 12, **synchronising inside the
+  timed region**: 61.7 ms against 2.4 ms at Flux's 1024 shape (26x), 13.0
+  against 0.64 at 512 (20x), agreeing to 5.3e-8. End to end, interleaved,
+  minimum of three: **23.15 s against 31.31 s**, fused lower on every pass,
+  same image to mean 0.022/255. `SD_FLUX_ROPE=matrix` restores the old path so
+  the pair can be re-measured.
+
+  Two methodological notes, both paid for here. A first timing reported 14
+  million elements rotated in 9 microseconds — 1.5 TB/s, which is the tell
+  that **Metal was queuing the work and the timer was measuring enqueue**. And
+  a first end-to-end run compared against the *recorded* 20.8 s baseline and
+  showed nothing; only alternating the two in one session separated a 35 %
+  difference from a 40 % spread.
+- ~~`candle_nn::ops::{pixel_shuffle, pixel_unshuffle}`~~ **Checked: not
+  applicable, and no benchmark needed to say so.** They are patchify by
+  another name only in the spatial sense — `pixel_unshuffle` is
+  `reshape → permute(0,1,3,5,2,4) → reshape` to `[b, c*4, h/2, w/2]`, where
+  Flux's `pack_latents` permutes to `[b, tokens, c*4]`. Same class of
+  operation, different output layout: adopting candle's would mean its permute
+  *plus* a flatten and a transpose to get back to a sequence. Strictly more
+  work, so it cannot be faster.
 - Broaden fused attention to SD 1.5 by materialising `causal_mask` from
   `[1,1,s,s]` to `[b,h,s,s]`. A reshape, not a kernel.
 - A **blocked CPU attention kernel**, tiling over query rows as well as keys.

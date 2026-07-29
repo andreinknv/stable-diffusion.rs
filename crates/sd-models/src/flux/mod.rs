@@ -362,7 +362,7 @@ impl DoubleStreamBlock {
         img: &Tensor,
         txt: &Tensor,
         vec: &Tensor,
-        pe: &Tensor,
+        pe: &rope::Rope,
     ) -> Result<(Tensor, Tensor)> {
         let (img_mod1, img_mod2) = self.img_mod.forward(vec)?;
         let (txt_mod1, txt_mod2) = self.txt_mod.forward(vec)?;
@@ -395,7 +395,7 @@ impl DoubleStreamBlock {
         let k = Tensor::cat(&[&txt_k, &img_k], 2)?;
         let v = Tensor::cat(&[&txt_v, &img_v], 2)?.contiguous()?;
 
-        let (q, k) = rope::apply_rope(&q, &k, pe)?;
+        let (q, k) = rope::apply_rope_fused(&q, &k, pe)?;
         let attn = ops::scaled_dot_product_attention(&q.contiguous()?, &k.contiguous()?, &v)?;
         let attn = merge_heads(&attn)?;
 
@@ -470,7 +470,7 @@ impl SingleStreamBlock {
         self.linear1.resident_bytes() + self.linear2.resident_bytes()
     }
 
-    fn forward(&self, xs: &Tensor, vec: &Tensor, pe: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, vec: &Tensor, pe: &rope::Rope) -> Result<Tensor> {
         let (m, _) = self.modulation.forward(vec)?;
         let x_mod = modulate(&self.pre_norm.forward(xs)?, &m)?;
 
@@ -481,7 +481,7 @@ impl SingleStreamBlock {
         let (q, k, v) = split_qkv(&qkv.contiguous()?, self.num_heads, self.head_dim)?;
         let q = self.qk_norm.query_norm.forward(&q)?;
         let k = self.qk_norm.key_norm.forward(&k)?;
-        let (q, k) = rope::apply_rope(&q, &k, pe)?;
+        let (q, k) = rope::apply_rope_fused(&q, &k, pe)?;
         let attn = ops::scaled_dot_product_attention(&q.contiguous()?, &k.contiguous()?, &v)?;
         let attn = merge_heads(&attn)?;
 
@@ -766,7 +766,7 @@ impl FluxTransformer {
         // Text ids precede image ids, matching the concatenation order inside
         // every block.
         let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
-        let pe = rope::embed_nd(&ids, &self.cfg.axes_dim, self.cfg.theta)?;
+        let pe = rope::embed_nd_cos_sin(&ids, &self.cfg.axes_dim, self.cfg.theta)?;
 
         let mut txt = txt;
         match &self.blocks {

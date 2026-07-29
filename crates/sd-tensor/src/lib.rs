@@ -883,6 +883,17 @@ pub mod ops {
         attention_with_path(q, k, v, Some(mask)).map(|(t, _)| t)
     }
 
+    /// candle's fused rotary embedding, interleaved variant.
+    ///
+    /// `xs` is `[b, heads, seq, head_dim]`; `cos` and `sin` are `[seq, dim/2]`
+    /// or `[b, seq, dim/2]`. Rotates **adjacent pairs** — `(x0, x1)`,
+    /// `(x2, x3)` — which is Flux's convention. `rope` (without the `_i`)
+    /// splits the head in half instead and is a different function on the
+    /// same shapes.
+    pub fn rope_interleaved(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        candle_nn::rotary_emb::rope_i(xs, cos, sin)
+    }
+
     /// Additive causal mask of shape `[1, 1, seq, seq]`.
     ///
     /// Position `(i, j)` is `0.0` when `j <= i` and `f32::NEG_INFINITY`
