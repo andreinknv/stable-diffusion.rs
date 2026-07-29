@@ -658,9 +658,8 @@ silent-wrongness bug if missed:
   logits. Reusing the text mask would let each patch see only those before it
   in raster order and still emit the right shape.
 - **The class token is prepended**, because the pooled output reads position 0.
-- **`pre_layrnorm`** is spelled that way in the checkpoint. A slip that
-  shipped early and became part of the format — every implementation carries
-  it now, including this one. Do not "fix" it.
+- **`pre_layrnorm`** is spelled that way in the checkpoint, so that is the
+  name this loads. Correcting the spelling fails to find the tensor.
 
 **IP-Adapter consumes the *projected* embedding, not the pooled one.** The
 tower is 1280 wide and `visual_projection` narrows it to 1024, which is what
@@ -1054,9 +1053,9 @@ already uses, and — exactly — the `squaredcos_cap_v2` ladder written for the
 noise augmentation, which is the prior's sampling schedule too. What was
 genuinely new is one assembly and one sampler.
 
-**`diffusers/stable-diffusion-2-1-unclip-t2i-h` pairs halves that do not
-fit.** Its prior is Karlo's, emitting a 768-wide ViT-L embedding, while its
-image half is the ViT-H one — `image_normalizer` 1024 wide and a UNet
+**`diffusers/stable-diffusion-2-1-unclip-t2i-h` will not load here.** Its
+prior emits a 768-wide ViT-L embedding, while its image half is the ViT-H
+one — `image_normalizer` 1024 wide and a UNet
 whose class projection is 2048, being twice that. The two ends do not meet.
 **`-t2i-l` is the consistent pairing**: 768 throughout, class projection 1536.
 `with_prior` checks the two widths and names the mismatch rather than letting

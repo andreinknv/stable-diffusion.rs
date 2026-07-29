@@ -2,10 +2,8 @@
 
 Diffusion model inference in pure Rust.
 
-A ground-up Rust implementation in the spirit of
-[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) — no
-cmake, no git submodules, no vendored inference engine. `cargo build` and you
-have a binary.
+A ground-up Rust implementation: no cmake, no git submodules, no vendored
+inference engine. `cargo build` and you have a binary.
 
 > **Status: it renders.** Six architectures — Stable Diffusion 1.5, 2.x,
 > SDXL, SD 3.5, Flux (schnell and mini), and unCLIP — on CPU and Apple GPU,
@@ -26,27 +24,21 @@ hour"</code></em></p>
 
 ## Why
 
-`stable-diffusion.cpp` is excellent, and this project exists because of it, not
-in spite of it. Three things a Rust implementation gets you:
+Three things this implementation provides:
 
 - **No build ceremony.** One `cargo build`, no cmake, no submodule init, no
   toolchain file. Dependencies resolve through cargo like any other crate.
 - **Memory-safe model loading.** Weight parsers ingest files people download
-  from the internet, which is a category where memory safety is worth having
-  for free rather than by discipline. Ours is safe
-  Rust with `unsafe` confined to a single documented `mmap`. (safetensors
-  loads today; GGUF parses and dequantises, but SD checkpoints in it still
-  need a name map.)
+  from the internet. These are safe Rust, with `unsafe` confined to a single
+  documented `mmap`. (safetensors loads today; GGUF parses and dequantises,
+  but SD checkpoints in it still need a name map.)
 - **Embeddable.** A normal crate you add to a Rust application, not an FFI
   boundary you marshal across.
 
 ## Design
 
-Models, samplers, and loaders are ours. The tensor math is
-[candle](https://github.com/huggingface/candle) — the same bargain
-`stable-diffusion.cpp` makes with `ggml`, which it vendors unmodified.
-
-The difference is that candle sits behind a seam:
+Models, samplers, and loaders are implemented here. The tensor math is
+[candle](https://github.com/huggingface/candle), which sits behind a seam:
 
 ```
 sd-cli ──┐
@@ -231,37 +223,25 @@ runs.*
 
 ## Standing on
 
-Almost nothing here is an original idea. This is a port, and it is worth being
-plain about whose work it is a port *of*.
+What this project uses, and for what:
 
+- **[candle](https://github.com/huggingface/candle)** — tensor and compute
+  backend, reached only through `sd-tensor`. Its fused kernels are used where
+  they apply: `ops::sdpa` for attention and `rotary_emb::rope_i` for Flux's
+  positional encoding.
 - **[diffusers](https://github.com/huggingface/diffusers)** and
-  **[transformers](https://github.com/huggingface/transformers)** are the
-  reference this project is checked against, tensor by tensor. Every
-  agreement figure in the table above is agreement *with them*. Where this
-  port was wrong — and it has been wrong in most of the ways a port can be —
-  their implementation is how it was found out. Several of the subtleties
-  documented in `docs/handoff.md` are things their code already got right and
-  this one had to learn.
-- **[candle](https://github.com/huggingface/candle)** is the tensor library
-  underneath. The fused kernels it ships are worth more than any optimisation
-  written here: its rotary embedding is 26x faster than the hand-rolled one it
-  replaced, and its attention kernel 2.5-3.8x. Where a limitation of it is
-  recorded in the docs, that is a note for whoever hits the same edge, not a
-  complaint — it is a fast-moving pre-1.0 library doing a hard job.
-- **[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)**
-  is why this project exists at all. Its architecture decisions, its GGUF
-  conventions, and its answers to questions like block streaming and
-  placement were all worked out first there, and several designs here are its
-  design with different syntax.
-- **The model authors** — Stability AI, Black Forest Labs, kakaobrain, and the
-  research behind LCM, LoRA, ControlNet, IP-Adapter, GLIGEN, AnimateDiff,
-  TeaCache and the rest. The weights and the methods are theirs; this reads
-  them.
-- **The people who publish quantised checkpoints and open mirrors**, notably
-  [city96](https://huggingface.co/city96), without whom several of these
-  models would not fit on a laptop and could not be tested here at all.
+  **[transformers](https://github.com/huggingface/transformers)** — the
+  reference implementations every component here is compared against, tensor
+  by tensor. Module layouts and parameter names follow theirs so pretrained
+  weights load unmodified.
+- **[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)** —
+  architecture layouts, GGUF conventions, weight-name maps and the
+  block-streaming and placement designs.
+- **[tokenizers](https://github.com/huggingface/tokenizers)** — CLIP's BPE,
+  loaded from `tokenizer.json`.
 
-Bugs found in other projects are recorded in `docs/handoff.md` because they
-cost time and the next person deserves the warning. They are not a scorecard.
-This project has produced more of its own bugs than it has found in anyone
-else's, and those are written down in the same place and at greater length.
+The models themselves belong to their authors and carry their own licences —
+Stability AI, Black Forest Labs, kakaobrain, OpenAI, Google, and the research
+behind ControlNet, IP-Adapter, GLIGEN, AnimateDiff, LCM, LoRA and TeaCache.
+Several are only testable on a laptop because other people publish quantised
+conversions and ungated mirrors. [NOTICE](NOTICE) has the full list.

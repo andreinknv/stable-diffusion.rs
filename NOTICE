@@ -77,7 +77,6 @@ Model weights and methods
 --------------------------------------------------------------------------
 Quantised checkpoints and open mirrors
 
-    Several models are only testable on modest hardware because other people
-    publish quantised conversions and ungated mirrors — city96's GGUF
-    conversions in particular. Those redistributions carry the original
-    models' licences.
+    Testing on modest hardware relies on third-party quantised conversions and
+    ungated mirrors, notably city96's GGUF conversions. Those redistributions
+    carry the original models' licences.

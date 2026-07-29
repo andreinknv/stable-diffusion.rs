@@ -102,11 +102,10 @@ fn the_conditioning_slots_are_exclusive_and_go_to_the_right_architectures() {
 
 #[test]
 fn the_unclip_class_projection_is_exactly_twice_an_image_embedding() {
-    // **The invariant the published `-t2i-h` mirror does not satisfy.** Its
-    // prior emits a 768-wide ViT-L embedding while its UNet's class projection
-    // is 2048, being twice a 1024-wide ViT-H one, so the two halves do not
-    // meet. Worth pinning here because it is the kind of mismatch a
-    // repackaged checkpoint can acquire without anyone noticing.
+    // Pinned because a checkpoint can arrive with the two halves at
+    // different widths and nothing else would catch it: `-t2i-h` has a
+    // 768-wide prior against a class projection of 2048, being twice a
+    // 1024-wide embedding, and does not load here.
     //
     // The width is twice the embedding's because the vector is the embedding
     // concatenated with a sinusoid of the noise level, at the same width. Any

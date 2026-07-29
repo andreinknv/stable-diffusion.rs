@@ -1691,9 +1691,9 @@ def dump_unclip_prior(output: pathlib.Path, model_id: str) -> None:
 
     # Why `-t2i-l` and not `-t2i-h`
 
-    **`diffusers/stable-diffusion-2-1-unclip-t2i-h` pairs halves that do not
-    fit.** Its prior is Karlo's, which emits a 768-wide ViT-L embedding, while
-    its image half is the ViT-H one: `image_normalizer` is 1024 wide and the UNet's
+    **`diffusers/stable-diffusion-2-1-unclip-t2i-h` is not usable here.** Its
+    prior emits a 768-wide ViT-L embedding, while its image half is the ViT-H
+    one: `image_normalizer` is 1024 wide and the UNet's
     `projection_class_embeddings_input_dim` is 2048, being twice that. The two
     halves cannot be connected, and the mismatch is in the published configs
     rather than anything this port does. `-t2i-l` is the consistent pairing --
