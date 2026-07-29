@@ -1120,18 +1120,32 @@ entirely untested, so that visit should cover both.
 
 ### Also open
 
-- **ControlNet for SDXL.** The mechanism is architecture-independent —
-  `forward_controlled` takes plain tensors and `ControlNet::new` takes a
-  `UNetConfig` — so this should be config and a checkpoint, not new code. Worth
-  confirming that claim rather than assuming it.
+- **ControlNet for SDXL — and it is *not* config-only, which this entry used
+  to claim.** Checked rather than assumed: `ControlNet::new` takes a
+  `UNetConfig` but builds only a `TimestepEmbedding` from it, ignoring
+  `cfg.addition` entirely, and `ControlNet::forward` takes
+  `(sample, timestep, context, hint, scale)` with nowhere to put a pooled
+  embedding or time ids. SDXL ControlNets are `addition_embed_type:
+  "text_time"` and are conditioned on both. So this is an `add_embedding` on
+  the ControlNet plus a wider `forward` — small, but new code, and the UNet
+  side (`forward_controlled`) genuinely is architecture-independent.
 - ~~**Multiple ControlNets at once.**~~ **Done**, and has been for a while —
   `ControlConfig::controls` is a `Vec<Control>` and the corrections are summed
   before the UNet sees them. The entry outlived the work; see the section
   above for why summing is the right composition.
-- `candle_nn::rotary_emb::{rope, rope_i, rope_thd}` — fused RoPE. Flux's
-  axis-wise 2x2 form may not map onto it; establish rather than assume.
+- `candle_nn::rotary_emb::{rope, rope_i, rope_thd}` — fused RoPE. All three
+  exist in candle-nn 0.11. **Established by reading, not yet by running: the
+  form maps onto `rope_i`, not `rope`.** Flux rotates *interleaved adjacent
+  pairs* — `flux::rope` reshapes to `[.., dim/2, 2]` and narrows both halves —
+  which is `rope_i`'s convention; `rope` splits the head in half instead. And
+  the explicit 2x2 is `[[cos, -sin], [sin, cos]]`, so the `cos`/`sin` those
+  functions want are its first column. The axis-wise frequencies concatenate
+  along the frequency axis and fit `(t, dim/2)` unchanged. What is still
+  unmeasured is whether it is *faster* on these shapes — see the entry above
+  for how badly that assumption has gone before.
 - `candle_nn::ops::{pixel_shuffle, pixel_unshuffle}` — patchify/unpatchify by
-  another name.
+  another name. Both present in candle-nn 0.11 (`ops.rs`). Same caveat: the
+  shapes line up, the speed is unmeasured.
 - Broaden fused attention to SD 1.5 by materialising `causal_mask` from
   `[1,1,s,s]` to `[b,h,s,s]`. A reshape, not a kernel.
 - A **blocked CPU attention kernel**, tiling over query rows as well as keys.
