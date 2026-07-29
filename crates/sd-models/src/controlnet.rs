@@ -34,8 +34,8 @@ use sd_tensor::nn::{conv2d, Conv2d, Conv2dConfig};
 use sd_tensor::{ops, DType, Module, Result, Tensor, VarBuilder};
 
 use crate::unet::{
-    timestep_embedding, BlockConfig, DownBlock2D, MidBlock2DCrossAttn, TimestepEmbedding,
-    UNetConfig, UnetAttentionSpec,
+    timestep_embedding, AdditionEmbedding, BlockConfig, DownBlock2D, MidBlock2DCrossAttn,
+    TimestepEmbedding, UNetConfig, UnetAttentionSpec,
 };
 
 /// Channel widths inside the hint encoder, before the projection to the UNet's
@@ -138,6 +138,12 @@ pub struct ControlNet {
     mid_projection: Conv2d,
     freq_dim: usize,
     dtype: DType,
+    /// SDXL only. A ControlNet copies the base's *down* stack, so it inherits
+    /// the base's conditioning too — an SDXL ControlNet is
+    /// `addition_embed_type: "text_time"` and is given the same pooled
+    /// embedding and time ids the UNet gets. Its own `add_embedding` weights,
+    /// not the UNet's.
+    add_embedding: Option<(TimestepEmbedding, AdditionEmbedding)>,
 }
 
 impl ControlNet {
@@ -227,7 +233,23 @@ impl ControlNet {
             )?,
             freq_dim: first,
             dtype: vb.dtype(),
+            add_embedding: match cfg.addition {
+                Some(add) => Some((
+                    TimestepEmbedding::new(
+                        add.projection_input_dim,
+                        temb_channels,
+                        vb.pp("add_embedding"),
+                    )?,
+                    add,
+                )),
+                None => None,
+            },
         })
+    }
+
+    /// Whether this ControlNet expects SDXL's micro-conditioning.
+    pub fn takes_micro_conditioning(&self) -> bool {
+        self.add_embedding.is_some()
     }
 
     pub fn dtype(&self) -> DType {
@@ -248,8 +270,78 @@ impl ControlNet {
         hint: &Tensor,
         scale: f64,
     ) -> Result<Control> {
+        self.forward_with(sample, timestep, context, hint, scale, None)
+    }
+
+    /// [`Self::forward`], with SDXL's micro-conditioning.
+    ///
+    /// `added` is `(pooled, time_ids)`, exactly what
+    /// `UNet2DConditionModel::forward_sdxl` takes — and it must be the *same*
+    /// pair, because the corrections are added to a UNet that saw it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_sdxl(
+        &self,
+        sample: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        hint: &Tensor,
+        scale: f64,
+        pooled: &Tensor,
+        time_ids: &Tensor,
+    ) -> Result<Control> {
+        self.forward_with(
+            sample,
+            timestep,
+            context,
+            hint,
+            scale,
+            Some((pooled, time_ids)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with(
+        &self,
+        sample: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        hint: &Tensor,
+        scale: f64,
+        added: Option<(&Tensor, &Tensor)>,
+    ) -> Result<Control> {
         let temb = timestep_embedding(timestep, self.freq_dim)?.to_dtype(self.dtype)?;
         let temb = self.time_embedding.forward(&temb)?;
+
+        // The same slot, and the same arithmetic, as the UNet's — see
+        // `unet::model`. A ControlNet whose base has micro-conditioning must
+        // receive it too, or its corrections are computed at a different
+        // timestep embedding than the block they correct.
+        let temb = match (&self.add_embedding, added) {
+            (Some((embed, add_cfg)), Some((pooled, time_ids))) => {
+                let (b, n) = time_ids.dims2()?;
+                let flat = time_ids.flatten_all()?;
+                let sinusoid =
+                    timestep_embedding(&flat, add_cfg.time_embed_dim)?.to_dtype(self.dtype)?;
+                let sinusoid = sinusoid.reshape((b, n * add_cfg.time_embed_dim))?;
+                // Pooled first, then the sinusoid — both orders sum to the
+                // same width and load, and the reversed one conditions on
+                // nonsense.
+                let combined = Tensor::cat(&[pooled, &sinusoid], 1)?;
+                (temb + embed.forward(&combined)?)?
+            }
+            (Some(_), None) => {
+                return Err(sd_tensor::Error::Msg(
+                    "this ControlNet expects SDXL micro-conditioning; use forward_sdxl".to_string(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(sd_tensor::Error::Msg(
+                    "micro-conditioning supplied to a ControlNet that has no add_embedding"
+                        .to_string(),
+                ))
+            }
+            (None, None) => temb,
+        };
 
         // The hint is added to conv_in's output, not concatenated: a
         // ControlNet's conv_in takes the same 4 latent channels the UNet's

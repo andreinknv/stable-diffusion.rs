@@ -1172,19 +1172,26 @@ entirely untested, so that visit should cover both.
 
 ### Also open
 
-- **ControlNet for SDXL — and it is *not* config-only, which this entry used
-  to claim.** Checked rather than assumed: `ControlNet::new` takes a
-  `UNetConfig` but builds only a `TimestepEmbedding` from it, ignoring
-  `cfg.addition` entirely, and `ControlNet::forward` takes
-  `(sample, timestep, context, hint, scale)` with nowhere to put a pooled
-  embedding or time ids. SDXL ControlNets are `addition_embed_type:
-  "text_time"` and are conditioned on both. So this is an `add_embedding` on
-  the ControlNet plus a wider `forward` — small, but new code, and the UNet
-  side (`forward_controlled`) genuinely is architecture-independent.
-- ~~**Multiple ControlNets at once.**~~ **Done**, and has been for a while —
-  `ControlConfig::controls` is a `Vec<Control>` and the corrections are summed
-  before the UNet sees them. The entry outlived the work; see the section
-  above for why summing is the right composition.
+- ~~**ControlNet for SDXL.**~~ **Done**, and it was not config-only — the
+  entry used to claim it would be "a config and a checkpoint, not new code".
+  `ControlNet::new` took a `UNetConfig` but built only a `TimestepEmbedding`
+  from it, ignoring `cfg.addition`, and `forward` had nowhere to put a pooled
+  embedding or time ids. An SDXL ControlNet is `addition_embed_type:
+  "text_time"` and is conditioned on both, exactly as the SDXL UNet is.
+
+  `ControlNet::forward_sdxl` now takes them, through the same arithmetic and
+  the same slot the UNet uses. Verified correction by correction against
+  `diffusers/controlnet-canny-sdxl-1.0`: nine skips plus the mid block, all
+  within 1e-3, and a plain `forward` on such a checkpoint is refused by name.
+
+  **Not** the `-small` distilled variant, which is tempting at 640 MB against
+  5 GB and is a different architecture: all `DownBlock2D`,
+  `transformer_layers_per_block: [0, 0, 0]`, no mid block. `UNetConfig::sdxl()`
+  does not describe it. Supporting it would be its own config, not this one.
+
+  Still open: wiring it into `SdxlPipeline`, which is plumbing — the model
+  side is verified.
+
 - ~~`candle_nn::rotary_emb::{rope, rope_i, rope_thd}`~~ **Done — `rope_i`, and
   it is worth 1.35x on a whole Flux run.** Flux rotates *interleaved adjacent
   pairs*, which is `rope_i`'s convention; `rope` splits the head in half and is

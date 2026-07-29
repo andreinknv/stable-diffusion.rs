@@ -1923,6 +1923,85 @@ def dump_unclip_prior(output: pathlib.Path, model_id: str) -> None:
     print(f"\nthe attention mask moves the prediction by {moved:.4f}")
 
 
+def dump_controlnet_sdxl(output: pathlib.Path, model_id: str) -> None:
+    """An SDXL ControlNet, which is conditioned like an SDXL UNet.
+
+    The reason this needs its own reference rather than reusing the SD 1.5
+    one: an SDXL ControlNet is `addition_embed_type: "text_time"`, so its time
+    embedding takes the pooled text embedding and the six time ids on top of
+    the timestep. Getting that wrong does not fail — it produces thirteen
+    corrections of exactly the right shapes, computed at a timestep embedding
+    that means something else, and the image merely comes out wrong.
+
+    Uses the **full** checkpoint, not the distilled `-small` one. The small
+    variant is 640 MB and tempting, but it is a different architecture: its
+    `down_block_types` are all `DownBlock2D`, `transformer_layers_per_block`
+    is `[0, 0, 0]`, and it has no mid block — a purely convolutional
+    ControlNet that `UNetConfig::sdxl()` does not describe. The full one
+    matches that config field for field, which is the point.
+    """
+    torch = _require("torch")
+    _require("diffusers")
+    from diffusers import ControlNetModel
+    from safetensors.torch import save_file
+
+    out = output / "controlnet_sdxl"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id}")
+    net = ControlNetModel.from_pretrained(model_id, torch_dtype=torch.float32).eval()
+    cfg = net.config
+    print(
+        f"  {cfg.addition_embed_type}, projection {cfg.projection_class_embeddings_input_dim}, "
+        f"blocks {list(cfg.block_out_channels)}"
+    )
+
+    gen = torch.Generator().manual_seed(SEED)
+    sample = torch.randn(1, 4, 32, 32, generator=gen)
+    timestep = torch.tensor([500.0])
+    context = torch.randn(1, 77, cfg.cross_attention_dim, generator=gen)
+    hint = torch.rand(1, 3, 256, 256, generator=gen)
+    pooled = torch.randn(1, 1280, generator=gen)
+    time_ids = torch.tensor([[1024.0, 1024.0, 0.0, 0.0, 1024.0, 1024.0]])
+
+    with torch.no_grad():
+        res = net(
+            sample,
+            timestep,
+            encoder_hidden_states=context,
+            controlnet_cond=hint,
+            conditioning_scale=1.0,
+            added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids},
+            return_dict=True,
+        )
+
+    tensors = {
+        "sample": sample.contiguous(),
+        "timestep": timestep.contiguous(),
+        "context": context.contiguous(),
+        "hint": hint.contiguous(),
+        "pooled": pooled.contiguous(),
+        "time_ids": time_ids.contiguous(),
+        "mid": res.mid_block_res_sample.detach().contiguous().clone(),
+    }
+    for i, d in enumerate(res.down_block_res_samples):
+        tensors[f"down_{i:02d}"] = d.detach().contiguous().clone()
+
+    save_file(tensors, str(out / "reference.safetensors"))
+
+    _require("huggingface_hub")
+    from huggingface_hub import hf_hub_download
+
+    weights = hf_hub_download(repo_id=model_id, filename="diffusion_pytorch_model.safetensors")
+    link = out / "controlnet.safetensors"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(weights)
+
+    print(f"\nwrote {out / 'reference.safetensors'}")
+    print(f"  {len(res.down_block_res_samples)} down corrections plus mid")
+
+
 SAMPLER_SIGMAS = [14.6146, 10.0, 6.0, 3.0, 1.5, 0.5, 0.0]
 
 
@@ -2319,6 +2398,10 @@ def main() -> None:
     ucp.add_argument("--model-id", default="diffusers/stable-diffusion-2-1-unclip-t2i-l")
     ucp.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    cns = sub.add_parser("controlnet_sdxl", help="dump SDXL ControlNet references")
+    cns.add_argument("--model-id", default="diffusers/controlnet-canny-sdxl-1.0")
+    cns.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     gg = sub.add_parser("gguf", help="link small real GGUF files for the header tests")
     gg.add_argument("--model-id", default="", help="unused")
     gg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -2328,6 +2411,8 @@ def main() -> None:
         dump_gligen(args.output, args.model_id)
     elif args.component == "unclip":
         dump_unclip(args.output, args.model_id)
+    elif args.component == "controlnet_sdxl":
+        dump_controlnet_sdxl(args.output, args.model_id)
     elif args.component == "unclip_prior":
         dump_unclip_prior(args.output, args.model_id)
     elif args.component == "motion":

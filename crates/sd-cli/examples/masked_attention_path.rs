@@ -50,19 +50,17 @@ fn main() -> Result<()> {
 }
 
 fn measure(name: &str, dev: &Device, b: usize, heads: usize, seq: usize, dim: usize) -> Result<()> {
-    let dev = dev.clone();
-    let dev = &dev;
     let mut rng = sd_tensor::rng::SeededRng::new(0);
-    let q = rng.randn((b, heads, seq, dim), &dev)?;
-    let k = rng.randn((b, heads, seq, dim), &dev)?;
-    let v = rng.randn((b, heads, seq, dim), &dev)?;
+    let q = rng.randn((b, heads, seq, dim), dev)?;
+    let k = rng.randn((b, heads, seq, dim), dev)?;
+    let v = rng.randn((b, heads, seq, dim), dev)?;
 
-    let broadcast = ops::causal_mask(seq, &dev)?.to_dtype(DType::F32)?;
+    let broadcast = ops::causal_mask(seq, dev)?.to_dtype(DType::F32)?;
     let materialised = broadcast.broadcast_as((b, heads, seq, seq))?.contiguous()?;
 
     println!("{name}, batch {b}, {heads} heads x {dim}, {seq} tokens");
-    run("mask [1,1,s,s]", &dev, &q, &k, &v, &broadcast)?;
-    run("mask [b,h,s,s]", &dev, &q, &k, &v, &materialised)?;
+    run("mask [1,1,s,s]", dev, &q, &k, &v, &broadcast)?;
+    run("mask [b,h,s,s]", dev, &q, &k, &v, &materialised)?;
 
     // The masks must agree, or a faster path is just a different answer.
     let a = ops::attention_with_path(&q, &k, &v, Some(&broadcast))?.0;
