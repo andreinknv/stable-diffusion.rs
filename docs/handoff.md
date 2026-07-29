@@ -1,5 +1,127 @@
 # Handoff
 
+## "go" starts here
+
+Saying **go** means: read this file, take the first unchecked item under
+**Start here** below, and begin. No further instruction is needed or expected.
+
+### Start here
+
+1. **Bind `mlx-c` behind `sd-tensor`.** Nothing else moves until this exists.
+   - `mlx-c` is Apple's own C API (github.com/ml-explore/mlx-c). Bind it
+     directly; `cargo search mlx` finds no first-party Rust crate, and the
+     third-party shims are 0.2.x.
+   - It goes in `sd-tensor` and nowhere else. `scripts/check-seam.sh` enforces
+     that no crate outside it names the backend, and CI runs it. That rule is
+     what makes this migration bounded rather than total — do not weaken it to
+     make the port easier.
+   - Target surface first: `Tensor`, dtype/shape/stride, and the ~20 ops that
+     `sd-models` actually calls. The full list of what candle currently
+     provides is in [roadmap.md](roadmap.md).
+   - Success looks like: `sd-tensor` compiles against MLX behind a feature
+     flag, with candle still the default, and one trivial op agreeing between
+     the two.
+
+2. **Port SD 1.5 end to end**, gated on `golden_unet` and `golden_vae`. The
+   checkpoint is at `models/sd15` and those are the strictest tests in the
+   repo. Do not start a second model until the first is green.
+
+3. **Run both backends in parallel** until every golden test passes on MLX.
+   Delete candle in one commit, not gradually.
+
+4. **GGUF last**, gated on `flux_schnell_gguf`. This is the piece with no
+   measurement behind it and no obvious path — see the warning below.
+
+Verification, unchanged and non-negotiable:
+
+```bash
+SD_REQUIRE_FIXTURES=1 SD_TEST_MODEL_DIR=$(pwd)/models/sd15 \
+SD_TEST_SDXL_DIR=$(pwd)/models/sdxl \
+SD_TEST_INIT_IMAGE=$(pwd)/assets/controlnet-crab-canny-512.png \
+cargo test --release --workspace --features metal --no-fail-fast
+```
+
+Without those variables the suite reports 14 failures that are only unset
+paths, and `cargo test` stops at the first failing binary — so a truncated run
+looks like a clean one. `--no-fail-fast` is not optional.
+
+## Decision: the backend moves to MLX
+
+Taken deliberately, after measuring the alternative. The evidence both ways is
+in [roadmap.md](roadmap.md); this section is what to do about it.
+
+**Why, in one line:** every performance win this project found had to be
+hand-written, and MLX's lazy graph fuses that class of thing automatically —
+so the question was never "can we beat candle" (we did, repeatedly) but "how
+many kernels are we prepared to own forever."
+
+### What the measurements say to carry across
+
+Nothing here is wasted, but be clear about what survives.
+
+**Survives, and is the most valuable thing in the repo:** the golden tests and
+their tolerances. Every one was measured against diffusers/transformers with
+`xtask/golden/reference_precision.py`, never guessed. **They are how the MLX
+port gets proven correct.** Do not loosen one to make a port pass — that rule
+does not change with the backend.
+
+**Survives as knowledge, not code:**
+- candle's `gelu_erf` returns *exactly zero* for every input below about -6,
+  because it forms `1 + erf(u)` by subtraction. Check whether MLX does the
+  same; the fix is to read `erfc` off the polynomial before subtracting.
+  See `fused.rs` and `--example gelu_tail`.
+- Reductions: sequential row sums lose accuracy with row length. This bit
+  twice — candle's CPU `rms_norm` is 6-9x less accurate than a blocked
+  reduction, enough to fail `golden_t5`. Verify MLX reduces in a tree.
+- A composition and a kernel **trade places depending on the backend**. Three
+  separate times: fused won on Metal and lost on CPU, for the same op.
+
+**Becomes dead code on the move:**
+- `sd-tensor/src/fused.rs` — the three Metal kernels (group_norm 6.09x, adaLN
+  5.26x, GEGLU 3.65x). MLX's fusion should subsume them. **Measure that it
+  does** rather than assuming; if MLX does not fuse norm-then-modulate, that
+  is 492 ms a Flux step and worth a custom op.
+- The 1x1 convolution routing in `conv.rs`.
+- `sd-tensor/src/mps.rs` and the four objc2 dependencies.
+
+**The hardest piece, and the reason to schedule it early:** `quantized.rs` and
+GGUF. MLX has its own quantisation and does not read GGUF natively. Flux
+schnell GGUF is in the test suite and will not port by itself.
+
+### Order of work
+
+1. **Bind `mlx-c` behind `sd-tensor`.** This is what the seam exists for: no
+   crate outside it may name the backend, so in principle nothing above it
+   changes. `mlx-c` is Apple's own C API — bind it directly rather than taking
+   a third-party shim (`cargo search mlx` finds no first-party Rust crate).
+2. **Port SD 1.5 first**, end to end, against `golden_unet` and
+   `golden_vae`. The checkpoint is on disk and the tests are the strictest.
+   Do not port a second model until the first is green.
+3. **Keep candle building in parallel** behind a feature until parity is
+   proven on every golden test. Delete it in one commit, not gradually.
+4. **GGUF last**, with `flux_schnell_gguf` as the gate.
+
+### Numbers to beat
+
+The current Metal path, measured this session, interleaved three times each:
+
+```text
+  SD 1.5, 512x512, 20 steps:  15.736 s  ->  12.830 s   (18.5% faster)
+```
+
+That 12.830 s is what an MLX port has to beat to be worth the move. It is not
+a low bar: it already includes three fused kernels candle does not have.
+
+Also measured, and the thing MLX most plausibly improves on: candle's
+convolution is im2col plus a matmul, materialising up to 283 MB per call at
+~25 GB/s, and **Apple's own conv is 1.99x faster** (`--example mps_conv`).
+Convolution is ~48% of a step. If MLX does not beat candle's conv, the move
+has not paid for itself.
+
+---
+
+# Handoff
+
 Updated 2026-07-28.
 
 ## Say "go" to resume

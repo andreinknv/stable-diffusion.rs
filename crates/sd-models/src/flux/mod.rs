@@ -243,9 +243,17 @@ impl Modulation {
 ///
 /// The `1 +` is what makes an untrained modulation the identity. Dropping it
 /// leaves a model that trains but does not match published weights.
-fn modulate(xs: &Tensor, m: &Mod) -> Result<Tensor> {
-    xs.broadcast_mul(&(&m.scale + 1.0)?)?
-        .broadcast_add(&m.shift)
+/// The norm and the modulation that always follows it, as one kernel.
+///
+/// Never separately: every `PlainLayerNorm` in this file is immediately
+/// modulated, which is the whole adaptive-layer-norm mechanism, and splitting
+/// it into four ops costs seven trips over an activation that is 50 MB at
+/// 1024x1024. Fused it is two — 5.2x here, about 492 ms of a Flux-dev step.
+///
+/// Falls back to `modulate(&norm.forward(xs)?, m)` off Metal, so this is the
+/// same arithmetic either way.
+fn norm_modulate(xs: &Tensor, norm: &PlainLayerNorm, m: &Mod) -> Result<Tensor> {
+    sd_tensor::fused::ada_layer_norm(xs, &m.scale, &m.shift, norm.eps)
 }
 
 /// LayerNorm with no learned parameters at all.
@@ -371,7 +379,7 @@ impl DoubleStreamBlock {
             txt_mod2.expect("double block"),
         );
 
-        let img_in = modulate(&self.img_norm1.forward(img)?, &img_mod1)?;
+        let img_in = norm_modulate(img, &self.img_norm1, &img_mod1)?;
         let (img_q, img_k, img_v) = split_qkv(
             &self.img_qkv.forward(&img_in)?,
             self.num_heads,
@@ -380,7 +388,7 @@ impl DoubleStreamBlock {
         let img_q = self.img_qk_norm.query_norm.forward(&img_q)?;
         let img_k = self.img_qk_norm.key_norm.forward(&img_k)?;
 
-        let txt_in = modulate(&self.txt_norm1.forward(txt)?, &txt_mod1)?;
+        let txt_in = norm_modulate(txt, &self.txt_norm1, &txt_mod1)?;
         let (txt_q, txt_k, txt_v) = split_qkv(
             &self.txt_qkv.forward(&txt_in)?,
             self.num_heads,
@@ -413,7 +421,7 @@ impl DoubleStreamBlock {
         let img_ff = self.img_mlp_out.forward(&ops::gelu_approx(
             &self
                 .img_mlp_in
-                .forward(&modulate(&self.img_norm2.forward(&img)?, &img_mod2)?)?,
+                .forward(&norm_modulate(&img, &self.img_norm2, &img_mod2)?)?,
         )?)?;
         let img = (img + img_ff.broadcast_mul(&img_mod2.gate)?)?;
 
@@ -425,7 +433,7 @@ impl DoubleStreamBlock {
         let txt_ff = self.txt_mlp_out.forward(&ops::gelu_approx(
             &self
                 .txt_mlp_in
-                .forward(&modulate(&self.txt_norm2.forward(&txt)?, &txt_mod2)?)?,
+                .forward(&norm_modulate(&txt, &self.txt_norm2, &txt_mod2)?)?,
         )?)?;
         let txt = (txt + txt_ff.broadcast_mul(&txt_mod2.gate)?)?;
 
@@ -472,7 +480,7 @@ impl SingleStreamBlock {
 
     fn forward(&self, xs: &Tensor, vec: &Tensor, pe: &rope::Rope) -> Result<Tensor> {
         let (m, _) = self.modulation.forward(vec)?;
-        let x_mod = modulate(&self.pre_norm.forward(xs)?, &m)?;
+        let x_mod = norm_modulate(xs, &self.pre_norm, &m)?;
 
         let projected = self.linear1.forward(&x_mod)?;
         let qkv = projected.narrow(D::Minus1, 0, 3 * self.hidden_size)?;

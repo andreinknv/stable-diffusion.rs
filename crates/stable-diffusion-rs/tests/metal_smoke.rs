@@ -23,12 +23,24 @@ use stable_diffusion_rs::tensor::{Device, Tensor};
 
 /// Model directories to try, by the name they are linked under. Missing ones
 /// skip: this must stay green on a machine that has not downloaded them.
-const DIFFUSERS_LAYOUT: [&str; 4] = ["sd15", "sd21", "sdxl", "gligen"];
+const DIFFUSERS_LAYOUT: [&str; 3] = ["sd15", "sd21", "gligen"];
 
 /// Models that cannot be driven from text alone, and the test that covers
 /// each instead. Listed so the coverage check below can tell "not exercised"
 /// from "exercised elsewhere".
 const NON_TXT2IMG: [&str; 3] = ["ip2p", "unclip", "unclip-t2i"];
+
+/// Models that *are* driven from text alone but load through a different
+/// pipeline, so they cannot go in [`DIFFUSERS_LAYOUT`].
+///
+/// SDXL was in that list and could never have passed. `Txt2ImgPipeline`
+/// builds an SD-family UNet, which has attention in every down block; **an
+/// SDXL UNet has none in the first**, holding zero attention tensors in
+/// `down_blocks.0` where SD 1.5 holds a full set. So the load asked for
+/// `down_blocks.0.attentions.0.transformer_blocks.0.norm1.weight`, a name
+/// that cannot exist in any SDXL checkpoint. It also conditions on a pooled
+/// embedding and time ids that `Txt2ImgPipeline` has nowhere to put.
+const OWN_PIPELINE: [&str; 1] = ["sdxl"];
 
 fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models")
@@ -337,10 +349,48 @@ fn unclip_cfg(
 }
 
 /// Kept last: a note for whoever adds an architecture.
+#[test]
+fn the_sdxl_path_runs_on_the_gpu() {
+    // Its own test because SDXL loads through `SdxlPipeline`: two text
+    // encoders, a pooled embedding and time ids, and a UNet with three down
+    // blocks rather than four. It sat in the general list for a release
+    // without ever loading.
+    let Some(dev) = gpu() else { return };
+    let dir = models_dir().join("sdxl");
+    if !dir.join("unet").exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no sdxl model");
+        return;
+    }
+    use stable_diffusion_rs::pipeline::SdxlPipeline;
+    let pipeline = match SdxlPipeline::load(&dir, &dev) {
+        Ok(p) => p,
+        Err(e) if refused_for_memory(&e) => {
+            eprintln!("SKIP: not enough free memory for sdxl right now");
+            return;
+        }
+        Err(e) => panic!("sdxl failed to load on Metal: {e}"),
+    };
+    // 128 px, one step: this is a plumbing check, and SDXL's native 1024
+    // would cost far more than the question is worth. The picture will be
+    // poor, which is a property of the size, not of the pipeline.
+    let image = match pipeline.run(&tiny(11)) {
+        Ok(image) => image,
+        Err(e) if refused_for_memory(&e) => {
+            eprintln!("SKIP: not enough free memory to run sdxl");
+            return;
+        }
+        Err(e) => panic!("sdxl failed to run on Metal: {e}"),
+    };
+    assert_plausible(&image, "sdxl");
+    eprintln!("  sdxl: ok");
+}
+
 ///
 /// Add it to [`DIFFUSERS_LAYOUT`] if it loads through `Txt2ImgPipeline`, or
-/// give it its own test if it takes a different route. The cost of forgetting
-/// is a backend-specific failure that ships.
+/// give it its own test if it takes a different route — and list it in
+/// [`NON_TXT2IMG`] or [`OWN_PIPELINE`] so this check can tell that apart from
+/// an oversight. The cost of forgetting is a backend-specific failure that
+/// ships.
 #[test]
 fn the_smoke_list_covers_what_the_repo_links() {
     let dir = models_dir();
@@ -356,7 +406,9 @@ fn the_smoke_list_covers_what_the_repo_links() {
         .collect();
     for name in &linked {
         assert!(
-            DIFFUSERS_LAYOUT.contains(&name.as_str()) || NON_TXT2IMG.contains(&name.as_str()),
+            DIFFUSERS_LAYOUT.contains(&name.as_str())
+                || NON_TXT2IMG.contains(&name.as_str())
+                || OWN_PIPELINE.contains(&name.as_str()),
             "models/{name} is linked but not in the GPU smoke list — add it, \
              or the next backend-specific bug there will ship"
         );

@@ -126,15 +126,81 @@ pub struct Conv2d {
     pad: usize,
 }
 
+/// Below this many spatial positions, the matmul form of a 1x1 convolution
+/// loses to im2col.
+///
+/// Not a guess. The matmul contracts the channel axis, leaving `h*w` columns,
+/// and at 8x8 that is 64 — too narrow to fill a gemm. Measured across every
+/// 1x1 shape in SD 1.5 (`--example conv1x1`), the crossover sits between 64
+/// and 256 columns:
+///
+/// ```text
+///   [2, 640,64,64] -> 320   im2col 3.823 ms   matmul 0.782 ms   4.89x
+///   [2,1280,32,32] -> 640   im2col 2.185 ms   matmul 0.710 ms   3.08x
+///   [2,1280,16,16] -> 1280  im2col 1.180 ms   matmul 0.677 ms   1.74x
+///   [2,1280, 8, 8] -> 1280  im2col 0.481 ms   matmul 0.548 ms   0.88x
+///   [2,2560, 8, 8] -> 1280  im2col 0.727 ms   matmul 1.035 ms   0.70x
+/// ```
+const MATMUL_MIN_POSITIONS: usize = 256;
+
 impl Conv2d {
     pub fn new(inner: candle_nn::Conv2d) -> Self {
         let pad = inner.config().padding;
         Self { inner, pad }
     }
+
+    /// A 1x1 convolution is a matmul, and candle does not know that.
+    ///
+    /// `candle_core`'s Metal `conv2d` runs im2col then matmul for every kernel
+    /// size. At 1x1, stride 1, no padding, the im2col buffer *is* the input —
+    /// copied out and read straight back. Contracting the channel axis instead
+    /// needs no transpose and no intermediate: `[b, c, h, w]` reshapes to
+    /// `[b, c, h*w]`, and the kernel `[co, ci, 1, 1]` to `[co, ci]`.
+    ///
+    /// Returns `None` for anything that does not qualify, so the caller falls
+    /// through to the ordinary path.
+    fn as_matmul(&self, xs: &Tensor) -> Result<Option<Tensor>> {
+        if !crate::fused::kernel_enabled() {
+            return Ok(None);
+        }
+        let cfg = self.inner.config();
+        let w = self.inner.weight();
+        let (co, ci, kh, kw) = w.dims4()?;
+        if kh != 1 || kw != 1 || cfg.stride != 1 || cfg.padding != 0 || cfg.dilation != 1 {
+            return Ok(None);
+        }
+        if cfg.groups != 1 {
+            // A grouped 1x1 is a block-diagonal matmul, not this one.
+            return Ok(None);
+        }
+        let (b, c, h, width) = xs.dims4()?;
+        // Metal only: on CPU candle's im2col path is vectorised and threaded,
+        // and this has not been measured there. The backend has decided
+        // against the obvious answer three times in this file's history.
+        if c != ci
+            || !xs.is_contiguous()
+            || !xs.device().is_metal()
+            || h * width < MATMUL_MIN_POSITIONS
+        {
+            return Ok(None);
+        }
+
+        let out = w
+            .reshape((co, ci))?
+            .broadcast_matmul(&xs.reshape((b, ci, h * width))?)?
+            .reshape((b, co, h, width))?;
+        Ok(Some(match self.inner.bias() {
+            Some(bias) => out.broadcast_add(&bias.reshape((1, co, 1, 1))?)?,
+            None => out,
+        }))
+    }
 }
 
 impl Module for Conv2d {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        if let Some(out) = self.as_matmul(xs)? {
+            return Ok(out);
+        }
         let (wrap_x, wrap_y) = wrapping();
         if self.pad == 0 || !(wrap_x || wrap_y) {
             return self.inner.forward(xs);

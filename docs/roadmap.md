@@ -530,9 +530,9 @@ directly, because it indexes the mask flat.
 A survey after the fused-attention surprise, since the same mistake was
 clearly available twice:
 
-- **`candle_nn::ops::rms_norm`** — a fused RMSNorm. We hand-wrote one in
-  `t5`, one in `flux` and one in `sd3`. Three copies of an op candle already
-  has, each doing its own f32 upcast.
+- ~~**`candle_nn::ops::rms_norm`**~~ — done, and the answer turned out to
+  depend on the backend. See [Fused norms are a backend
+  question](#fused-norms-are-a-backend-question) below.
 - ~~**`candle_nn::cpu_flash_attention::run_flash_attn_cpu`**~~ — done, and it
   was **not** "the largest single win available" as this list guessed. See
   [CPU flash attention](#cpu-flash-attention-a-short-sequence-win-not-a-general-one)
@@ -541,14 +541,281 @@ clearly available twice:
 - **`candle_nn::rotary_emb::{rope, rope_i, rope_thd}`** — fused RoPE. Flux's
   axis-wise 2x2 formulation may not map onto it directly, but that is worth
   establishing rather than assuming.
-- **`candle_nn::ops::{layer_norm, pixel_shuffle, pixel_unshuffle}`** — a
-  fused LayerNorm, and shuffles that are exactly patchify/unpatchify.
+- ~~**`candle_nn::ops::layer_norm`**~~ — done, same answer as `rms_norm`
+  and for the same reason. **`pixel_shuffle`/`pixel_unshuffle`** are still
+  open: they are exactly patchify/unpatchify.
 - `candle-transformers` ships its own flux, t5, clip and stable_diffusion
   models. We do not want those — implementing the models is the point of this
   project — but they are a reference to check ambiguous conventions against.
 
 - Broadening the fused attention path to SD 1.5 by materialising the causal
   mask to the shape the kernel wants, which is a reshape rather than a kernel.
+
+## Fused norms are a backend question
+
+The seam hand-rolled `rms_norm` and `plain_layer_norm` as compositions —
+`mean_keepdim`, subtract, square, reduce, sqrt, divide — where candle ships
+fused kernels for both. Commit e5e372a measured the fused ones as 6 to 10x
+less accurate and kept the compositions. That measurement was correct and its
+conclusion was too broad: it was taken on CPU only.
+
+The two backends do not share a reduction. Relative error against an f64
+reference, from `cargo run -p sd-cli --example norm_accuracy`:
+
+```text
+                       CPU                     Metal
+  [1,154,4096]  ours 1.3e-7  candle 8.8e-7    ours 1.4e-7  candle 9.0e-8
+  [1,1536,3072] ours 9.4e-8  candle 7.5e-7    ours 1.3e-7  candle 9.3e-8
+  [1,77,768]    ours 7.1e-8  candle 4.4e-7    ours 1.1e-7  candle 7.6e-8
+```
+
+candle's CPU kernel sums each row with a sequential `.sum::<f32>()`; error in
+a sequential sum grows with row length, and these rows are long. Its Metal
+kernel reduces across a threadgroup in a tree, which is at least as accurate
+as reducing in blocks — and 4.5x faster. So the seam now uses the fused
+kernels on Metal and the compositions on CPU, with half precision staying on
+the composition everywhere because it reduces in f32 whatever the input dtype,
+which `t5::RmsNorm` needs at d_model 4096.
+
+What this is worth, from per-call measurements at the shapes Flux-dev runs
+(`--example norm_flux_shapes`), weighted by counted call sites — 115 layer
+norms and 152 QK norms per forward, split across a 4096-token image stream, a
+512-token text stream, and 4608 concatenated:
+
+```text
+  layer norms   418 ms
+  QK norms      899 ms
+  total        1316 ms per step, at 1024x1024
+```
+
+That is an estimate, not a generation: no Flux checkpoint is present on the
+development machine, and instantiating dev at f32 would ask for about 48 GB.
+
+Two things are worth carrying forward from this. The first is that "fused is
+better" and "fused is worse" are both wrong as general rules — the question is
+which reduction the kernel uses on the backend in front of you, and it has now
+come out differently on CPU and Metal for the same op. The second is that a
+comment recording the earlier measurement did not stop the swap being
+attempted a second time; `crates/sd-tensor/tests/norm_reduction.rs` now
+asserts the CPU bound directly, without needing a T5 checkpoint to catch it.
+
+CUDA is deliberately unmeasured. candle reduces in a tree there too and would
+very likely behave like Metal, but there is no CUDA machine here.
+
+## Kernels we write ourselves
+
+`crates/sd-tensor/src/fused.rs` compiles Metal source this project wrote and
+dispatches it onto candle's own device. It forks nothing and adds nothing to
+the build graph: `candle-metal-kernels` and `objc2-metal` already compile in
+every `--features metal` build, and candle exposes exactly the seams needed —
+`CustomOp1::metal_fwd`, `Device::new_library_with_source` to compile at
+runtime, and `MetalDevice::command_encoder` to encode onto the command stream
+candle is already filling.
+
+This matters because the earlier reading of the constraint was wrong. Writing
+GPU kernels was assumed to require `metal-rs` or `cudarc` as a new dependency
+and was costed at months in "Deliberately not doing". It requires neither.
+
+### Which compositions are worth replacing
+
+Every candidate is several ops in a row on a large tensor, each reading its
+input from memory and writing its output back. The arithmetic between those
+trips is trivial, so the cost *is* the trips. Measured with
+`--example fusion_survey`:
+
+```text
+  adaLN, norm -> modulate      472.6 ms per Flux-dev step   (estimated)
+  GEGLU                         25.0 ms per SD 1.5 forward
+  GroupNorm -> SiLU              1.1 ms per SD 1.5 forward
+```
+
+GroupNorm -> SiLU is **not worth a kernel** and that is a result, not a gap:
+SiLU costs about 0.02 ms against the norm's 3.6 ms at the largest shape, so it
+is already hidden. Measuring it first cost less than writing it would have.
+
+### GEGLU: done
+
+`hidden * gelu(gate)` was four ops — two narrows, a gelu and a multiply — on
+the largest tensor in a transformer block, since the projection is eight times
+the model width. Five trips over the data where two would do.
+
+```text
+  seq 4096 dim  320   composed 5.639 ms   ours 1.452 ms   3.88x
+  seq 1024 dim  640   composed 2.563 ms   ours 0.738 ms   3.47x
+  seq  256 dim 1280   composed 1.280 ms   ours 0.433 ms   2.96x
+  seq   64 dim 1280   composed 0.411 ms   ours 0.196 ms   2.10x
+```
+
+3.65x on the op, 53.5 ms -> 14.6 ms per SD 1.5 forward. **End to end that is
+3.2%**: 15.810 s against 15.323 s for 20 steps at 512, interleaved three times
+each with a spread under 0.04 s within a condition. Worth writing down that
+the microbenchmark predicted 38.8 ms per step and the real saving was 24.4 —
+an elementwise fusion looks better in isolation than in a model whose time
+goes to matmul and convolution.
+
+The kernel is one thread per `float4` of output on a two-dimensional grid, so
+a row and a column arrive as `thread_position_in_grid` without an integer
+divide. `inner` is the model width times four and so always a multiple of
+four, which is what makes the vector loads legal.
+
+### The GELU tail, which candle rounds away
+
+Metal has no `erf`, so it has to be approximated. Both implementations use
+Abramowitz and Stegun 7.1.26; they differ in arrangement. candle computes
+`erf(a) = 1 - poly(t) * exp(-a*a)` and GELU then forms `1 + erf(u)`. For
+negative `u` that is `1 - (1 - erfc)`, and once `erfc` drops below f32's
+epsilon the inner subtraction rounds to exactly 1 and the outer one to exactly
+0 — so **every input below about -6 returns precisely zero**.
+
+But `poly(t) * exp(-a*a)` *is* `erfc(a)`, before any subtraction. Reading it
+off directly costs the same operations and has no tail to lose. Against an f64
+reference (`--example gelu_tail`):
+
+```text
+       x        f64 truth        candle           ours
+   -6.00   -5.93687799e-9   -0.0000000e0    -5.9407439e-9
+   -7.00   -8.97731889e-12  -0.0000000e0    -9.0168940e-12
+   -8.00   -4.88498131e-15  -0.0000000e0    -5.0277868e-15
+```
+
+Ours is closer at every tail point from -8 to -3. This is a real difference in
+an activation, not a curiosity — though whether it changes an image is
+untested, and the honest expectation is that it does not, since the values
+involved are far below the noise floor of a diffusion step.
+
+**The CPU path does not get this.** `fused::geglu` falls back to the
+composition off Metal, so CPU callers still get the collapsing tail. Closing
+that means replacing a vectorised candle kernel with a scalar Rust loop, which
+is not obviously a win and has not been measured.
+
+### adaLN: done
+
+`norm(x) * (1 + scale) + shift`, the conditioning mechanism of every diffusion
+transformer, was four ops: a norm, an add of 1, a broadcast multiply and a
+broadcast add. Seven trips over an activation that is 50 MB at Flux's
+1024x1024.
+
+The kernel is one threadgroup per row, holding the row in threadgroup memory
+across both reductions and the write — **two device trips instead of seven**.
+The reduction is `simd_sum` per simdgroup and a short serial pass over the
+per-simdgroup totals, which is blocked rather than sequential, for the reason
+recorded in [Fused norms are a backend
+question](#fused-norms-are-a-backend-question).
+
+```text
+  b1 4096 tokens  composed  7.235 ms   ours 1.405 ms   5.15x
+  b1  512 tokens  composed  0.988 ms   ours 0.275 ms   3.60x
+  b1 4608 tokens  composed  7.573 ms   ours 1.329 ms   5.70x
+  b2 4096 tokens  composed 16.181 ms   ours 2.861 ms   5.66x   [strided cond]
+```
+
+**607.8 ms -> 115.7 ms per Flux-dev forward, 5.26x, saving 492 ms a step** —
+above the 472 ms the survey predicted, and twenty times what GEGLU returned.
+Agreement with the composition is 2.9e-6 absolute.
+
+There is no end-to-end figure and there will not be one on this machine: no
+Flux or SD 3 checkpoint is present, and Flux-dev at f32 would ask for about
+48 GB. What is verified is that the kernel agrees with the arithmetic it
+replaced, at every shape both models run, on both the contiguous and strided
+conditioning paths. The 492 ms is per-call measurement times counted call
+sites — the same method that predicted 38.8 ms for GEGLU where the real
+end-to-end saving was 24.4, so treat it as an upper bound.
+
+Both DiTs now call it. SD 3 normalises `x` twice per dual block where it
+previously normalised once and modulated twice, because two fused calls at two
+trips each still beat one norm plus two modulations at eleven.
+
+### group_norm: done, and the largest of the three
+
+`step_profile` — which extracts every conv2d, linear, group norm and layer norm
+from the real SD 1.5 checkpoint and times each at its own shape — put a step at
+roughly 48% convolution, 26% matmul, 24% group norm and 2% layer norm.
+
+candle's `GroupNorm` is not a kernel. It is about ten ops: two reductions and
+five full passes over the tensor, measuring **1.7 to 6.8 GB/s** where the adaLN
+kernel reaches 71.6 on the same machine.
+
+Ours is one threadgroup per (batch, group), in two device passes: one to
+reduce, one to write. A group row runs to 40,960 elements, far past the 32 KB
+of threadgroup memory adaLN relies on, so the row is read twice rather than
+cached. The accumulators are shifted by the row's first element — summing `x`
+and `x*x` and forming `E[x2] - E[x]2` cancels badly when the mean is large next
+to the spread, which is what a post-convolution activation looks like.
+
+```text
+  [2, 320,64,64] x13   candle 3.522 ms (6.0 GB/s)   ours 0.541 ms (38.7 GB/s)   6.51x
+  [2, 960,64,64] x1    candle 9.191 ms (6.8 GB/s)   ours 0.990 ms (63.6 GB/s)   9.29x
+  [2,1280, 8, 8] x12   candle 0.438 ms (3.0 GB/s)   ours 0.157 ms ( 8.4 GB/s)   2.80x
+```
+
+**126.0 ms -> 20.7 ms per forward, 6.09x.** End to end, interleaved three times
+each: **SD 1.5 at 512 over 20 steps goes 15.734 s -> 13.390 s, 17.5% faster**,
+with under 0.03 s of spread within a condition. That includes the GEGLU
+kernel's 3.2%, so group norm alone is worth about 11.7%.
+
+### The backend decides, again
+
+The same implementation was measured on CPU against the same composition, and
+**lost by 3x** — 122.9 ms against 41.6 for a forward, at every one of the
+fourteen shapes:
+
+```text
+  [2,320,64,64]   candle 1.210 ms   ours 3.544 ms   0.34x
+  [2,640,64,64]   candle 2.502 ms   ours 7.562 ms   0.33x
+```
+
+candle's CPU primitives are vectorised and threaded, so ten fast passes beat
+one scalar serial pass. The CPU path stays on candle, and
+`fused::GroupNormOp::cpu_fwd` exists only as the f64 reference the kernel is
+tested against.
+
+This is [Fused norms are a backend
+question](#fused-norms-are-a-backend-question) from the opposite direction, and
+it is the third time the answer has come out this way. The rule worth carrying:
+**a composition and a kernel trade places depending on the backend**, because a
+composition on a GPU pays per dispatch while on a CPU it is vectorised for
+free. Neither "fused is better" nor "fused is worse" survives a measurement.
+
+One number for perspective: candle's *Metal* group norm (126.0 ms a forward)
+was slower than its own *CPU* group norm (41.6 ms). Ours, at 20.7, is the only
+one of the three that beats running it on the processor.
+
+### What this means for owning more of the backend
+
+The three kernels here are Metal-only, which widens rather than narrows the gap
+between backends. That is deliberate and measured — the CPU attempt lost — but
+it is worth being plain that **only CPU and Metal are verified in this project
+at all**. CUDA is a feature flag with no measurements behind it and no CI
+runner; the box above is still unticked.
+
+It also bounds the ambition. A step is roughly three quarters convolution and
+matmul, and candle's matmul and attention kernels are **Apple's MLX code**,
+extracted with the copyright header intact — `mlx_gemm.metal` names its source
+in the first line. So the hardest quarter of candle's Metal surface is already
+the best available implementation, and rewriting it would mean competing with
+Apple on their own hardware. The quarter that is *not* gemm is where all three
+of this session's wins came from, and it is now largely taken.
+
+### Next
+
+The two kernels here share a shape: candle **cannot** fuse either of them,
+because a general tensor library has to expose `layer_norm` and `mul` and
+`add` as separate ops. Knowing that a norm is always followed by a modulation
+is model knowledge, and it is worth 5.26x. That is the seam where this project
+can beat its own backend, and it is not the seam where gemm lives.
+
+Still open, in rough order of value per line written:
+- **Fused attention plus its projections** for the DiTs, the same trick one
+  level up.
+- **GroupNorm -> SiLU**: measured at 1.1 ms and rejected. Recorded so it is
+  not measured a third time.
+- **f16 and bf16** for both kernels. Today they fall back, so half precision
+  gets none of this.
+- **The CPU path**, which gets none of it either.
+
+`SD_FUSED_KERNELS=0` returns every kernel in this file to its composition, so
+the A/B can be run in one session rather than against a number recorded
+earlier on a machine in a different state.
 
 ## Upstream contributions worth making
 

@@ -86,14 +86,11 @@ fn timestep_embedding(t: &Tensor, dim: usize) -> Result<Tensor> {
 }
 
 /// `x * (1 + scale) + shift`, with both broadcast over the token axis.
-fn modulate(xs: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
-    xs.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(shift)
-}
-
-/// LayerNorm with no learned parameters — the scale and shift come from the
-/// modulation vector instead.
-fn plain_layer_norm(xs: &Tensor) -> Result<Tensor> {
-    ops::plain_layer_norm(xs, 1e-6)
+/// The norm and the modulation that follows it, as one kernel — see the note
+/// on `flux::norm_modulate`. Takes the tensor *before* normalising, because
+/// the point is that no intermediate is written out.
+fn norm_modulate(xs: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    sd_tensor::fused::ada_layer_norm(xs, scale, shift, 1e-6)
 }
 
 /// RMSNorm over the head dimension, applied to queries and keys.
@@ -274,11 +271,12 @@ impl JointBlock {
         let cm = self.context.modulation(c)?;
         let xm = self.x.modulation(c)?;
 
-        let c_in = modulate(&plain_layer_norm(context)?, &cm[0], &cm[1])?;
+        let c_in = norm_modulate(context, &cm[0], &cm[1])?;
         let (cq, ck, cv) = self.context.attn.qkv(&c_in)?;
 
-        let x_norm = plain_layer_norm(x)?;
-        let x_in = modulate(&x_norm, &xm[0], &xm[1])?;
+        // Normalised twice rather than once, because two fused calls
+        // (two trips each) still beat one norm plus two modulations (eleven).
+        let x_in = norm_modulate(x, &xm[0], &xm[1])?;
         let (xq, xk, xv) = self.x.attn.qkv(&x_in)?;
 
         // Context first, then image — the order the halves are split back out
@@ -303,7 +301,7 @@ impl JointBlock {
                 .mlp
                 .as_ref()
                 .expect("non-pre_only block has an mlp")
-                .forward(&modulate(&plain_layer_norm(&ctx)?, &cm[3], &cm[4])?)?;
+                .forward(&norm_modulate(&ctx, &cm[3], &cm[4])?)?;
             Some((ctx + ff.broadcast_mul(&cm[5])?)?)
         };
 
@@ -312,7 +310,7 @@ impl JointBlock {
             // A second self-attention over the image tokens alone, modulated
             // independently and added to the same residual.
             let attn2 = self.x.attn2.as_ref().expect("dual block has attn2");
-            let x2_in = modulate(&x_norm, &xm[6], &xm[7])?;
+            let x2_in = norm_modulate(x, &xm[6], &xm[7])?;
             let (q2, k2, v2) = attn2.qkv(&x2_in)?;
             let a2 = ops::scaled_dot_product_attention(&q2, &k2, &v2)?;
             xs = (xs + attn2.post(&a2)?.broadcast_mul(&xm[8])?)?;
@@ -322,7 +320,7 @@ impl JointBlock {
             .mlp
             .as_ref()
             .expect("the image stream always has an mlp")
-            .forward(&modulate(&plain_layer_norm(&xs)?, &xm[3], &xm[4])?)?;
+            .forward(&norm_modulate(&xs, &xm[3], &xm[4])?)?;
         let xs = (xs + ff.broadcast_mul(&xm[5])?)?;
 
         Ok((context_out, xs))
@@ -645,7 +643,7 @@ impl Sd3Transformer {
         let scale = params.narrow(D::Minus1, dim, dim)?.unsqueeze(1)?;
         let xs = self
             .final_linear
-            .forward(&modulate(&plain_layer_norm(&xs)?, &shift, &scale)?)?;
+            .forward(&norm_modulate(&xs, &shift, &scale)?)?;
 
         unpatchify(&xs, lh, lw, p, self.cfg.in_channels)
     }

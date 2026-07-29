@@ -21,7 +21,8 @@
 //! candle does not provide — not an abstraction layer with its own opinions.
 
 pub use candle_core::{
-    safetensors, DType, Device, Error, IndexOp, Module, Result, Shape, Tensor, D,
+    safetensors, CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Device, Error, IndexOp, Layout, Module,
+    Result, Shape, Tensor, D,
 };
 pub use candle_nn::VarBuilder;
 
@@ -93,16 +94,24 @@ pub fn tensor_shape(path: &std::path::Path, name: &str) -> Result<Option<Vec<usi
 /// Layers we build models out of. Re-exported so model crates never name candle.
 pub mod nn {
     pub use candle_nn::{
-        embedding, group_norm, layer_norm, linear, linear_no_bias, Conv2dConfig, Embedding,
-        GroupNorm, LayerNorm, LayerNormConfig, Linear, VarBuilder, VarMap,
+        embedding, layer_norm, linear, linear_no_bias, Conv2dConfig, Embedding, LayerNorm,
+        LayerNormConfig, Linear, VarBuilder, VarMap,
     };
     // Shadowing candle's, so every model picks up circular padding without
     // changing. See `crate::conv`.
     pub use crate::conv::{conv2d, conv2d_no_bias, Conv2d};
+    // Also shadowing candle's, for the same reason in a different direction:
+    // candle's `GroupNorm` is a composition of about ten ops running at 1.7 to
+    // 5.8 GB/s, and it is 23.5% of an SD 1.5 step. Same constructor, same
+    // weight names; see `crate::fused`.
+    pub use crate::fused::{group_norm, GroupNorm};
 }
 
 /// Convolution with optional circular padding, for seamless tiling.
 pub mod conv;
+pub mod fused;
+#[cfg(feature = "metal")]
+pub mod mps;
 
 /// Elementwise and reduction ops.
 ///
@@ -168,6 +177,9 @@ pub mod ops {
     /// in the input dtype, matching what the three copies did and what
     /// transformers does.
     pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f64) -> Result<Tensor> {
+        if prefer_fused_norm(xs) && alpha.dtype() == DType::F32 {
+            return candle_nn::ops::rms_norm(xs, alpha, eps as f32);
+        }
         let dtype = xs.dtype();
         let xs32 = xs.to_dtype(DType::F32)?;
         let rrms = (xs32.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?;
@@ -193,6 +205,16 @@ pub mod ops {
     ///
     /// Normalised in f32 whatever comes in, then narrowed back.
     pub fn plain_layer_norm(xs: &Tensor, eps: f64) -> Result<Tensor> {
+        if prefer_fused_norm(xs) {
+            // The fused kernel wants explicit affine parameters where this
+            // form has none, so it gets a unit scale and a zero shift.
+            // Allocating those two `[width]` vectors per call is measurable and
+            // small: the path still wins 3.2x at 1536 tokens and 4.8x at 4608.
+            let width = xs.dim(D::Minus1)?;
+            let ones = Tensor::ones(width, DType::F32, xs.device())?;
+            let zeros = Tensor::zeros(width, DType::F32, xs.device())?;
+            return candle_nn::ops::layer_norm(xs, &ones, &zeros, eps as f32);
+        }
         let dtype = xs.dtype();
         let xs32 = xs.to_dtype(DType::F32)?;
         let mean = xs32.mean_keepdim(D::Minus1)?;
@@ -881,6 +903,56 @@ pub mod ops {
         mask: &Tensor,
     ) -> Result<Tensor> {
         attention_with_path(q, k, v, Some(mask)).map(|(t, _)| t)
+    }
+
+    /// Whether to hand this tensor to candle's fused norm kernels instead of
+    /// the compositions below.
+    ///
+    /// The two are not interchangeable, and which one is better depends on the
+    /// backend, because they do not share a reduction. Relative error against
+    /// an f64 reference, from `--example norm_accuracy`:
+    ///
+    /// ```text
+    ///                        CPU                     Metal
+    ///   [1,154,4096]  ours 1.3e-7  candle 8.8e-7    ours 1.4e-7  candle 9.0e-8
+    ///   [1,1536,3072] ours 9.4e-8  candle 7.5e-7    ours 1.3e-7  candle 9.3e-8
+    ///   [1,77,768]    ours 7.1e-8  candle 4.4e-7    ours 1.1e-7  candle 7.6e-8
+    /// ```
+    ///
+    /// candle's CPU kernel sums each row with a sequential `.sum::<f32>()`
+    /// where `mean_keepdim` reduces in blocks, and error in a sequential sum
+    /// grows with row length — 6 to 9x worse here, enough that routing T5 onto
+    /// it moves `golden_t5` to 3.891e-3 past a 3e-3 bound. Its Metal kernel
+    /// reduces across a threadgroup in a tree, which is at least as accurate as
+    /// blocks, and 4.5x faster besides.
+    ///
+    /// So: fused on Metal, the composition on CPU. CUDA is deliberately not
+    /// included — candle reduces in a tree there too and it would very likely
+    /// behave like Metal, but there is no CUDA machine here to measure it on,
+    /// and this file does not carry claims that were not measured.
+    ///
+    /// Half precision stays on the composition on every backend: it reduces in
+    /// f32 whatever the input dtype, which `t5::RmsNorm` needs rather than
+    /// prefers, since at d_model 4096 a sum of squares overflows f16.
+    fn prefer_fused_norm(xs: &Tensor) -> bool {
+        xs.dtype() == DType::F32 && xs.device().is_metal()
+    }
+
+    /// candle's fused layer norm, exposed only so `--example norm_path` can
+    /// measure it. Not used in any model path: see the note on
+    /// [`plain_layer_norm`].
+    pub fn fused_layer_norm(
+        xs: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        eps: f64,
+    ) -> Result<Tensor> {
+        candle_nn::ops::layer_norm(xs, alpha, beta, eps as f32)
+    }
+
+    /// candle's fused RMS norm, exposed only for the same measurement.
+    pub fn fused_rms_norm(xs: &Tensor, alpha: &Tensor, eps: f64) -> Result<Tensor> {
+        candle_nn::ops::rms_norm(xs, alpha, eps as f32)
     }
 
     /// candle's fused rotary embedding, interleaved variant.
