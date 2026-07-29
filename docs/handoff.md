@@ -35,7 +35,7 @@ mattered:
 ## What this project does today
 
 Every capability below is verified against `diffusers`/`transformers` with a
-recorded number. **374 tests, all gates green**, plus 7 GPU smoke tests behind the `metal`
+recorded number. **376 tests, all gates green**, plus 7 GPU smoke tests behind the `metal`
 feature (`cargo test --features metal --test metal_smoke`) — they are not in
 the default count because a machine without a GPU cannot run them.
 
@@ -172,7 +172,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 374 tests, all gates green
+table is in [roadmap.md](roadmap.md). 376 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
@@ -350,30 +350,56 @@ through the UNet at the pipeline's own shapes (1.125e-5), and the output now
 tracks the reference — see [Next](#next) for the beta-schedule trap that made
 this look broken for a long time.
 
-**Step caching exists and underdelivers**, `--cache-threshold`. Honest numbers,
-SD 1.5, 512, 20 steps:
+**Step caching works now**, `--cache-threshold`, and the reason it did not
+before was the predictor *and* the sampler. SD 1.5, 512, 20 steps, `dpmpp2m`;
+`evaluated` is how many of the twenty steps ran the model, which is the exact
+saving:
 
 ```text
-  0.0    22.1 s   baseline
-  0.08   21.0 s   bit-identical — nothing was skipped
-  0.3    20.1 s   clean image, mean 8.2/255 from the baseline
-  1.0     9.1 s   2.4x, and badly degraded
+  0.00    20/20    22.6 s   baseline
+  0.05    20/20            nothing skipped
+  0.10    12/20    20.4 s   clean, mean 15.0/255 from the baseline
+  0.20     7/20    15.6 s   clean, mean 23.0/255 — 1.45x end to end
+  0.40     4/20     6.7 s   degraded: speckle and smeared edges
 ```
 
-**About 9 % at a usable setting**, against the 1.5-2x the caching literature
-reports. The gap is this implementation, not the idea: TeaCache predicts the
-*output* change from the timestep embedding through a per-model fitted
-polynomial, while this measures how far the *input* moved — a poor proxy early
-in a run, when the latent travels far each step but the prediction barely
-changes.
+**0.10 to 0.20 is the usable band**, and 0.20 skips 65 % of the steps for
+1.45x end to end — about **2.9x on the denoising itself**, the rest being load
+and decode that caching cannot touch. The predecessor bought about 9 %.
 
-I also documented the wrong useful band first (0.05-0.15), having taken it
-from the paper; those numbers describe TeaCache's rescaled metric, not this
-one. Measuring gave 0.3.
+**Caching is now refused with `euler_a` and `lcm`, and that is the real
+finding.** An ancestral sampler draws fresh noise every step, so consecutive
+predictions never stop moving. Measured relative L1 change of the output
+between steps, three prompts:
 
-Worth keeping as a foundation rather than reverting: the skip machinery and
-its exactness guarantee (threshold 0 is bit-identical) are the parts that are
-fiddly, and swapping the predictor is contained.
+```text
+  euler_a    0.34 .. 0.90    never small
+  dpmpp2m    0.02 .. 0.78    small through the middle of the run
+```
+
+There is nothing to reuse, and reusing anyway does not degrade gracefully —
+it returns colour speckle (`assets/cache-euler-a-speckle.png`, threshold 0.10,
+against `assets/cache-dpmpp2m-threshold020.png` for what a *more* aggressive
+setting looks like on the right sampler). The old 9 % ceiling was measured under `euler_a`,
+which is the default sampler, so **the feature was being evaluated in the one
+regime where it cannot work.**
+
+The predictor is TeaCache's: relative change in the **timestep embedding**,
+rescaled through a fitted polynomial into an estimate of the output change,
+accumulated. `--example cache_fit` fits it — and fitting rather than borrowing
+is the point, since this feature has already been burned once by a constant
+taken from the paper that described a different metric.
+
+Two things the fit said that the plan had backwards. On `dpmpp2m` the
+timestep embedding is **1.6x the better predictor**, as expected — but under
+`euler_a` the *latent* is better, and the latent's degree-4 fit reaches 1.7e4
+coefficients over a narrow range, which is overfitting rather than
+prediction. And `Progress::evaluated` now reports steps actually run, because
+wall clock on this machine has varied 2x on the same configuration and a
+timed A/B has lied about this feature before.
+
+Still open: the polynomial is **per model**, fitted on SD 1.5. SDXL and SD 2.x
+need their own, which is one command each.
 
 **Runtime LoRA on quantised bases** closes the gap `lora.rs` documented:
 `y = QMatMul(x) + ((x @ down^T) @ up^T) * scale`, so the quantised weight is
@@ -1076,21 +1102,22 @@ Verified against diffusers:
   the t2i UNet under it            2.0e-3     floor 1.5e-3
 ```
 
-### 1. A real predictor for step caching
+### ~~1. A real predictor for step caching~~ — done
 
-`--cache-threshold` works but buys ~9 % where the literature reports 1.5-2x.
-The machinery is right (threshold 0 is bit-identical, the last step always
-evaluates); the *predictor* is the weak part — it measures how far the input
-moved rather than predicting how much the output will change.
+TeaCache's predictor is in: the relative change in the timestep embedding,
+rescaled through a polynomial fitted by `--example cache_fit`. 0.20 skips 65 %
+of the steps for a clean image — 1.45x end to end, 2.9x on the denoising —
+against about 9 % before. See the section above.
 
-Replace it with TeaCache's approach: take the relative change in the
-**timestep-modulated embedding**, rescale through a fitted polynomial, and
-accumulate that. The polynomial is per-model and published for SD 1.5, SDXL
-and Flux. Everything else stays.
+The finding worth carrying: **the old ceiling was the sampler, not the
+predictor.** `euler_a` re-noises every step, so consecutive predictions never
+stop moving; caching is now refused there rather than producing speckle. The
+whole feature had been evaluated in the one regime where it cannot work.
 
-Measured numbers to beat are in `Txt2ImgConfig::cache_threshold`.
+Remaining: the polynomial is per model and fitted on SD 1.5. SDXL and SD 2.x
+want their own, which is one command each.
 
-### 2. Newer architectures worth the port
+### 1. Newer architectures worth the port
 
 From a July 2026 survey. All fit this library's existing shape — DiT-style
 transformers with quantised GGUF variants:
@@ -1102,7 +1129,7 @@ transformers with quantised GGUF variants:
   external VAE and no separate text encoders. That makes it *less* work than
   its size suggests, since two towers disappear.
 
-### 3. Extend streaming past Flux and SD 3.5, and measure on a discrete GPU
+### 2. Extend streaming past Flux and SD 3.5, and measure on a discrete GPU
 
 `Residency::Streamed` works for Flux and SD 3.5, both quantised. Gaps:
 

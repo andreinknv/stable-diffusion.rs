@@ -347,6 +347,8 @@ impl SdxlPipeline {
 
             progress(Progress {
                 step: i + 1,
+                // No cache in this loop: every step ran the model.
+                evaluated: i + 1,
                 total: steps,
                 sigma,
                 denoised: &denoised,

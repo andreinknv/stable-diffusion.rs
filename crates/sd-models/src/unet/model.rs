@@ -449,6 +449,25 @@ impl UNet2DConditionModel {
         self.class_embedding.is_some()
     }
 
+    /// The timestep embedding this UNet would use, without running it.
+    ///
+    /// `[b, block_out_channels[0] * 4]`. Two sinusoid-and-MLP calls, which is
+    /// nothing beside a forward pass — that is the point. **Step caching needs
+    /// to predict how much the output will change before paying for it**, and
+    /// TeaCache's finding is that the timestep embedding's own movement is a
+    /// far better predictor of that than the latent's.
+    ///
+    /// Note this depends on the timestep *alone*, not on the latent. For a
+    /// DiT, where modulation multiplies into the token stream, the equivalent
+    /// quantity is content-dependent; in a UNet the embedding is added to
+    /// resnet activations and carries no content. So this is a schedule
+    /// predictor, and whether that is enough is a question for measurement,
+    /// not for the paper.
+    pub fn timestep_features(&self, timestep: &Tensor) -> Result<Tensor> {
+        let temb = timestep_embedding(timestep, self.freq_dim)?.to_dtype(self.dtype)?;
+        self.time_embedding.forward(&temb)
+    }
+
     /// `sample`: `[b, 4, h, w]`, `timestep`: `[b]`, `context`: `[b, 77, dim]`.
     pub fn forward(&self, sample: &Tensor, timestep: &Tensor, context: &Tensor) -> Result<Tensor> {
         self.forward_with_skips(sample, timestep, context, None)

@@ -14,10 +14,10 @@ pub use placement::{Placement, Residency, StageBytes};
 pub use sd3::{sd3_paths_in, Sd3Paths, Sd3Pipeline, Sd3RunConfig};
 pub use sdxl::SdxlPipeline;
 pub use txt2img::{
-    sigma_to_timestep, AreaConfig, Cancel, Conditioning, Control, ControlConfig, GroundedBox,
-    GroundingConfig, HiresConfig, Img2ImgConfig, InpaintConfig, InstructConfig, PipelineError,
-    Prediction, Progress, ProgressFn, Region, SamplerKind, Strength, Txt2ImgConfig,
-    Txt2ImgPipeline, UnclipConfig, Upscale,
+    cache_rescale, sigma_to_timestep, AreaConfig, CalibrationPoint, Cancel, Conditioning, Control,
+    ControlConfig, GroundedBox, GroundingConfig, HiresConfig, Img2ImgConfig, InpaintConfig,
+    InstructConfig, PipelineError, Prediction, Progress, ProgressFn, Region, SamplerKind, Strength,
+    Txt2ImgConfig, Txt2ImgPipeline, UnclipConfig, Upscale,
 };
 
 /// Whichever decoder a pipeline is using.

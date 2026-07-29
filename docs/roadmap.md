@@ -142,7 +142,7 @@ Remaining milestone 2 work:
 
 SD 2.x · SD 3 · Flux (schnell, dev) · ControlNet · LoRA · TAESD ·
 ESRGAN upscaling · inpainting  —  ✅ Flux (flux-mini), ✅ T5 text encoder,
-✅ LoRA (SD 1.5 dense path), ✅ LCM sampling, ✅ inpainting, ✅ ControlNet, ✅ TAESD, ✅ SD 2.x, ✅ ESRGAN upscaling, ✅ IP-Adapter, ✅ seamless tiling, ✅ textual inversion, ✅ two-pass (hires), ✅ checkpoint merging, ✅ motion modules, ✅ area conditioning, ✅ InstructPix2Pix, ✅ GLIGEN, ✅ unCLIP
+✅ LoRA (SD 1.5 dense path), ✅ LCM sampling, ✅ inpainting, ✅ ControlNet, ✅ TAESD, ✅ SD 2.x, ✅ ESRGAN upscaling, ✅ IP-Adapter, ✅ seamless tiling, ✅ textual inversion, ✅ two-pass (hires), ✅ checkpoint merging, ✅ motion modules, ✅ area conditioning, ✅ InstructPix2Pix, ✅ GLIGEN, ✅ unCLIP, ✅ step caching (TeaCache predictor)
 
 **unCLIP generates from an image embedding**, `sdrs unclip` — either from a
 reference image, or from a prompt through the prior. The last capability

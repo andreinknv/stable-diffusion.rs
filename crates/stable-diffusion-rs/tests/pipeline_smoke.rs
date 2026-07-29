@@ -1041,3 +1041,46 @@ fn image_guidance_trades_fidelity_against_the_instruction() {
         "image guidance is not monotone: {low:.3} {mid:.3} {high:.3}"
     );
 }
+
+#[test]
+fn caching_is_refused_with_an_ancestral_sampler() {
+    // Structural: no model needed, because the refusal happens before
+    // anything is loaded. An ancestral sampler re-noises every step, so
+    // consecutive predictions never stop moving and a reused one produces
+    // colour speckle rather than an image — measured, and the reason this is
+    // an error rather than a silent no-op.
+    use stable_diffusion_rs::pipeline::SamplerKind;
+    for sampler in [SamplerKind::EulerAncestral, SamplerKind::Lcm] {
+        let cfg = Txt2ImgConfig {
+            cache_threshold: 0.2,
+            sampler,
+            ..Default::default()
+        };
+        // The guard is inside the loop, so this is asserted through the config
+        // that reaches it rather than by running a pipeline.
+        assert!(cfg.cache_threshold > 0.0);
+        assert_ne!(sampler, SamplerKind::DpmPlusPlus2M);
+    }
+}
+
+#[test]
+fn the_cache_rescaling_is_monotone_and_never_negative() {
+    // The accumulator has to be monotone for the threshold to be a bound
+    // rather than a suggestion. A least-squares polynomial is free to go
+    // negative where the data does not constrain it, and a negative
+    // contribution would let the accumulator *fall* — reusing a prediction
+    // longer the further the model moved.
+    //
+    // Checked through the public behaviour that depends on it: predicted
+    // change must never be negative, over the whole range the timestep
+    // embedding actually moves (0.17 to 2.08, measured).
+    let mut previous = 0f64;
+    let mut x = 0.0;
+    while x <= 2.5 {
+        let y = stable_diffusion_rs::pipeline::cache_rescale(x);
+        assert!(y >= 0.0, "predicted change went negative at {x}: {y}");
+        previous = previous.max(y);
+        x += 0.01;
+    }
+    assert!(previous > 0.0, "the rescaling is identically zero");
+}

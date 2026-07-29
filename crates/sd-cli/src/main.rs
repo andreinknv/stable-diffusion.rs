@@ -785,6 +785,9 @@ where
         tracing::info!(
             step = p.step,
             total = p.total,
+            // What the cache actually bought, exactly rather than by
+            // stopwatch: equal to `step` when caching is off.
+            evaluated = p.evaluated,
             sigma = format!("{:.3}", p.sigma),
             "denoise"
         );

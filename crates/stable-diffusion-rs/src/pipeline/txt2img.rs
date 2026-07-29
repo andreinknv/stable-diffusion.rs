@@ -249,41 +249,67 @@ pub struct Txt2ImgConfig {
     pub cfg_scale: f64,
     pub seed: u64,
     pub sampler: SamplerKind,
-    /// Reuse the model's output between steps when the latent has barely
-    /// moved. 0 disables it, which is **bit-identical** to not having the
-    /// feature at all.
+    /// Reuse the model's prediction between steps while it is estimated not
+    /// to have moved much. 0 disables it, **bit-identically**.
     ///
-    /// Diffusion steps are highly redundant: consecutive steps often produce
-    /// nearly the same prediction, so recomputing it is wasted work. This
-    /// tracks how far the latent has drifted since the last real evaluation
-    /// and reuses the cached prediction until the accumulated drift crosses
-    /// the threshold.
+    /// The units are *predicted relative change in the model's output*,
+    /// accumulated since the last real evaluation. So 0.2 means "reuse until
+    /// the prediction is estimated to have drifted 20 %", which is a statement
+    /// about the model rather than about an arbitrary metric.
     ///
-    /// **A simplification of TeaCache**, which predicts the output change from
-    /// the timestep embedding using a per-model fitted polynomial. This uses
-    /// the latent's own movement instead — no fitting, no per-architecture
-    /// constants, and it applies unchanged to every model here. It is
-    /// correspondingly more conservative.
+    /// # It needs a deterministic sampler
     ///
-    /// **Measured on SD 1.5, 512, 20 steps** — not taken from the papers:
+    /// **Refused with `euler_a` or `lcm`**, and that is the most important
+    /// thing on this page. An ancestral sampler draws fresh noise every step,
+    /// so consecutive predictions never stop moving and there is nothing to
+    /// reuse. Measured relative L1 change of the output between steps, SD 1.5
+    /// at 20 steps over three prompts:
     ///
     /// ```text
-    ///   0.0    22.1 s   baseline
-    ///   0.08   21.0 s   bit-identical: nothing was skipped
-    ///   0.3    20.1 s   clean image, mean 8.2/255 from the baseline
-    ///   1.0     9.1 s   2.4x, and badly degraded — a silhouette in speckle
+    ///   euler_a    0.34 .. 0.90    never small
+    ///   dpmpp2m    0.02 .. 0.78    small through the middle of the run
     /// ```
     ///
-    /// So the usable setting is around **0.3, for about 9 %**. That is well
-    /// short of the 1.5-2x the caching literature reports, and the reason is
-    /// this implementation rather than the idea: TeaCache predicts the
-    /// *output* change from the timestep embedding via a per-model fitted
-    /// polynomial, while this measures how far the *input* moved. Input
-    /// movement is a poor proxy early in a run, when the latent travels far
-    /// each step but the prediction changes little.
+    /// Forcing it anyway does not degrade gracefully — it returns colour
+    /// speckle — so it errors instead.
     ///
-    /// Swapping in a proper predictor is a contained change — the skip
-    /// machinery and its exactness guarantee stay as they are.
+    /// # Measured, SD 1.5, 512, 20 steps, `dpmpp2m`
+    ///
+    /// `evaluated` is how many of the twenty steps ran the model, which is the
+    /// exact saving; wall clock on this machine is noisy enough that the same
+    /// configuration has varied 2x, so the step count is the number to trust
+    /// and the seconds are minimum-of-three, alternated.
+    ///
+    /// ```text
+    ///   0.00    20/20    22.6 s   baseline
+    ///   0.05    20/20            nothing skipped
+    ///   0.10    12/20    20.4 s   clean, mean 15.0/255 from the baseline
+    ///   0.20     7/20    15.6 s   clean, mean 23.0/255 — 1.45x end to end
+    ///   0.40     4/20     6.7 s   degraded: speckle and smeared edges
+    /// ```
+    ///
+    /// So the usable band is **0.10 to 0.20**, and 0.20 skips 65 % of the
+    /// steps for a 1.45x end-to-end run — about 2.9x on the denoising itself,
+    /// the rest being load and decode that caching cannot touch.
+    ///
+    /// # How the prediction is made
+    ///
+    /// TeaCache's method: the relative change in the **timestep embedding**,
+    /// rescaled through a per-model fitted polynomial into an estimate of the
+    /// output change, and accumulated. The polynomial is [`CACHE_RESCALE`],
+    /// fitted here by `--example cache_fit` rather than borrowed.
+    ///
+    /// The predecessor measured how far the *input latent* moved and bought
+    /// about 9 %. Both predictors were fitted against the true output change
+    /// and scored: on `dpmpp2m` the timestep embedding is **1.6x** the better
+    /// of the two, and its fit is far better conditioned — the latent's
+    /// degree-4 coefficients reach 1.7e4 over a narrow range, which is
+    /// overfitting rather than prediction.
+    ///
+    /// Worth knowing, because it is the opposite of what was assumed: under
+    /// `euler_a` the *latent* is the better predictor of the two. It is
+    /// predicting a quantity that never gets small, so it buys nothing either
+    /// way.
     pub cache_threshold: f64,
     /// Frames to generate as one clip. 1 is a still image.
     ///
@@ -440,6 +466,15 @@ pub enum PipelineError {
          cannot run at all. `-t2i-l` is the consistent one."
     )]
     PriorWidth { got: usize, want: usize },
+    #[error(
+        "step caching needs a deterministic sampler; {sampler} re-noises every step.\n\n\
+         An ancestral sampler draws fresh noise each step, so consecutive predictions never \
+         stop moving — measured on SD 1.5 at 20 steps, the model's output changes by 34-90 % \
+         between steps under `euler_a` against 2-78 % under `dpmpp2m`. There is nothing to \
+         reuse, and reusing anyway produces colour speckle rather than an image.\n\n\
+         Use `--sampler dpmpp2m`, or set `--cache-threshold 0`."
+    )]
+    CacheNeedsDeterministicSampler { sampler: &'static str },
     #[error("cancelled after {completed} of {total} steps")]
     Cancelled { completed: usize, total: usize },
     #[error("tensor: {0}")]
@@ -484,6 +519,14 @@ pub struct Progress<'a> {
     /// [`Txt2ImgPipeline::with_taesd`] exists. `Txt2ImgPipeline::preview`
     /// decodes it with whichever decoder is attached.
     pub denoised: &'a Tensor,
+    /// How many steps so far actually ran the model, as opposed to reusing a
+    /// cached prediction.
+    ///
+    /// Equal to `step` when caching is off. Exposed because the saving from
+    /// `cache_threshold` is *steps skipped*, and wall-clock on this machine is
+    /// noisy enough that a timed A/B has lied about it before — this is the
+    /// same quantity, measured exactly and for free.
+    pub evaluated: usize,
 }
 
 /// Called after each denoising step.
@@ -772,6 +815,93 @@ impl LatentShape {
     fn dims(self) -> (usize, usize, usize, usize) {
         (self.frames, 4, self.height, self.width)
     }
+}
+
+/// Turns a relative change in the timestep embedding into a predicted
+/// relative change in the model's output.
+///
+/// Degree-4 polynomial, least-squares fitted on **SD 1.5** over 57 steps from
+/// three prompts by `--example cache_fit`. Fitted here rather than taken from
+/// TeaCache's published tables, because this project has twice been caught
+/// borrowing a constant without checking what it was a constant *of* — and
+/// once was this very feature.
+///
+/// **Per model.** The coefficients describe SD 1.5's schedule and its
+/// embedding widths; SDXL or SD 2.x need their own, which is one command.
+/// Using these on another architecture is not catastrophic — the accumulator
+/// is monotone either way — but the threshold stops meaning what it says.
+const CACHE_RESCALE: [f64; 5] = [
+    5.036842e-2,
+    1.022504e-1,
+    -4.397247e-1,
+    5.716702e-1,
+    -1.481600e-1,
+];
+
+/// The sampler's name if it re-noises each step, or `None` if it integrates.
+///
+/// Both ancestral kinds here draw fresh noise every step — Euler ancestral by
+/// definition, and LCM because a consistency model jumps to `x0` and re-noises
+/// out rather than integrating. Either way consecutive inputs are decorrelated
+/// and there is no redundancy for a cache to find.
+fn ancestral_name(sampler: SamplerKind) -> Option<&'static str> {
+    match sampler {
+        SamplerKind::EulerAncestral => Some("euler_a"),
+        SamplerKind::Lcm => Some("lcm"),
+        SamplerKind::DpmPlusPlus2M => None,
+    }
+}
+
+/// Evaluate [`CACHE_RESCALE`], clamped at zero.
+///
+/// A least-squares polynomial is free to go negative where the data does not
+/// constrain it, and a negative contribution would let the accumulator *fall*
+/// — reusing a prediction for longer the further the model moved. Clamping is
+/// what makes the accumulator monotone, which is what makes the threshold a
+/// bound rather than a suggestion.
+pub fn cache_rescale(moved: f64) -> f64 {
+    CACHE_RESCALE
+        .iter()
+        .enumerate()
+        .map(|(p, c)| c * moved.powi(p as i32))
+        .sum::<f64>()
+        .max(0.0)
+}
+
+/// One step of a step-cache calibration: the candidate predictors, and the
+/// quantity they are trying to predict.
+///
+/// All three are **relative L1** distances from the previous step —
+/// `|a - b|_1 / |b|_1` — which is what TeaCache accumulates and what makes the
+/// numbers comparable across steps whose tensors differ in magnitude by orders
+/// of magnitude.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CalibrationPoint {
+    /// How far the scaled input latent moved. What the shipped predictor uses.
+    pub latent: f64,
+    /// How far the timestep embedding moved. What TeaCache uses.
+    pub temb: f64,
+    /// How far the guided noise prediction actually moved — the target.
+    pub output: f64,
+}
+
+/// Relative L1 distance, `|a - b|_1 / |b|_1`.
+///
+/// Relative rather than absolute because the tensors involved span orders of
+/// magnitude across a run, and an absolute threshold would mean something
+/// different at step 1 than at step 19.
+fn relative_l1(a: &Tensor, b: &Tensor) -> Result<f64, PipelineError> {
+    let diff = (a - b)?
+        .abs()?
+        .sum_all()?
+        .to_dtype(DType::F32)?
+        .to_scalar::<f32>()? as f64;
+    let base = b
+        .abs()?
+        .sum_all()?
+        .to_dtype(DType::F32)?
+        .to_scalar::<f32>()? as f64;
+    Ok(diff / base.max(f64::EPSILON))
 }
 
 /// The control maps for one run, already doubled for the guidance batch.
@@ -1806,6 +1936,8 @@ impl Txt2ImgPipeline {
                 total: steps,
                 sigma,
                 denoised: &denoised,
+                // This loop has no cache, so every step ran the model.
+                evaluated: i + 1,
             });
         }
         self.decode(&latent)
@@ -2326,6 +2458,88 @@ impl Txt2ImgPipeline {
         Ok((rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?)
     }
 
+    /// Record, per step, how far each candidate predictor moved against how
+    /// far the model's output actually moved.
+    ///
+    /// Caching is **off** throughout — the point is to observe the true
+    /// output-change sequence, which a cached run by definition does not have.
+    /// Used by `--example cache_fit` to fit the rescaling polynomial on this
+    /// model rather than borrowing one whose provenance cannot be checked.
+    pub fn cache_calibration(
+        &self,
+        cfg: &Txt2ImgConfig,
+    ) -> Result<Vec<CalibrationPoint>, PipelineError> {
+        if self.unet.in_channels() != 4 || self.unet.takes_class_labels() {
+            return Err(PipelineError::NeedsInstruct);
+        }
+        let context = self
+            .encode_conditioning(&cfg.prompt, &cfg.negative_prompt)?
+            .context;
+        let sigmas = self.sigmas_for(cfg.sampler, cfg.steps);
+        let (lh, lw) = (cfg.height / 8, cfg.width / 8);
+        let mut rng = SeededRng::new(cfg.seed);
+        let mut latent = (rng.randn((1, 4, lh, lw), &self.device)? * sigmas[0])?;
+
+        let steps = sigmas.len().saturating_sub(1);
+        let mut dpm = DpmSolverPlusPlus2M::new();
+        let shape = LatentShape {
+            frames: 1,
+            height: lh,
+            width: lw,
+        };
+
+        let mut series = Vec::with_capacity(steps);
+        let (mut last_scaled, mut last_temb, mut last_out): (
+            Option<Tensor>,
+            Option<Tensor>,
+            Option<Tensor>,
+        ) = (None, None, None);
+
+        for i in 0..steps {
+            let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+            let t = sigma_to_timestep(&self.schedule, sigma);
+            let timestep = Tensor::from_vec(vec![t as f32; 2], 2, &self.device)?;
+
+            // Exactly what the loop feeds the UNet, so the predictor is
+            // measured on the tensor it would really see.
+            let latent_in = Tensor::cat(&[&latent, &latent], 0)?;
+            let scaled = (latent_in / (sigma * sigma + 1.0).sqrt())?;
+            let temb = self.unet.timestep_features(&timestep)?;
+
+            let out = self.unet.forward(&scaled, &timestep, &context)?;
+            let uncond = out.narrow(0, 0, 1)?;
+            let cond = out.narrow(0, 1, 1)?;
+            let noise_pred = (&uncond + ((cond - &uncond)? * cfg.cfg_scale)?)?;
+
+            if let (Some(ps), Some(pt), Some(po)) = (&last_scaled, &last_temb, &last_out) {
+                series.push(CalibrationPoint {
+                    latent: relative_l1(&scaled, ps)?,
+                    temb: relative_l1(&temb, pt)?,
+                    output: relative_l1(&noise_pred, po)?,
+                });
+            }
+            last_scaled = Some(scaled);
+            last_temb = Some(temb);
+            last_out = Some(noise_pred.clone());
+
+            let denoised = self.prediction.denoise(&latent, &noise_pred, sigma)?;
+            latent = self.step(
+                cfg,
+                &mut dpm,
+                StepPoint {
+                    latent: &latent,
+                    denoised: &denoised,
+                    sigma,
+                    sigma_next,
+                    t,
+                },
+                &mut rng,
+                shape,
+            )?;
+        }
+        Ok(series)
+    }
+
     /// Generate from an explicit starting latent, returning the final one too.
     ///
     /// `latent` of `None` draws from the seed, which is exactly what
@@ -2604,6 +2818,15 @@ impl Txt2ImgPipeline {
             areas,
             class_labels,
         } = run;
+        // Caching is only meaningful where consecutive predictions are
+        // similar, and an ancestral sampler guarantees they are not. Refused
+        // rather than silently ignored: a caller who asked for caching and got
+        // none would wonder why, and one who got it anyway would get speckle.
+        if cfg.cache_threshold > 0.0 {
+            if let Some(sampler) = ancestral_name(cfg.sampler) {
+                return Err(PipelineError::CacheNeedsDeterministicSampler { sampler });
+            }
+        }
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
         let steps = sigmas.len().saturating_sub(1);
         let mut dpm = DpmSolverPlusPlus2M::new();
@@ -2618,7 +2841,9 @@ impl Txt2ImgPipeline {
         };
         // Reused prediction, and the drift accumulated since it was computed.
         let mut cached: Option<Tensor> = None;
-        let mut previous = latent.clone();
+        // The predictor's own state: the last timestep embedding, and the
+        // accumulated *predicted* relative change in the model's output.
+        let mut previous_temb: Option<Tensor> = None;
         let mut drift = 0f64;
         let mut evaluated = 0usize;
         // Motion modules need it too, and they are four levels down.
@@ -2651,27 +2876,29 @@ impl Txt2ImgPipeline {
                 None => &contexts[0],
             };
 
-            // How far the latent has moved since the last real evaluation,
-            // relative to its own size. Computed *before* the model runs, so a
-            // skipped step costs one norm rather than a forward pass.
-            if cfg.cache_threshold > 0.0 && cached.is_some() {
-                let moved = (&latent - &previous)?
-                    .sqr()?
-                    .sum_all()?
-                    .to_dtype(DType::F32)?
-                    .to_scalar::<f32>()? as f64;
-                let scale = previous
-                    .sqr()?
-                    .sum_all()?
-                    .to_dtype(DType::F32)?
-                    .to_scalar::<f32>()? as f64;
-                drift += (moved / scale.max(f64::EPSILON)).sqrt();
-            }
-            previous = latent.clone();
-
             let t = sigma_to_timestep(&self.schedule, sigma);
             // One entry per row of the guidance batch: 2 * frames, not 2.
             let timestep = Tensor::from_vec(vec![t as f32; 2 * frames], 2 * frames, &self.device)?;
+
+            // **The predictor.** How far the timestep embedding moved, rescaled
+            // through a fitted polynomial into an estimate of how far the
+            // model's *output* will move, and accumulated. Two small matmuls
+            // against a forward pass, so a skipped step costs essentially
+            // nothing to decide.
+            //
+            // The rescaling is the whole idea: the raw embedding distance is
+            // not comparable to an output distance, and without it the
+            // threshold has no units. See `CACHE_RESCALE`.
+            if cfg.cache_threshold > 0.0 {
+                let temb = self.unet.timestep_features(&timestep)?;
+                if let Some(prev) = &previous_temb {
+                    if cached.is_some() {
+                        let moved = relative_l1(&temb, prev)?;
+                        drift += cache_rescale(moved);
+                    }
+                }
+                previous_temb = Some(temb);
+            }
 
             // Reuse, or evaluate and cache. The *last* step always evaluates:
             // it lands the image, and a reused prediction there shows up
@@ -2701,12 +2928,12 @@ impl Txt2ImgPipeline {
                     total: steps,
                     sigma,
                     denoised: &denoised,
+                    evaluated,
                 });
                 continue;
             }
             evaluated += 1;
             drift = 0.0;
-            let _ = evaluated;
 
             let out = match &control {
                 Some(hints) if !self.controlnets.is_empty() => {
@@ -2845,6 +3072,7 @@ impl Txt2ImgPipeline {
                 total: steps,
                 sigma,
                 denoised: &denoised,
+                evaluated,
             });
         }
         Ok(latent)

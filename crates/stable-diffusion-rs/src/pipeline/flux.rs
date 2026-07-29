@@ -382,6 +382,8 @@ impl FluxPipeline {
 
             progress(super::Progress {
                 step: i + 1,
+                // No cache in this loop: every step ran the model.
+                evaluated: i + 1,
                 total: cfg.steps,
                 sigma: sigmas[i],
                 denoised: &denoised,
