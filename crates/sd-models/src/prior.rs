@@ -365,15 +365,29 @@ impl PriorTransformer {
     /// conditioning and the answer, and masking them would hide the prompt
     /// from the token that has to produce the prediction.
     ///
-    /// Left as `[b, 1, seq, seq]` to broadcast over heads rather than
-    /// materialised to `[b, heads, seq, seq]`. The reference expands it —
-    /// `repeat_interleave(num_attention_heads)` — but it does so to satisfy an
-    /// API that takes `[b * heads, ...]`, not for any numerical reason, and
-    /// expanding here would cost 32x the memory for the same numbers.
-    fn attention_mask(&self, _batch: usize, text_mask: Option<&Tensor>) -> Result<Tensor> {
+    /// **Materialised to `[b, heads, seq, seq]`, for speed and only for
+    /// speed.**
+    ///
+    /// The numbers are identical either way — a `[b, 1, seq, seq]` mask
+    /// broadcasts correctly, and this expansion was briefly present for a
+    /// mistaken reason and removed once it was shown not to be the fix for a
+    /// Metal failure. It is back because it was then *measured*:
+    /// `ops::attention_with_path` offers its mask to candle's fused kernel,
+    /// which declines the broadcast form and takes the expanded one. At this
+    /// prior's shape — batch 2, 32 heads, 81 tokens — that is
+    /// **794.9 us against 211.2 us**, agreeing to 3.3e-7, and the prior runs
+    /// 20 blocks x 25 steps of it. `--example masked_attention_path` measures
+    /// it.
+    ///
+    /// The cost is 1.7 MB per forward, which is nothing beside the 3.8x.
+    fn attention_mask(&self, batch: usize, text_mask: Option<&Tensor>) -> Result<Tensor> {
         let seq = self.cfg.sequence_length();
+        let heads = self.cfg.num_attention_heads;
         let Some(text_mask) = text_mask else {
-            return Ok(self.causal_mask.clone());
+            return self
+                .causal_mask
+                .broadcast_as((batch, heads, seq, seq))?
+                .contiguous();
         };
         let (b, n) = text_mask.dims2()?;
         if n != self.cfg.num_embeddings {
@@ -395,7 +409,9 @@ impl PriorTransformer {
         // penalty applies to a *key* whatever the query, and the causal one to
         // the pair.
         let row = row.reshape((b, 1, 1, seq))?;
-        row.broadcast_add(&self.causal_mask)
+        row.broadcast_add(&self.causal_mask)?
+            .broadcast_as((b, heads, seq, seq))?
+            .contiguous()
     }
 
     /// Un-whiten a sampled embedding into the units the image half expects.

@@ -260,6 +260,9 @@ pub struct ClipTextEncoder {
     /// `[1, 1, 77, 77]`, built once. Rebuilding it per call would allocate a
     /// 77x77 tensor on every forward for a value that never changes.
     causal_mask: Tensor,
+    /// Needed to expand the mask into the shape candle's fused attention
+    /// kernel accepts; see `forward_embeds`.
+    heads: usize,
     /// `0..77`, likewise fixed. CLIP attends over the full context, including
     /// the EOS padding, so positions never depend on the prompt.
     positions: Tensor,
@@ -315,6 +318,7 @@ impl ClipTextEncoder {
             // Built in f32 and cast: the mask is -inf and 0, both exact in
             // f16, so this loses nothing.
             causal_mask: ops::causal_mask(seq, device)?.to_dtype(dtype)?,
+            heads: cfg.num_attention_heads,
             positions: Tensor::arange(0u32, seq as u32, device)?,
             dtype,
             text_projection: match cfg.projection_dim {
@@ -366,9 +370,28 @@ impl ClipTextEncoder {
         let pos = self.position_embedding.forward(&self.positions)?;
         let mut xs = xs.broadcast_add(&pos)?;
 
+        // **Expanded to `[b, heads, seq, seq]` once, then shared by every
+        // layer.** The stored mask is `[1, 1, seq, seq]` and broadcasts
+        // correctly, but `ops::attention_with_path` offers its mask to
+        // candle's fused kernel and that kernel declines the broadcast form —
+        // so the broadcast mask silently takes the naive path. Measured on
+        // CLIP-L under guidance: 416.9 us against 165.2 us, agreeing to
+        // 2.3e-7. See `--example masked_attention_path`.
+        //
+        // Built here rather than at construction because the batch is not
+        // known until a call, and shared across the twelve layers because it
+        // does not change between them.
+        let (b, _, _) = xs.dims3()?;
+        let heads = self.heads;
+        let seq = self.causal_mask.dim(sd_tensor::D::Minus1)?;
+        let mask = self
+            .causal_mask
+            .broadcast_as((b, heads, seq, seq))?
+            .contiguous()?;
+
         let mut per_layer = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            xs = layer.forward(&xs, &self.causal_mask)?;
+            xs = layer.forward(&xs, &mask)?;
             per_layer.push(xs.clone());
         }
 

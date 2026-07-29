@@ -1119,15 +1119,40 @@ want their own, which is one command each.
 
 ### 1. Newer architectures worth the port
 
-From a July 2026 survey. All fit this library's existing shape — DiT-style
-transformers with quantised GGUF variants:
+Scouted rather than surveyed — every line below is from the published
+`model_index.json` and file listings, not from a blog post. **The previous
+version of this entry was wrong about HiDream in a way that would have cost
+whoever picked it up a day.**
 
-- **FLUX.2 [dev]** — strongest open-weight photorealism; on a Mac it means the
-  quantised GGUF, which is the path already built. `[klein]` is Apache-2.0.
-- **Qwen-Image** — the specialist for legible in-image text, Apache-2.0.
-- **HiDream-I1** — MIT, and architecturally interesting: 8B pixel-native, no
-  external VAE and no separate text encoders. That makes it *less* work than
-  its size suggests, since two towers disappear.
+| | transformer (Q4) | text encoders | VAE |
+|---|---|---|---|
+| **HiDream-I1** | 10.7 GB | CLIP-L ✅, CLIP-G ✅, T5 ✅, **Llama** ✗ | `AutoencoderKL` ✅ |
+| **Qwen-Image** | 11.9 GB | **Qwen2.5-VL** ✗ | `AutoencoderKLQwenImage` ✗ |
+| **FLUX.2 [dev]** | 19.3 GB | a 10-shard LLM ✗ | `ae.safetensors` |
+
+**HiDream-I1 is the one to start with**, and for the opposite of the reason
+this entry used to give. It claimed "8B pixel-native, no external VAE and no
+separate text encoders... *less* work than its size suggests". Its
+`model_index.json` says `vae: AutoencoderKL` and lists **four** text encoders.
+It is more work than the old note claimed — but three of those four already
+exist here, and the VAE is the standard one this project has verified since
+milestone 1. So what is actually new is the transformer plus a Llama encoder,
+and candle ships Llama already.
+
+**Qwen-Image needs two new towers**: `Qwen2_5_VLForConditionalGeneration` — a
+vision-language model, not a text encoder in the CLIP or T5 sense — and its
+own `AutoencoderKLQwenImage`. Largest of the three by work, not by size.
+
+**FLUX.2 is gated and `[klein]` is not obtainable.** `FLUX.2-dev` is
+`gated: auto` and its raw files 401 without credentials; `FLUX.2-klein` 401s
+outright, so the old note that it is "Apache-2.0" describes a licence on
+something that cannot currently be downloaded. The quantised mirror
+(`city96/FLUX.2-dev-gguf`) is ungated, which is the practical route — as it
+was for Flux.1 schnell — but its text encoder is ten shards of a large LLM and
+is the real cost.
+
+All three publish Q4 GGUFs, so the quantised path this project already has is
+the one to use; none of them fits dense on 36 GB.
 
 ### 2. Extend streaming past Flux and SD 3.5, and measure on a discrete GPU
 
@@ -1189,8 +1214,26 @@ entirely untested, so that visit should cover both.
   operation, different output layout: adopting candle's would mean its permute
   *plus* a flatten and a transpose to get back to a sequence. Strictly more
   work, so it cannot be faster.
-- Broaden fused attention to SD 1.5 by materialising `causal_mask` from
-  `[1,1,s,s]` to `[b,h,s,s]`. A reshape, not a kernel.
+- ~~Broaden fused attention by materialising `causal_mask`.~~ **Done, and the
+  premise was exactly right.** `attention_with_path` already offers its mask
+  to candle's fused kernel, which **declines the broadcast `[1,1,s,s]` form
+  and takes `[b,h,s,s]`** — so every masked attention here was silently on the
+  naive path. Measured by `--example masked_attention_path`, minimum of 20,
+  synchronised:
+
+  ```text
+    CLIP-L text tower   naive 416.9 us   fused 165.2 us   2.5x
+    unCLIP prior        naive 794.9 us   fused 211.2 us   3.8x
+  ```
+
+  Agreeing to 2.3e-7 and 3.3e-7. The prior gains most because it runs 20
+  blocks x 25 steps of it. Both now expand once and share the result across
+  layers.
+
+  Worth recording that this **puts back an expansion removed earlier in the
+  same session**, when it was shown not to be the fix for a Metal failure. It
+  was not; it is a 2.5-3.8x speed-up, which is a different claim, and this
+  time it is measured.
 - A **blocked CPU attention kernel**, tiling over query rows as well as keys.
   This is the one that would matter: attention at 4096 tokens is where CPU
   time actually goes, and it is exactly where candle's CPU flash kernel loses
