@@ -35,7 +35,7 @@ mattered:
 ## What this project does today
 
 Every capability below is verified against `diffusers`/`transformers` with a
-recorded number. **376 tests, all gates green**, plus 7 GPU smoke tests behind the `metal`
+recorded number. **378 tests, all gates green**, plus 7 GPU smoke tests behind the `metal`
 feature (`cargo test --features metal --test metal_smoke`) — they are not in
 the default count because a machine without a GPU cannot run them.
 
@@ -172,7 +172,7 @@ because candle pools its buffers and only returns them inside
 what actually dominates.
 
 Every component is verified against `diffusers`/`transformers` — the full
-table is in [roadmap.md](roadmap.md). 376 tests, all gates green
+table is in [roadmap.md](roadmap.md). 378 tests, all gates green
 (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`,
 `scripts/check-seam.sh`, `scripts/check-native-deps.sh`).
 
