@@ -124,19 +124,22 @@ Remaining milestone 2 work:
   Still open: keeping the text encoder at F16 while the UNet stays quantised.
   Q4_K makes this much less urgent, and unlike the above it is plumbing (two
   weight sources for one pipeline), not measurement.
-- **Keep quantised weights quantised.** Today every GGUF weight is
-  dequantised to f32 at load, so quantisation buys disk and nothing else —
-  SD 1.5 occupies 4.26 GB of RAM whether the file is Q4_0 or f32. candle's
-  `QMatMul` holds weights in their quantised form and dequantises per
-  operation. This is the blocker for the larger architectures below: Flux is
-  12B parameters, which is 48 GB of f32 and will not load on a 36 GB machine
-  at any quantisation. Doing this before attempting them is the right order.
-- CUDA through the seam. Metal is verified end to end at 512; CUDA is untested.
+- ~~**Keep quantised weights quantised.**~~ **Done**, and it turned out to be
+  the load-bearing piece it was predicted to be. `weights::Source::Quantized`
+  holds a `QLinear` and dequantises per operation; `FluxTransformer` and
+  `Sd3Transformer` both build `from_quantized`, with streaming variants on
+  top. Flux schnell is 12B parameters in 6.32 GB resident, which is the only
+  reason it runs here at all — see handoff.md, where the same mechanism turned
+  out to be the *correctness* fix for T5 as well, since f16 overflows it.
+- **CUDA through the seam** — the only unticked box in this file, and open
+  purely for want of a device. Metal is verified end to end and has per-module
+  CPU parity; nothing about CUDA is known either way.
 - **SD 1.5 in f16 too**, if it is ever worth it. SDXL needed it to fit; SD 1.5
   does not, and switching would mean re-verifying every golden test against f16
   tolerances. Measure first.
-- **img2img and SDXL together.** The SDXL pipeline is txt2img only; the encoder
-  and `Strength` already exist, so this is composition rather than new maths.
+- ~~**img2img and SDXL together.**~~ **Done** — `SdxlPipeline::run_img2img`,
+  verified end to end through encoder tiling, strength, sampler and decoder.
+  It was composition rather than new maths, as predicted.
 
 ## Milestone 3 — breadth
 
