@@ -1124,9 +1124,10 @@ entirely untested, so that visit should cover both.
   `forward_controlled` takes plain tensors and `ControlNet::new` takes a
   `UNetConfig` — so this should be config and a checkpoint, not new code. Worth
   confirming that claim rather than assuming it.
-- **Multiple ControlNets at once.** diffusers sums the corrections from several
-  before applying them. The summing is trivial; the question is whether the
-  API should take a list, and that is worth deciding once rather than twice.
+- ~~**Multiple ControlNets at once.**~~ **Done**, and has been for a while —
+  `ControlConfig::controls` is a `Vec<Control>` and the corrections are summed
+  before the UNet sees them. The entry outlived the work; see the section
+  above for why summing is the right composition.
 - `candle_nn::rotary_emb::{rope, rope_i, rope_thd}` — fused RoPE. Flux's
   axis-wise 2x2 form may not map onto it; establish rather than assume.
 - `candle_nn::ops::{pixel_shuffle, pixel_unshuffle}` — patchify/unpatchify by
