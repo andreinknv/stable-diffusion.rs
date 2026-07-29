@@ -134,9 +134,24 @@ Remaining milestone 2 work:
 - **CUDA through the seam** — the only unticked box in this file, and open
   purely for want of a device. Metal is verified end to end and has per-module
   CPU parity; nothing about CUDA is known either way.
-- **SD 1.5 in f16 too**, if it is ever worth it. SDXL needed it to fit; SD 1.5
-  does not, and switching would mean re-verifying every golden test against f16
-  tolerances. Measure first.
+- ~~**SD 1.5 in f16 too.**~~ **Measured, and the answer is no.**
+  `--example unet_dtype` times one UNet forward at a guidance batch of 2, 512,
+  synchronising inside the timed region, f32 and f16 alternated:
+
+  ```text
+    f32          698.6 ms
+    f16          637.1 ms
+    f32 again    700.5 ms
+  ```
+
+  **1.10x**, worth about 1.2 s on a 20-step image, plus 1.7 GB of residency on
+  a machine where SD 1.5 already fits in f32 with room to spare. Against that:
+  casting at the sampler boundary inside the most-verified loop in the project,
+  and re-verifying every golden test at f16 tolerances. SDXL took f16 because
+  it did not fit otherwise, which is a different reason and still a good one.
+
+  Worth re-running if a machine with a much wider f16 advantage appears —
+  the example exists now, so it is one command.
 - ~~**img2img and SDXL together.**~~ **Done** — `SdxlPipeline::run_img2img`,
   verified end to end through encoder tiling, strength, sampler and decoder.
   It was composition rather than new maths, as predicted.
