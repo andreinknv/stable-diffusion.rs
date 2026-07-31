@@ -20,6 +20,9 @@ pub mod flux;
 pub mod gligen;
 pub mod image;
 pub mod ip_adapter;
+/// SD 1.5 on MLX. See docs/handoff.md.
+#[cfg(feature = "mlx")]
+pub mod mlx;
 pub mod prior;
 pub mod sd3;
 pub mod t5;
