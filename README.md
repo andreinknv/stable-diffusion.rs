@@ -3,35 +3,52 @@
 Diffusion model inference in pure Rust.
 
 A ground-up Rust implementation: no cmake, no git submodules, no vendored
-inference engine. `cargo build` and you have a binary.
+inference engine. One system library — MLX, installed with `brew install
+mlx-c` — and then `cargo build`.
 
 > **Status: it renders.** Six architectures — Stable Diffusion 1.5, 2.x,
-> SDXL, SD 3.5, Flux (schnell and mini), and unCLIP — on CPU and Apple GPU,
-> with img2img, inpainting, ControlNet, LoRA, IP-Adapter, GLIGEN, textual
-> inversion, AnimateDiff motion modules and more besides. Every model
-> component is verified tensor-by-tensor against `diffusers`/`transformers`,
-> not eyeballed. GGUF works end to end (`sdrs txt2img --gguf`); prefer Q4_K
-> over Q4_0, which is visibly soft. **CUDA compiles but is untested** — no
-> device has been available. See the [roadmap](docs/roadmap.md).
+> SDXL, SD 3.5, Flux schnell, and unCLIP — on Apple GPU via MLX, with
+> img2img, inpainting, ControlNet, LoRA, IP-Adapter, GLIGEN, textual
+> inversion, AnimateDiff clips, region prompts, two-pass hires, step caching
+> and 4x upscaling. Every model component is verified tensor-by-tensor
+> against `diffusers`/`transformers`, not eyeballed.
 
 <p align="center">
-  <img src="assets/sdxl-crab-1024-metal-f16.png" width="420"
-       alt="SDXL, 1024x1024: a rusty crab on a beach">
+  <img src="assets/readme-sdxl-lighthouse.png" width="520"
+       alt="SDXL at 1024x1024: a lighthouse on a cliff at dusk">
 </p>
-<p align="center"><em>SDXL at 1024x1024, 20 steps, DPM++ 2M, 89 s on an
-M4 Max. <code>"a rusty crab on a beach, detailed photograph, golden
-hour"</code></em></p>
+<p align="center"><em>SDXL, 1024&times;1024, 30 steps, DPM++ 2M.<br>
+<code>sdrs txt2img --model models/sdxl --sdxl --steps 30 --sampler dpmpp2m</code></em></p>
+
+### What fits on a 36 GB laptop
+
+Weights are held **quantised at rest** — packed bits, dequantised inside the
+matmul kernel a tile at a time — so models that cannot be loaded densely run
+anyway:
+
+| model | resident | dense f32 |
+|---|---|---|
+| Flux schnell + T5-XXL | **13.3 GB** | 66 GB |
+| SD 3.5 medium + T5-XXL | **10.1 GB** | ~40 GB |
+| SDXL | 10.3 GB | 10.3 GB |
+
+4-bit everywhere is *not* good enough — measured 0.933 cosine against dense
+across a whole transformer, which is a visibly different picture. The layers
+that multiply the residual stream are held at 8 bits and the rest at 4, which
+reaches 0.992 at 19 % of dense. The numbers and the reasoning are in
+[`quantized.rs`](crates/sd-models/src/mlx/quantized.rs).
 
 ## Why
 
 Three things this implementation provides:
 
-- **No build ceremony.** One `cargo build`, no cmake, no submodule init, no
-  toolchain file. Dependencies resolve through cargo like any other crate.
+- **Almost no build ceremony.** `brew install mlx-c`, then one `cargo build`.
+  No cmake, no submodule init, no toolchain file; every Rust dependency
+  resolves through cargo like any other crate.
 - **Memory-safe model loading.** Weight parsers ingest files people download
-  from the internet. These are safe Rust, with `unsafe` confined to a single
-  documented `mmap`. (safetensors loads today; GGUF parses and dequantises,
-  but SD checkpoints in it still need a name map.)
+  from the internet. These are safe Rust, with `unsafe` confined to the FFI
+  boundary and one documented `mmap`. safetensors and GGUF both load, and a
+  GGUF checkpoint in the older CompVis naming is translated on the way in.
 - **Embeddable.** A normal crate you add to a Rust application, not an FFI
   boundary you marshal across.
 
@@ -71,11 +88,18 @@ what the seam does *not* protect against are in
 ## Build
 
 ```bash
-cargo build --release                        # CPU
-cargo build --release --features accelerate  # CPU + Apple BLAS (no native code added)
-cargo build --release --features metal       # Apple GPU
-cargo build --release --features cuda        # NVIDIA
+brew install mlx-c      # pulls mlx; once, not per build
+cargo build --release
 ```
+
+`build.rs` finds MLX through `MLX_C_PREFIX`/`MLX_PREFIX` or Homebrew, and
+links nothing at all without the `mlx` feature — so `--no-default-features`
+still compiles on a machine that has never seen it, which is what lets CI
+check the crate graph anywhere.
+
+**Apple silicon only, today.** MLX is Apple's. The seam is what would make
+another backend a bounded change rather than a rewrite — it has already
+survived one swap, from candle — but nothing else is wired up.
 
 ```bash
 ./target/release/sdrs info

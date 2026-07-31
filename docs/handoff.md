@@ -839,6 +839,33 @@ contamination producing 10x timing variance. **Run one suite at a time.** The
 models are gigabytes each and several test binaries load three or four of
 them.
 
+### What removing candle actually cost
+
+**37,928 lines deleted, 726 added**, across 156 files, in one commit — which is
+what `docs/handoff.md` prescribed and what the seam made possible.
+
+What went: every candle model (~10k lines), the candle pipeline (~4.9k), 43
+test binaries, `sd-tensor`'s `ops`/`nn`/`conv`/`fused`/`mps`/`quantized`
+modules, `sd-loader`'s VarBuilder paths, and the three hand-written Metal
+kernels. Those kernels were real wins — group_norm 6.09x, adaLN 5.26x, GEGLU
+3.65x — and MLX's fusion subsumes them. They were always the cost of staying.
+
+`sd-tensor/src/lib.rs` went from **1,726 lines to 163**: an error type, a
+seeded generator, the memory guard, and the fixture skip. That number is the
+clearest measure of what the seam was: almost all of it was re-export surface.
+
+**What stayed, and why it is not under `mlx/`.** The tokenizers, the scalar
+schedules, `sd_loader`'s name mappings, `sd_sample`'s sigma ladders, and
+`config.rs`. None touches a tensor, and a second copy of a schedule or a name
+mapping is how two implementations come to disagree about which tensor is
+which — which was the whole lesson of the port.
+
+**One thing the seam did not catch.** `tokenizers` needed a regex backend that
+candle had been enabling transitively. Removing candle turned that into a build
+error rather than a silent behaviour change, which is the good direction — the
+dependency was always real and is now named. `fancy-regex`, not `onig`, so the
+"no C toolchain" property survives.
+
 ### The ledger, so the next reader does not have to rebuild it
 
 28 MLX test binaries against 43 candle ones. The gap is not 15 ports:
