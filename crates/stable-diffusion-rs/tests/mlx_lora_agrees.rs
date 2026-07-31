@@ -164,3 +164,49 @@ fn a_missing_alpha_means_no_rescaling_not_no_effect() {
         );
     }
 }
+
+/// **Coverage, stated absolutely rather than by agreement with candle.**
+///
+/// `the_mlx_merge_matches_sd_loaders` above checks that the two backends agree,
+/// which is the right check while both exist and is worth nothing once candle
+/// is gone. The name mapping is where a LoRA silently half-applies, and a
+/// half-applied adapter still renders a plausible image — so the assertion is
+/// coverage, and it needs its own anchor.
+#[test]
+fn the_adapter_maps_completely_onto_the_unet() {
+    if !lora_path().exists() || !unet_path().exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: needs the lora and unet_full fixtures.");
+        return;
+    }
+    let s = Stream::gpu();
+    let raw = load_safetensors(&lora_path()).expect("lora");
+    let lora = MlxLora::from_weights(&raw, &s).expect("parse");
+    assert_eq!(lora.len(), 278, "lcm-lora-sdv1-5 corrects 278 layers");
+
+    let before = load_safetensors(&unet_path()).expect("unet");
+    let mut after = load_safetensors(&unet_path()).expect("unet");
+    let applied = lora.merge_into(&mut after, 1.0, &s).expect("merge");
+
+    assert_eq!(
+        applied.unmatched.len(),
+        0,
+        "{} layers found no home, the first being {:?}",
+        applied.unmatched.len(),
+        applied.unmatched.first()
+    );
+    assert_eq!(applied.merged, 278, "every corrected layer must be merged");
+
+    // **And exactly those weights moved.** Coverage alone would pass if the
+    // merge wrote to every tensor it could reach.
+    let mut changed = 0usize;
+    for (name, b) in &before {
+        let a = after.get(name).expect("weight survived");
+        if a.to_vec_f32(&s).unwrap() != b.to_vec_f32(&s).unwrap() {
+            changed += 1;
+        }
+    }
+    assert_eq!(
+        changed, 278,
+        "exactly the adapter's own layers must change, not {changed}"
+    );
+}

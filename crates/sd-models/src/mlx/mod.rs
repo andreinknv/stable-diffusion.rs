@@ -246,6 +246,34 @@ impl<'a> Adapters<'a> {
     }
 }
 
+/// Rename a checkpoint's legacy VAE attention keys to the modern ones, in
+/// place.
+///
+/// **The stock SD 1.5 VAE — the file most people download — uses the legacy
+/// names.** diffusers renamed the block at some point; the tensors are
+/// identical and only the keys differ. Model code stays on the modern names
+/// and this converts once at load, rather than every lookup carrying a
+/// fallback.
+///
+/// A decoder that skips this passes every numerical test against a
+/// `state_dict()`-derived fixture and then fails to load the real checkpoint,
+/// which is how the candle side found it.
+pub fn normalise_legacy_attention(w: &mut Weights) {
+    let legacy: Vec<String> = w
+        .keys()
+        .filter(|k| sd_loader::modern_attention_key(k).is_some())
+        .cloned()
+        .collect();
+    for old in legacy {
+        let Some(new) = sd_loader::modern_attention_key(&old) else {
+            continue;
+        };
+        if let Some(v) = w.remove(&old) {
+            w.insert(new, v);
+        }
+    }
+}
+
 pub fn conv(x: &Array, w: &Array, b: Option<&Array>, padding: usize, s: &Stream) -> Result<Array> {
     conv_strided(x, w, b, 1, padding, s)
 }

@@ -96,6 +96,18 @@ pub fn legacy_attention_key(name: &str) -> Option<String> {
         .map(|(modern, legacy)| name.replace(modern, legacy))
 }
 
+/// Rewrite a legacy attention key to its modern equivalent.
+///
+/// The inverse of [`legacy_attention_key`], and needed by loaders that
+/// normalise a checkpoint into modern names once rather than translating at
+/// every lookup. Returns `None` when the name needs no rewriting.
+pub fn modern_attention_key(name: &str) -> Option<String> {
+    LEGACY_ATTENTION_KEYS
+        .iter()
+        .find(|(_, legacy)| name.contains(legacy))
+        .map(|(modern, legacy)| name.replace(legacy, modern))
+}
+
 /// Whether any file names a tensor using the legacy attention layout.
 ///
 /// Reads only the safetensors headers — no tensor data is touched, so this is
