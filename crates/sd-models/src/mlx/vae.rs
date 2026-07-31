@@ -202,3 +202,83 @@ pub fn decode(latent_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Array> {
         s,
     )
 }
+
+/// `AutoencoderKL`'s encoder: an image in, the latent distribution's moments
+/// out.
+///
+/// `conv_out` emits **twice** `latent_channels` — the first half is the mean,
+/// the second the log-variance. Taking the wrong half loads fine and yields
+/// noise.
+///
+/// Down blocks have `layers_per_block` resnets, one *fewer* than the decoder's
+/// up blocks.
+pub fn encode_moments(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Array> {
+    let h = conv(
+        image_nhwc,
+        get(w, "encoder.conv_in.weight")?,
+        Some(get(w, "encoder.conv_in.bias")?),
+        1,
+        s,
+    )?;
+
+    // 128 -> 128 -> 256 -> 512 -> 512, downsampling on all but the last.
+    let mut h = h;
+    for (i, has_down) in [true, true, true, false].into_iter().enumerate() {
+        for j in 0..2 {
+            h = resnet(&h, w, &format!("encoder.down_blocks.{i}.resnets.{j}"), s)?;
+        }
+        if has_down {
+            h = downsample(&h, w, &format!("encoder.down_blocks.{i}.downsamplers.0"), s)?;
+        }
+    }
+
+    let h = resnet(&h, w, "encoder.mid_block.resnets.0", s)?;
+    let h = attention(&h, w, "encoder.mid_block.attentions.0", s)?;
+    let h = resnet(&h, w, "encoder.mid_block.resnets.1", s)?;
+
+    let h = h
+        .group_norm(
+            NORM_GROUPS,
+            VAE_EPS,
+            Some(get(w, "encoder.conv_norm_out.weight")?),
+            Some(get(w, "encoder.conv_norm_out.bias")?),
+            s,
+        )?
+        .silu(s)?;
+    let h = conv(
+        &h,
+        get(w, "encoder.conv_out.weight")?,
+        Some(get(w, "encoder.conv_out.bias")?),
+        1,
+        s,
+    )?;
+    // 1x1, so no padding.
+    conv(
+        &h,
+        get(w, "quant_conv.weight")?,
+        Some(get(w, "quant_conv.bias")?),
+        0,
+        s,
+    )
+}
+
+/// The encoder's stride-2 downsample.
+///
+/// **Asymmetric padding**: one row at the bottom and one column at the right,
+/// none at the top or left, which is `Downsample2D(padding=0)` followed by
+/// `F.pad(x, (0, 1, 0, 1))` in diffusers. A symmetric `padding: 1` runs,
+/// produces the right shape, and shifts the whole image half a pixel per
+/// downsample — `docs/handoff.md` records that bug measuring 17.32.
+///
+/// NHWC, so the spatial axes are 1 and 2 rather than 2 and 3.
+fn downsample(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
+    let padded = x.pad(&[1, 2], &[0, 0], &[1, 1], s)?;
+    super::conv_strided(
+        &padded,
+        get(w, &format!("{prefix}.conv.weight"))?,
+        Some(get(w, &format!("{prefix}.conv.bias"))?),
+        2,
+        0,
+        s,
+    )
+}

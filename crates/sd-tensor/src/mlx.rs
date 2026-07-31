@@ -152,6 +152,20 @@ unsafe extern "C" {
         axis: i32,
         s: mlx_stream,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn mlx_pad(
+        res: *mut mlx_array,
+        a: mlx_array,
+        axes: *const i32,
+        axes_num: usize,
+        low_pad_size: *const i32,
+        low_pad_size_num: usize,
+        high_pad_size: *const i32,
+        high_pad_size_num: usize,
+        pad_value: mlx_array,
+        mode: *const c_char,
+        s: mlx_stream,
+    ) -> i32;
     fn mlx_broadcast_to(
         res: *mut mlx_array,
         a: mlx_array,
@@ -928,6 +942,53 @@ impl Array {
         let k = Self::scalar_f32(1.702)?;
         let gate = self.mul(&k, stream)?.sigmoid(stream)?;
         self.mul(&gate, stream)
+    }
+
+    /// Zero-pad `axes` by `(low, high)` each.
+    ///
+    /// Needed because MLX convolutions take one symmetric padding per spatial
+    /// axis, and the VAE encoder's downsample is **asymmetric** — one row at
+    /// the bottom and one column at the right, none at the top or left, which
+    /// is what diffusers does. A symmetric pad runs, produces the right shape,
+    /// and shifts the image half a pixel per downsample.
+    pub fn pad(
+        &self,
+        axes: &[usize],
+        low: &[usize],
+        high: &[usize],
+        stream: &Stream,
+    ) -> Result<Self> {
+        if axes.len() != low.len() || axes.len() != high.len() {
+            return Err(Error::Msg(
+                "mlx: pad needs one low and one high per axis".into(),
+            ));
+        }
+        let ax: Vec<i32> = axes.iter().map(|&a| a as i32).collect();
+        let lo: Vec<i32> = low.iter().map(|&a| a as i32).collect();
+        let hi: Vec<i32> = high.iter().map(|&a| a as i32).collect();
+        let zero = Self::scalar_f32(0.0)?;
+        let mut out = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        check(
+            unsafe {
+                mlx_pad(
+                    &mut out,
+                    self.raw,
+                    ax.as_ptr(),
+                    ax.len(),
+                    lo.as_ptr(),
+                    lo.len(),
+                    hi.as_ptr(),
+                    hi.len(),
+                    zero.raw,
+                    c"constant".as_ptr(),
+                    stream.0,
+                )
+            },
+            "pad",
+        )?;
+        Self::wrap(out)
     }
 
     /// Broadcast to `shape`, which must be compatible with the current one.

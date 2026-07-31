@@ -60,7 +60,7 @@ pub(crate) fn linear(x: &Array, w: &Array, b: Option<&Array>, s: &Stream) -> Res
 
 /// A convolution whose weights arrive in diffusers' `(out, in, kh, kw)` and are
 /// used in MLX's `(out, kh, kw, in)`.
-fn conv_strided(
+pub(crate) fn conv_strided(
     x: &Array,
     w: &Array,
     b: Option<&Array>,

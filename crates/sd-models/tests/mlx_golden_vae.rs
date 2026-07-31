@@ -187,3 +187,36 @@ fn every_decoder_stage_matches_diffusers() {
         panic!("first bad up block is {i} at {rel:.3e} relative, past {STAGE_REL:.0e}");
     }
 }
+
+/// The encoder, against the moments diffusers produced from the same image.
+///
+/// `golden_vae.rs` bounds this with `ENCODER_RTOL`/`ENCODER_ATOL` at 1e-3,
+/// relative for the same reason the decoder's stages are — and this is the
+/// tensor whose asymmetric downsample padding is the trap: a symmetric pad
+/// produces the right shape and shifts the image half a pixel per level.
+#[test]
+fn encode_matches_diffusers() {
+    let Some((refs, w)) = fixtures() else { return };
+    let s = Stream::gpu();
+    const ENCODER_REL: f32 = 1e-4;
+
+    let image = refs
+        .get("encoder_input")
+        .expect("encoder_input")
+        .transpose(&[0, 2, 3, 1], &s)
+        .unwrap();
+    let got = vae::encode_moments(&image, &w, &s).unwrap();
+
+    assert_eq!(got.shape(), vec![1, 32, 32, 8], "mean and log-variance");
+    let rel = relative(
+        &got,
+        refs.get("encoder_moments").expect("encoder_moments"),
+        &s,
+        "encoder_moments",
+    );
+    assert!(
+        rel <= ENCODER_REL,
+        "the encoder is {rel:.3e} relative from diffusers; a half-pixel shift \
+         from symmetric downsample padding shows here first"
+    );
+}
