@@ -23,6 +23,8 @@
 pub mod clip;
 /// ControlNet: a copy of the UNet's down stack that emits corrections.
 pub mod controlnet;
+/// Flux's MMDiT transformer.
+pub mod flux;
 /// LoRA adapters, merged into a weight map before any model is built.
 pub mod lora;
 /// The txt2img sampling loop.
