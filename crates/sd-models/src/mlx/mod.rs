@@ -21,6 +21,8 @@
 
 /// CLIP's text tower. Its epsilon is 1e-5 and its activation is QuickGelu.
 pub mod clip;
+/// ControlNet: a copy of the UNet's down stack that emits corrections.
+pub mod controlnet;
 /// The txt2img sampling loop.
 pub mod sample;
 /// TAESD, the tiny autoencoder. Its latent scaling is 1.0, not the VAE's.
