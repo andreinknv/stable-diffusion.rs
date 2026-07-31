@@ -18,6 +18,8 @@ pub use sd_sample as sample;
 pub use sd_tensor as tensor;
 
 pub mod canny;
+/// Generation settings, backend-free.
+pub mod config;
 pub mod image_io;
 /// The generation pipeline on MLX.
 ///
