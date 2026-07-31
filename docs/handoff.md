@@ -64,9 +64,31 @@ findings still bind.
    and `sample::restore_outside_mask` runs the composite inside the loop. See
    [img2img and inpainting on MLX](#img2img-and-inpainting-on-mlx).
 
-6. **What is actually left.** This is the gate for deleting candle:
-   - **Port the 405 candle tests.** Deleting candle before this is what turns a
-     migration into a rewrite with no oracle.
+6. **What is actually left, and it is one thing.**
+
+   **Quantised-at-rest inference does not exist on MLX**, and full-size Flux
+   and T5-XXL cannot leave candle until it does. The MLX GGUF loader
+   dequantises to f32; Flux schnell is 11.89B parameters, which is **47.6 GB**
+   dense and does not fit on this machine at all. The candle path keeps those
+   weights quantised and dequantises per operation —
+   `FluxTransformer::from_quantized`, `resident_bytes` — and MLX has its own
+   quantisation scheme with no equivalent built here.
+
+   `mlx_gguf_large` pins the boundary as a test rather than a promise: the
+   geometry of both checkpoints is verified from the tensor directory, which
+   costs nothing, and the dense footprint is asserted to *not* fit. If that
+   assertion ever fails, the limitation is stale and the test says so.
+
+   What it would cost is already measured, under [Order of
+   work](#order-of-work): requantising into MLX's own 4-bit scheme at a cosine
+   of ~0.995 against the GGUF values — and **quantise from the original f16
+   checkpoint, not from the GGUF**, or the error sits on top of Q4_K's own.
+   `flux_schnell_gguf`'s tolerance would then have to be re-derived from
+   `xtask/golden/reference_precision.py`, not widened until it passed.
+
+   Everything else in the 405 is either ported, covered under a different name,
+   or dies with candle — see [Closing the MLX test
+   gap](#closing-the-mlx-test-gap-2026-07-31).
 
 7. **Run both backends in parallel** until every golden test passes on MLX.
    Delete candle in one commit, not gradually.
