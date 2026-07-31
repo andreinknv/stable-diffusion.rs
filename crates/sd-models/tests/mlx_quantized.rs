@@ -403,7 +403,8 @@ fn schnell_runs_quantised_at_full_size() {
     let (lat_h, lat_w) = (64usize, 64usize);
     let img_len = (lat_h / 2) * (lat_w / 2);
     let cfg = sd_models::mlx::flux::FluxConfig::schnell();
-    let ids = sd_models::mlx::flux::image_ids(lat_h, lat_w);
+    // The patch grid, which is half the latent on each side.
+    let ids = sd_models::mlx::flux::image_ids(lat_h / 2, lat_w / 2);
 
     let img = activation(img_len, 64);
     let img = img.reshape(&[1, img_len, 64], &s).unwrap();

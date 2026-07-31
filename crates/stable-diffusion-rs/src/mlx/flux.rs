@@ -335,7 +335,11 @@ impl FluxPipeline {
         // The ladder depends on how many tokens the transformer will see.
         let sigmas = flow_sigmas(&self.flow, cfg.steps, img_len);
         let timesteps = flow_timesteps(&self.flow, &sigmas);
-        let img_ids = flux::image_ids(lat_h, lat_w);
+        // **The patch grid, not the latent.** `image_ids` names its argument
+        // `h x w patch grid` and Flux halves the latent into 2x2 patches, so
+        // passing the latent gives four times the positions and the rotary
+        // embedding fails to reshape — which is how this was found.
+        let img_ids = flux::image_ids(patch_h, patch_w);
 
         // Driven by the checkpoint, so a `guidance` setting cannot be silently
         // discarded — nor a required one silently omitted.
