@@ -182,6 +182,13 @@ unsafe extern "C" {
     fn mlx_log(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
     fn mlx_rsqrt(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
 
+    fn mlx_fast_rms_norm(
+        res: *mut mlx_array,
+        x: mlx_array,
+        weight: mlx_array,
+        eps: f32,
+        s: mlx_stream,
+    ) -> i32;
     fn mlx_fast_layer_norm(
         res: *mut mlx_array,
         x: mlx_array,
@@ -774,6 +781,29 @@ impl Array {
         self.mul(&half, stream)?.mul(&e.add(&one, stream)?, stream)
     }
 
+    /// Tanh-approximate GELU — `gelu_new` in transformers.
+    ///
+    /// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+    ///
+    /// **Not interchangeable with [`Array::gelu`].** The two differ by ~1e-3,
+    /// which is far above T5's noise floor and shows up as a systematic drift
+    /// through the stack rather than as a visible break. T5 v1.1's gated
+    /// feed-forward wants this one; the UNet's GEGLU wants the erf form.
+    pub fn gelu_approx(&self, stream: &Stream) -> Result<Self> {
+        let half = Self::scalar_f32(0.5)?;
+        let one = Self::scalar_f32(1.0)?;
+        let c = Self::scalar_f32((2.0f32 / std::f32::consts::PI).sqrt())?;
+        let k = Self::scalar_f32(0.044715)?;
+
+        let cubed = self.mul(self, stream)?.mul(self, stream)?;
+        let inner = self
+            .add(&cubed.mul(&k, stream)?, stream)?
+            .mul(&c, stream)?
+            .tanh(stream)?;
+        self.mul(&half, stream)?
+            .mul(&inner.add(&one, stream)?, stream)
+    }
+
     /// Layer normalisation over the last axis, via MLX's fused kernel.
     ///
     /// `weight` and `bias` are optional; `None` means no affine term.
@@ -809,6 +839,65 @@ impl Array {
     /// `scale` is applied to the query before the product, as diffusers does.
     /// Unmasked — the UNet's transformer attends over everything, which is the
     /// same assumption `unet/attention.rs` makes on the candle path.
+    /// RMS normalisation over the last axis: no mean subtraction, no bias.
+    ///
+    /// **Not LayerNorm.** T5 uses this, and substituting LayerNorm gives
+    /// plausible activations and a wrong result. `weight` is optional.
+    pub fn rms_norm(&self, weight: Option<&Self>, eps: f32, stream: &Stream) -> Result<Self> {
+        let null = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        let mut out = null;
+        check(
+            unsafe {
+                mlx_fast_rms_norm(
+                    &mut out,
+                    self.raw,
+                    weight.map_or(null, |w| w.raw),
+                    eps,
+                    stream.0,
+                )
+            },
+            "rms_norm",
+        )?;
+        Self::wrap(out)
+    }
+
+    /// Attention with an **additive** mask, broadcast over the score matrix.
+    ///
+    /// T5's relative position bias arrives this way rather than as a boolean
+    /// mask.
+    pub fn sdpa_masked(
+        &self,
+        keys: &Self,
+        values: &Self,
+        scale: f32,
+        mask: &Self,
+        stream: &Stream,
+    ) -> Result<Self> {
+        let null = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        let mut out = null;
+        check(
+            unsafe {
+                mlx_fast_scaled_dot_product_attention(
+                    &mut out,
+                    self.raw,
+                    keys.raw,
+                    values.raw,
+                    scale,
+                    c"array".as_ptr(),
+                    mask.raw,
+                    null,
+                    stream.0,
+                )
+            },
+            "sdpa_masked",
+        )?;
+        Self::wrap(out)
+    }
+
     /// Causal scaled dot-product attention, for CLIP's text tower.
     pub fn sdpa_causal(
         &self,

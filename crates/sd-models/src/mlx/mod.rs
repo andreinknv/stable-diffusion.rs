@@ -27,6 +27,8 @@ pub mod controlnet;
 pub mod lora;
 /// The txt2img sampling loop.
 pub mod sample;
+/// T5 v1.1, the text tower Flux and SD 3 use alongside CLIP.
+pub mod t5;
 /// TAESD, the tiny autoencoder. Its latent scaling is 1.0, not the VAE's.
 pub mod taesd;
 /// The VAE decoder. Its epsilon is 1e-6, not the UNet's 1e-5.
