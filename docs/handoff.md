@@ -131,6 +131,11 @@ SD_TEST_CONTROLNET=<a ControlNet .safetensors, e.g. lllyasviel/sd-controlnet-can
 cargo test --release --workspace --features metal --no-fail-fast
 ```
 
+**Swap `--features metal` for `--features mlx` to verify the other backend.**
+Both must pass while the two exist. `--features mlx` did not build at all until
+2026-07-31 — see [The workspace would not build under
+`--features mlx`](#the-workspace-would-not-build-under---features-mlx-at-all).
+
 Without those variables the suite reports 14 failures that are only unset
 paths, and `cargo test` stops at the first failing binary — so a truncated run
 looks like a clean one. `--no-fail-fast` is not optional.
