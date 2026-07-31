@@ -514,3 +514,42 @@ pub fn forward(
         s,
     )
 }
+
+/// `[b, c, h, w]` -> `[b, (h/2)*(w/2), c*4]`, Flux's 2x2 patch packing.
+///
+/// **This is literally SD 3's packing** — the same `(0, 2, 4, 1, 3, 5)`
+/// permutation — so it delegates rather than carrying a second copy. Verified
+/// against candle's `flux::pack_latents` element for element by
+/// `mlx_flux_packing_agrees`.
+///
+/// What differs between the two architectures is the **unpacking**, not the
+/// packing. Flux's [`unpack_latents`] is a true inverse of this; SD 3's
+/// `unpatchify` deliberately is *not*, because its patch embedding is a
+/// convolution whose flattened kernel runs `(channel, ph, pw)` while its final
+/// linear emits `(ph, pw, channel)`. Using either unpacking on the other
+/// model's tokens gives an image of the right shape whose every 2x2 patch has
+/// its channels and positions transposed.
+pub fn pack_latents(latents: &Array, s: &Stream) -> Result<Array> {
+    super::sd3::pack_latents(latents, s)
+}
+
+/// The inverse of [`pack_latents`].
+pub fn unpack_latents(tokens: &Array, h: usize, w: usize, s: &Stream) -> Result<Array> {
+    let [b, n, cc] = tokens.shape()[..] else {
+        return Err(Error::Msg(format!(
+            "mlx: flux tokens should be [b, n, c*4], got {:?}",
+            tokens.shape()
+        )));
+    };
+    let c = cc / 4;
+    if n != (h / 2) * (w / 2) {
+        return Err(Error::Msg(format!(
+            "mlx: {n} tokens do not fill a {h}x{w} latent"
+        )));
+    }
+    tokens
+        .reshape(&[b, h / 2, w / 2, c, 2, 2], s)?
+        .transpose(&[0, 3, 1, 4, 2, 5], s)?
+        .contiguous(s)?
+        .reshape(&[b, c, h, w], s)
+}

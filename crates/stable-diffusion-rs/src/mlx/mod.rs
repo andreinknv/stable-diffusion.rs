@@ -38,9 +38,11 @@ use sd_tensor::{Device, Tensor};
 
 use crate::pipeline::{PipelineError, SamplerKind, Strength, Txt2ImgConfig};
 
+pub mod flux;
 pub mod sd3;
 pub mod sdxl;
 
+pub use flux::{FluxPaths, FluxPipeline, FluxRunConfig};
 pub use sd3::{Sd3Paths, Sd3Pipeline, Sd3RunConfig};
 pub use sdxl::SdxlPipeline;
 

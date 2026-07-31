@@ -15,7 +15,9 @@
 
 use std::path::PathBuf;
 
-use stable_diffusion_rs::mlx::{GroundedBox, MlxPipeline, Sd3Paths, Sd3Pipeline, SdxlPipeline};
+use stable_diffusion_rs::mlx::{
+    FluxPaths, FluxPipeline, GroundedBox, MlxPipeline, Sd3Paths, Sd3Pipeline, SdxlPipeline,
+};
 use stable_diffusion_rs::pipeline::{SamplerKind, Strength, Txt2ImgConfig};
 use stable_diffusion_rs::tensor::mlx::Array;
 
@@ -692,5 +694,74 @@ fn the_flow_ladder_depends_on_the_image_size() {
     assert_ne!(
         big, small,
         "the two resolutions gave the same ladder; the sequence length is being ignored"
+    );
+}
+
+// -- Flux -------------------------------------------------------------------
+
+/// **`guidance_embed` is a property of the checkpoint, not the caller.**
+///
+/// schnell is not distilled on a guidance scale and rejects one; dev and
+/// flux-mini require one. Driven by the config so a setting cannot be silently
+/// discarded, nor a required one silently omitted.
+#[test]
+fn flux_variants_differ_on_whether_guidance_is_distilled() {
+    use sd_models::mlx::flux::FluxConfig;
+    assert!(
+        !FluxConfig::schnell().guidance_embed,
+        "schnell is not distilled on a guidance scale"
+    );
+    assert!(FluxConfig::dev().guidance_embed, "dev is");
+    assert!(FluxConfig::mini().guidance_embed, "flux-mini is");
+    // And they are not the same model otherwise.
+    assert_ne!(
+        FluxConfig::schnell().depth,
+        FluxConfig::mini().depth,
+        "schnell and mini have different depths"
+    );
+}
+
+/// Flux's paths name every shard, because both the transformer and T5-XXL ship
+/// sharded and a single-file assumption drops most of the model.
+#[test]
+fn flux_paths_read_the_directory_rather_than_guessing_a_shard_count() {
+    let paths = FluxPaths::in_dir(&PathBuf::from("/nonexistent/flux"));
+    // Nothing on disk, so nothing found — the point is that it does not
+    // fabricate a filename it then fails to open with a confusing message.
+    assert!(
+        paths.transformer.is_empty(),
+        "no transformer shards should be invented for a directory that is not there"
+    );
+    assert!(paths.t5.is_empty());
+    // The unsharded pieces are still named.
+    assert!(paths
+        .vae
+        .ends_with("vae/diffusion_pytorch_model.safetensors"));
+    assert!(paths.clip.ends_with("text_encoder/model.safetensors"));
+    // T5's tokenizer is sentencepiece, CLIP's is a tokenizer.json.
+    assert!(paths.t5_tokenizer.ends_with("tokenizer_2/spiece.model"));
+    assert!(paths.clip_tokenizer.ends_with("tokenizer/tokenizer.json"));
+}
+
+/// A missing checkpoint is refused rather than half-loaded.
+#[test]
+fn flux_refuses_a_directory_that_is_not_there() {
+    use sd_models::mlx::flux::FluxConfig;
+    let err = FluxPipeline::load(&PathBuf::from("/nonexistent/flux"), FluxConfig::schnell());
+    assert!(err.is_err(), "a missing Flux directory must be refused");
+}
+
+/// **Flux's ladder is resolution-dependent too**, and its `mu` shift differs
+/// from SD 3's — the two configs are not interchangeable.
+#[test]
+fn the_flux_and_sd3_flow_configs_are_not_the_same() {
+    use sd_sample::flow::{flow_sigmas, FlowMatchConfig};
+    let (flux, sd3) = (FlowMatchConfig::flux(), FlowMatchConfig::sd3());
+    let a = flow_sigmas(&flux, 4, 64 * 64);
+    let b = flow_sigmas(&sd3, 4, 64 * 64);
+    assert_eq!(a.len(), b.len());
+    assert_ne!(
+        a, b,
+        "the two flow configurations gave the same ladder; one is being ignored"
     );
 }
