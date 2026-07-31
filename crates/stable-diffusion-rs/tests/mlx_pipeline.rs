@@ -1231,3 +1231,46 @@ fn an_embedding_of_the_wrong_width_is_refused() {
     let empty = Array::from_slice_f32(&[], &[0, 768]).unwrap();
     assert!(pipe.attach_embedding("thing", empty).is_err());
 }
+
+/// **Upscaling quadruples the image**, and takes CLIP-style `[0, 1]` rather
+/// than the VAE's `[-1, 1]`.
+#[test]
+fn upscaling_quadruples_the_image() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let esrgan = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/esrgan/esrgan.safetensors");
+    if !esrgan.exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no ESRGAN fixture.");
+        return;
+    }
+    let pipe = MlxPipeline::load(&dir).expect("pipeline");
+    let weights = sd_tensor::mlx::load_safetensors(&esrgan).expect("esrgan");
+
+    // A small generated image, upscaled from its bytes so no range is named.
+    let small = Txt2ImgConfig {
+        width: 64,
+        height: 64,
+        ..config()
+    };
+    let (w, h, bytes) = pipe.txt2img(&small).expect("txt2img");
+    let (uw, uh, up) = pipe.upscale_bytes(w, h, &bytes, &weights).expect("upscale");
+
+    assert_eq!((uw, uh), (w * 4, h * 4), "Real-ESRGAN is 4x");
+    assert_eq!(up.len(), uw * uh * 3);
+
+    let (mean, sd, step) = looks_like_an_image(uw, uh, &up);
+    eprintln!("upscaled: mean {mean:.1}  sd {sd:.1}  neighbour step {step:.1}");
+    assert!((5.0..250.0).contains(&mean), "mean {mean:.1}");
+    // An upscale is smoother than its source, not noisier.
+    let (_, _, source_step) = looks_like_an_image(w, h, &bytes);
+    assert!(
+        step < source_step,
+        "the upscale is rougher ({step:.1}) than its source ({source_step:.1})"
+    );
+
+    // Wrong byte count is a caller error rather than a reshape deep inside.
+    assert!(pipe.upscale_bytes(w, h, &bytes[..10], &weights).is_err());
+}

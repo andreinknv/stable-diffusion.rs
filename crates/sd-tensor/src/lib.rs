@@ -1094,6 +1094,34 @@ pub mod device {
 pub mod rng {
     use super::{DType, Device, Result, Tensor};
 
+    /// A standard-normal draw as an MLX array, `[n, c, h, w]` in **NHWC**.
+    ///
+    /// The transpose happens here rather than at every call site because the
+    /// draw order is what a seed pins: `normals` fills NCHW-major, and
+    /// re-ordering afterwards is what keeps an MLX image identical to a candle
+    /// one from the same seed.
+    #[cfg(feature = "mlx")]
+    pub fn randn_nhwc(
+        rng: &mut SeededRng,
+        n: usize,
+        c: usize,
+        h: usize,
+        w: usize,
+    ) -> Result<crate::mlx::Array> {
+        let v = rng.normals(n * c * h * w);
+        let mut out = vec![0.0f32; v.len()];
+        for bi in 0..n {
+            for ci in 0..c {
+                for y in 0..h {
+                    for x in 0..w {
+                        out[((bi * h + y) * w + x) * c + ci] = v[((bi * c + ci) * h + y) * w + x];
+                    }
+                }
+            }
+        }
+        crate::mlx::Array::from_slice_f32(&out, &[n, h, w, c])
+    }
+
     /// splitmix64 — small, fast, and good enough for sampling noise.
     #[derive(Debug, Clone)]
     pub struct SeededRng {

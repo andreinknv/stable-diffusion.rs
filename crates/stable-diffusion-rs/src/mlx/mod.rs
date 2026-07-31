@@ -84,17 +84,7 @@ pub(crate) fn draw_noise(
     h: usize,
     w: usize,
 ) -> Result<Array, PipelineError> {
-    let t: Tensor = rng.randn((1, c, h, w), &Device::Cpu)?;
-    let v = t.flatten_all()?.to_vec1::<f32>()?;
-    let mut out = vec![0.0f32; v.len()];
-    for ci in 0..c {
-        for y in 0..h {
-            for x in 0..w {
-                out[(y * w + x) * c + ci] = v[ci * h * w + y * w + x];
-            }
-        }
-    }
-    Ok(Array::from_slice_f32(&out, &[1, h, w, c])?)
+    Ok(sd_tensor::rng::randn_nhwc(rng, 1, c, h, w)?)
 }
 
 /// `<|startoftext|>` and `<|endoftext|>` in CLIP's vocabulary.
@@ -483,6 +473,56 @@ impl MlxPipeline {
         let class_embeds = concat(&[&uncond, &conditioned], 0, s)?;
 
         self.generate_with_class(cfg, Some(&class_embeds), &mut rng)
+    }
+
+    /// Upscale an image 4x with Real-ESRGAN.
+    ///
+    /// **`image` is `[1, h, w, 3]` in `[0, 1]`, not the VAE's `[-1, 1]`.**
+    /// The two are the same shape and dtype, so the wrong range is accepted
+    /// and returns a washed-out picture with no error — the same trap
+    /// `clip_vision::preprocess` carries. [`Self::upscale_bytes`] takes the
+    /// bytes `txt2img` returns and does the conversion.
+    ///
+    /// Separate from the pipeline's own weights, because an upscaler is a
+    /// different model: loading it costs what a caller who never upscales
+    /// should not pay.
+    pub fn upscale(
+        &self,
+        image: &Array,
+        weights: &Weights,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        let s = &self.stream;
+        let out = sd_models::mlx::esrgan::upscale(image, weights, s)?;
+        let [_, h, w, _] = out.shape()[..] else {
+            return Err(msg(format!("mlx: esrgan returned {:?}", out.shape())));
+        };
+        // `[0, 1]` out, matching what went in.
+        let bytes = out
+            .to_vec_f32(s)?
+            .iter()
+            .map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect();
+        Ok((w, h, bytes))
+    }
+
+    /// [`Self::upscale`] over the RGB bytes the generation entry points
+    /// return, so a caller never has to name a range at all.
+    pub fn upscale_bytes(
+        &self,
+        width: usize,
+        height: usize,
+        rgb: &[u8],
+        weights: &Weights,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        if rgb.len() != width * height * 3 {
+            return Err(msg(format!(
+                "mlx: {} bytes is not {width}x{height} RGB",
+                rgb.len()
+            )));
+        }
+        let unit: Vec<f32> = rgb.iter().map(|&b| b as f32 / 255.0).collect();
+        let image = Array::from_slice_f32(&unit, &[1, height, width, 3])?;
+        self.upscale(&image, weights)
     }
 
     /// Attach a textual-inversion embedding under a trigger word.
