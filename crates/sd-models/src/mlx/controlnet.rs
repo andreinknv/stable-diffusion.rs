@@ -18,7 +18,7 @@ use sd_tensor::mlx::{Array, Stream};
 use sd_tensor::{Error, Result};
 
 use super::{
-    conv, conv_strided, down_block, get, mid_block, timestep_embedding, UNetConfig, Weights,
+    conditioned_temb, conv, conv_strided, down_block, get, mid_block, UNetConfig, Weights,
 };
 
 /// Widths of the hint pyramid. Three stride-2 steps, so 8x in total.
@@ -88,7 +88,41 @@ pub fn forward(
     w: &Weights,
     s: &Stream,
 ) -> Result<Control> {
-    let temb = timestep_embedding(timestep, 320, w, s)?;
+    forward_with(
+        sample_nhwc,
+        timestep,
+        context,
+        hint_nhwc,
+        None,
+        scale,
+        cfg,
+        w,
+        s,
+    )
+}
+
+/// [`forward`] plus SDXL's micro-conditioning: the pooled text embedding
+/// `[n, 1280]` and the six time ids `[n, 6]`.
+///
+/// **A ControlNet needs the same conditioning its UNet does**, built the same
+/// way — [`conditioned_temb`] is shared with the UNet for exactly that reason.
+/// Running an SDXL ControlNet on the plain timestep embedding loads, runs, and
+/// emits corrections computed at the wrong conditioning; they then get added
+/// into a UNet that *was* conditioned, so the result reads as a weak or
+/// misbehaving ControlNet rather than as a bug.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_with(
+    sample_nhwc: &Array,
+    timestep: &Array,
+    context: &Array,
+    hint_nhwc: &Array,
+    added: Option<(&Array, &Array)>,
+    scale: f64,
+    cfg: &UNetConfig,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Control> {
+    let temb = conditioned_temb(timestep, added, None, cfg, w, s)?;
 
     // Added, not concatenated.
     let h = conv(

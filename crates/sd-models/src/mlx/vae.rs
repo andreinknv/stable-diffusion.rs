@@ -13,7 +13,7 @@
 //! no timestep to condition on, so sharing the UNet's block would mean passing
 //! a zero and hoping. It is written out instead.
 
-use sd_tensor::mlx::{Array, Stream};
+use sd_tensor::mlx::{concat, Array, Stream};
 use sd_tensor::{Error, Result};
 
 use super::{conv, get, linear, Weights, NORM_GROUPS};
@@ -433,4 +433,150 @@ fn downsample(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array>
         0,
         s,
     )
+}
+
+// -- tiling -----------------------------------------------------------------
+//
+// A decode allocates a convolution im2col of `cin * 9` values per position, so
+// the peak scales with the *area* being decoded. A 1024x1024 image is 4x a
+// 512x512 one, and the failure lands at the end of a run, after every denoise
+// step has been paid for. Tiling turns that into a slightly different image
+// instead of a dead run.
+
+/// The default tile edge, in latent cells.
+pub const TILE_LATENT_EDGE: usize = 64;
+/// How much neighbouring tiles overlap, as a fraction of the edge.
+///
+/// The overlap is what there is to cross-fade over. Without it the tiles butt
+/// up against each other and every seam is a visible line — the decoder is
+/// convolutional, so a tile's edge pixels were computed from padding rather
+/// than from their true neighbours.
+const TILE_OVERLAP: f64 = 0.25;
+
+/// A linear ramp of `extent` values, `(i + 0.5) / extent`, on `axis`.
+///
+/// Cell-centred rather than starting at 0: a ramp that begins at exactly 0 and
+/// ends at exactly 1 gives the first blended column all of `a` and the last all
+/// of `b`, which reintroduces a hard edge at each end of the fade.
+fn ramp(extent: usize, axis: usize, s: &Stream) -> Result<Array> {
+    let values: Vec<f32> = (0..extent)
+        .map(|i| (i as f32 + 0.5) / extent as f32)
+        .collect();
+    let flat = Array::from_slice_f32(&values, &[extent])?;
+    // NHWC: height is axis 1, width axis 2.
+    let shape = if axis == 1 {
+        [1, extent, 1, 1]
+    } else {
+        [1, 1, extent, 1]
+    };
+    flat.reshape(&shape, s)
+}
+
+/// Cross-fade `b` into the trailing `extent` of `a` along `axis`.
+///
+/// Returns `b` with its leading `extent` replaced by the blend.
+fn blend(a: &Array, b: &Array, extent: usize, axis: usize, s: &Stream) -> Result<Array> {
+    let a_len = a.shape()[axis];
+    let b_len = b.shape()[axis];
+    let extent = extent.min(a_len).min(b_len);
+    if extent == 0 {
+        return b.contiguous(s);
+    }
+    let w = ramp(extent, axis, s)?;
+    let one_minus = Array::scalar_f32(1.0)?.sub(&w, s)?;
+    let a_tail = a.narrow(axis, a_len - extent, extent, s)?;
+    let b_head = b.narrow(axis, 0, extent, s)?;
+    // a fades out as b fades in.
+    let mixed = a_tail.mul(&one_minus, s)?.add(&b_head.mul(&w, s)?, s)?;
+    if b_len == extent {
+        return Ok(mixed);
+    }
+    let rest = b.narrow(axis, extent, b_len - extent, s)?;
+    concat(&[&mixed, &rest], axis, s)
+}
+
+/// [`decode_with`] in overlapping tiles, blended at the seams.
+///
+/// Below `tile` in both dimensions this is exactly [`decode_with`], so a small
+/// latent costs nothing for the option.
+pub fn decode_tiled(
+    latent_nhwc: &Array,
+    cfg: &VaeConfig,
+    tile: usize,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
+    let [_, lh, lw, _] = latent_nhwc.shape()[..] else {
+        return Err(Error::Msg(format!(
+            "mlx: a latent should be [n, h, w, c], got {:?}",
+            latent_nhwc.shape()
+        )));
+    };
+    if tile == 0 {
+        return Err(Error::Msg("mlx: a tile edge of zero".into()));
+    }
+    if lh <= tile && lw <= tile {
+        return decode_with(latent_nhwc, cfg, w, s);
+    }
+
+    let stride = (((tile as f64) * (1.0 - TILE_OVERLAP)) as usize).max(1);
+    // In output pixels: the decoder upsamples by 8.
+    let scale = 8;
+    let blend_extent = (tile - stride) * scale;
+    let keep = stride * scale;
+
+    let mut rows: Vec<Vec<Array>> = Vec::new();
+    let mut y = 0;
+    while y < lh {
+        let h = tile.min(lh - y);
+        let mut row = Vec::new();
+        let mut x = 0;
+        while x < lw {
+            let wd = tile.min(lw - x);
+            let patch = latent_nhwc
+                .narrow(1, y, h, s)?
+                .narrow(2, x, wd, s)?
+                .contiguous(s)?;
+            row.push(decode_with(&patch, cfg, w, s)?);
+            if x + wd >= lw {
+                break;
+            }
+            x += stride;
+        }
+        rows.push(row);
+        if y + h >= lh {
+            break;
+        }
+        y += stride;
+    }
+
+    // Blend each tile into its upper and left neighbours, then trim to the
+    // stride so the kept regions tile exactly.
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for i in 0..rows.len() {
+        let mut out_row: Vec<Array> = Vec::with_capacity(rows[i].len());
+        for j in 0..rows[i].len() {
+            let mut t = rows[i][j].contiguous(s)?;
+            if i > 0 {
+                t = blend(&rows[i - 1][j], &t, blend_extent, 1, s)?;
+            }
+            if j > 0 {
+                // The *untrimmed* left neighbour, not the trimmed result
+                // already pushed to `out_row` — those differ in height on any
+                // row whose tiles were cut short, and blending across that
+                // mismatch is a shape error.
+                t = blend(&rows[i][j - 1], &t, blend_extent, 2, s)?;
+            }
+            let last_col = j + 1 == rows[i].len();
+            let last_row = i + 1 == rows.len();
+            let (th, tw) = (t.shape()[1], t.shape()[2]);
+            let h = if last_row { th } else { keep.min(th) };
+            let wd = if last_col { tw } else { keep.min(tw) };
+            out_row.push(t.narrow(1, 0, h, s)?.narrow(2, 0, wd, s)?.contiguous(s)?);
+        }
+        let refs: Vec<&Array> = out_row.iter().collect();
+        out_rows.push(concat(&refs, 2, s)?);
+    }
+    let refs: Vec<&Array> = out_rows.iter().collect();
+    concat(&refs, 1, s)
 }

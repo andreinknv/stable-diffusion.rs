@@ -836,6 +836,101 @@ pub fn up_block(
     Ok(h)
 }
 
+/// The timestep embedding, plus whatever else conditions this UNet through it.
+///
+/// SDXL's micro-conditioning and unCLIP's image embedding both enter the *same*
+/// slot — added to the timestep embedding — from different tensors. A
+/// ControlNet for either has to build the identical vector, which is why this
+/// is a function rather than a passage inside the UNet's forward.
+///
+/// **Pooled first, then the sinusoid.** The halves are 1280 and 1536, so either
+/// order sums to 2816 and loads and runs — the reversed one just conditions on
+/// nonsense.
+pub fn conditioned_temb(
+    timestep: &Array,
+    added: Option<(&Array, &Array)>,
+    class_embeds: Option<&Array>,
+    cfg: &UNetConfig,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
+    let temb = timestep_embedding(timestep, 320, w, s)?;
+    let temb = match (cfg.addition, added) {
+        (Some(add), Some((pooled, time_ids))) => {
+            let [n, ids] = time_ids.shape()[..] else {
+                return Err(Error::Msg(format!(
+                    "mlx: time_ids should be [n, 6], got {:?}",
+                    time_ids.shape()
+                )));
+            };
+            // Each id gets its own sinusoid, then they are flattened.
+            let flat = time_ids.reshape(&[n * ids], s)?;
+            let sinusoid = sinusoid_embedding(&flat, add.time_embed_dim, s)?
+                .reshape(&[n, ids * add.time_embed_dim], s)?;
+            let combined = concat(&[pooled, &sinusoid], 1, s)?;
+            let projected = linear(
+                &combined,
+                get(w, "add_embedding.linear_1.weight")?,
+                Some(get(w, "add_embedding.linear_1.bias")?),
+                s,
+            )?
+            .silu(s)?;
+            let projected = linear(
+                &projected,
+                get(w, "add_embedding.linear_2.weight")?,
+                Some(get(w, "add_embedding.linear_2.bias")?),
+                s,
+            )?;
+            // Added to the timestep embedding, not concatenated with it.
+            temb.add(&projected, s)?
+        }
+        (Some(_), None) => {
+            return Err(Error::Msg(
+                "mlx: this UNet expects SDXL micro-conditioning".into(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(Error::Msg(
+                "mlx: micro-conditioning supplied to a UNet that has no add_embedding".into(),
+            ))
+        }
+        (None, None) => temb,
+    };
+
+    // unCLIP's image conditioning enters the same slot the micro-conditioning
+    // does — added to the timestep embedding — but from a different tensor.
+    let temb = match (cfg.class_projection, class_embeds) {
+        (true, Some(v)) => {
+            let h = linear(
+                v,
+                get(w, "class_embedding.linear_1.weight")?,
+                Some(get(w, "class_embedding.linear_1.bias")?),
+                s,
+            )?
+            .silu(s)?;
+            let h = linear(
+                &h,
+                get(w, "class_embedding.linear_2.weight")?,
+                Some(get(w, "class_embedding.linear_2.bias")?),
+                s,
+            )?;
+            temb.add(&h, s)?
+        }
+        (true, None) => {
+            return Err(Error::Msg(
+                "mlx: this UNet expects an unCLIP image embedding".into(),
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(Error::Msg(
+                "mlx: an image embedding was supplied to a UNet with no class_embedding".into(),
+            ))
+        }
+        (false, None) => temb,
+    };
+    Ok(temb)
+}
+
 /// SD 1.5's UNet, end to end, in NHWC.
 ///
 /// `sample_nhwc` is `[n, h, w, 4]` and the result is `[n, h, w, 4]`. Callers
@@ -923,80 +1018,7 @@ pub fn unet_forward_adapters(
     if let Some(a) = ad.ip {
         a.rewind();
     }
-    let temb = timestep_embedding(timestep, 320, w, s)?;
-    let temb = match (cfg.addition, added) {
-        (Some(add), Some((pooled, time_ids))) => {
-            let [n, ids] = time_ids.shape()[..] else {
-                return Err(Error::Msg(format!(
-                    "mlx: time_ids should be [n, 6], got {:?}",
-                    time_ids.shape()
-                )));
-            };
-            // Each id gets its own sinusoid, then they are flattened.
-            let flat = time_ids.reshape(&[n * ids], s)?;
-            let sinusoid = sinusoid_embedding(&flat, add.time_embed_dim, s)?
-                .reshape(&[n, ids * add.time_embed_dim], s)?;
-            let combined = concat(&[pooled, &sinusoid], 1, s)?;
-            let projected = linear(
-                &combined,
-                get(w, "add_embedding.linear_1.weight")?,
-                Some(get(w, "add_embedding.linear_1.bias")?),
-                s,
-            )?
-            .silu(s)?;
-            let projected = linear(
-                &projected,
-                get(w, "add_embedding.linear_2.weight")?,
-                Some(get(w, "add_embedding.linear_2.bias")?),
-                s,
-            )?;
-            // Added to the timestep embedding, not concatenated with it.
-            temb.add(&projected, s)?
-        }
-        (Some(_), None) => {
-            return Err(Error::Msg(
-                "mlx: this UNet expects SDXL micro-conditioning".into(),
-            ))
-        }
-        (None, Some(_)) => {
-            return Err(Error::Msg(
-                "mlx: micro-conditioning supplied to a UNet that has no add_embedding".into(),
-            ))
-        }
-        (None, None) => temb,
-    };
-
-    // unCLIP's image conditioning enters the same slot the micro-conditioning
-    // does — added to the timestep embedding — but from a different tensor.
-    let temb = match (cfg.class_projection, class_embeds) {
-        (true, Some(v)) => {
-            let h = linear(
-                v,
-                get(w, "class_embedding.linear_1.weight")?,
-                Some(get(w, "class_embedding.linear_1.bias")?),
-                s,
-            )?
-            .silu(s)?;
-            let h = linear(
-                &h,
-                get(w, "class_embedding.linear_2.weight")?,
-                Some(get(w, "class_embedding.linear_2.bias")?),
-                s,
-            )?;
-            temb.add(&h, s)?
-        }
-        (true, None) => {
-            return Err(Error::Msg(
-                "mlx: this UNet expects an unCLIP image embedding".into(),
-            ))
-        }
-        (false, Some(_)) => {
-            return Err(Error::Msg(
-                "mlx: an image embedding was supplied to a UNet with no class_embedding".into(),
-            ))
-        }
-        (false, None) => temb,
-    };
+    let temb = conditioned_temb(timestep, added, class_embeds, cfg, w, s)?;
     let (h, mut skips) = down_pass(sample_nhwc, &temb, context, cfg, ad, w, s)?;
     let mut h = mid_block(&h, &temb, context, cfg, ad, w, s)?;
 
