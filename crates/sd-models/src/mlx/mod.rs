@@ -185,8 +185,56 @@ pub(crate) fn linear(x: &Array, w: &Array, b: Option<&Array>, s: &Stream) -> Res
     }
 }
 
+/// Seamless tiling: whether convolutions wrap at the image edge.
+///
+/// **Thread-local, not global.** A rendering mode has to reach every
+/// convolution in the UNet *and* the VAE, and threading a flag through forty
+/// call sites is how half of them come to miss it — a tiling run whose decoder
+/// still zero-pads has a seam in the output and none in the latent, which is a
+/// confusing thing to debug. A thread-local keeps the tests isolated from each
+/// other, which a `static` would not: the suite runs them in parallel.
+mod seamless {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn enabled() -> bool {
+        ENABLED.with(Cell::get)
+    }
+
+    /// Turn tiling on until the returned guard drops.
+    ///
+    /// A guard rather than a setter so that an error path cannot leave the
+    /// mode on for whatever this thread does next.
+    pub struct Guard(bool);
+
+    impl Guard {
+        pub fn new(on: bool) -> Self {
+            Self(ENABLED.with(|e| e.replace(on)))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ENABLED.with(|e| e.set(self.0));
+        }
+    }
+}
+
+pub use seamless::Guard as SeamlessGuard;
+
+/// Whether convolutions are currently wrapping at the edge.
+pub fn seamless_enabled() -> bool {
+    seamless::enabled()
+}
+
 /// A convolution whose weights arrive in diffusers' `(out, in, kh, kw)` and are
 /// used in MLX's `(out, kh, kw, in)`.
+///
+/// Under [`SeamlessGuard`] the input is wrapped circularly and the convolution
+/// is then called with **zero** padding — doing both would pad twice.
 pub(crate) fn conv_strided(
     x: &Array,
     w: &Array,
@@ -196,7 +244,13 @@ pub(crate) fn conv_strided(
     s: &Stream,
 ) -> Result<Array> {
     let k = w.transpose(&[0, 2, 3, 1], s)?;
-    let y = x.conv2d(&k, (stride, stride), (padding, padding), (1, 1), 1, s)?;
+    let y = if padding > 0 && seamless::enabled() {
+        // NHWC: axes 1 and 2 are height and width.
+        let wrapped = x.pad_circular(&[1, 2], padding, s)?;
+        wrapped.conv2d(&k, (stride, stride), (0, 0), (1, 1), 1, s)?
+    } else {
+        x.conv2d(&k, (stride, stride), (padding, padding), (1, 1), 1, s)?
+    };
     match b {
         Some(b) => y.add(b, s),
         None => Ok(y),

@@ -32,11 +32,13 @@ use sd_models::mlx::{
     sample, timestep_embedding, unclip, unet_forward_adapters, vae, Adapters, Motion, UNetConfig,
     Weights,
 };
-use sd_sample::{sigmas_for_steps, Schedule};
+use sd_sample::{steps, Schedule};
 use sd_tensor::mlx::{concat, load_safetensors, Array, Device, Stream};
 use sd_tensor::rng::SeededRng;
 
-use crate::pipeline::{cache_rescale, PipelineError, SamplerKind, Strength, Txt2ImgConfig};
+use crate::pipeline::{
+    cache_rescale, PipelineError, Precision, SamplerKind, Strength, Txt2ImgConfig,
+};
 
 pub mod flux;
 pub mod sd3;
@@ -194,6 +196,77 @@ pub struct Region {
     pub prompt: String,
 }
 
+/// One generation, with everything optional named.
+///
+/// The public counterpart of `Extras`. Built by chaining, so the common call
+/// stays `Request::new(&cfg)` and the rare one names what it adds — which is
+/// the property the eight-parameter `txt2img_with` did not have, where two
+/// adjacent `Option<&Array>` meant a control map and a reference image were
+/// interchangeable to the compiler and not to the model.
+pub struct Request<'a> {
+    pub(crate) cfg: &'a Txt2ImgConfig,
+    pub(crate) hint: Option<&'a Array>,
+    pub(crate) reference: Option<&'a Array>,
+    pub(crate) boxes: &'a [GroundedBox],
+    pub(crate) regions: &'a [Region],
+    pub(crate) cache_threshold: f64,
+    pub(crate) cancel: Option<Cancel>,
+}
+
+impl<'a> Request<'a> {
+    pub fn new(cfg: &'a Txt2ImgConfig) -> Self {
+        Self {
+            cfg,
+            hint: None,
+            reference: None,
+            boxes: &[],
+            regions: &[],
+            cache_threshold: 0.0,
+            cancel: None,
+        }
+    }
+
+    /// A ControlNet's control map, `[1, h, w, 3]` in **`[-1, 1]`**.
+    pub fn hint(mut self, hint: &'a Array) -> Self {
+        self.hint = Some(hint);
+        self
+    }
+
+    /// An IP-Adapter reference image, `[1, h, w, 3]` in **`[0, 1]`** — CLIP's
+    /// range, not the VAE's. The two are the same shape and dtype.
+    pub fn reference(mut self, reference: &'a Array) -> Self {
+        self.reference = Some(reference);
+        self
+    }
+
+    /// GLIGEN grounding boxes, in normalised `[0, 1]` coordinates.
+    pub fn boxes(mut self, boxes: &'a [GroundedBox]) -> Self {
+        self.boxes = boxes;
+        self
+    }
+
+    /// Per-region prompts, blended into the prediction before each step.
+    pub fn regions(mut self, regions: &'a [Region]) -> Self {
+        self.regions = regions;
+        self
+    }
+
+    /// Reuse the model's prediction while it is estimated not to have moved
+    /// much. **Predicted relative change accumulated since the last real
+    /// evaluation**, so 0.2 means "reuse until the output is estimated to have
+    /// drifted 20%" — a statement about the model rather than an arbitrary
+    /// dial. 0 disables it bit-identically, and an ancestral sampler refuses it.
+    pub fn cache_threshold(mut self, threshold: f64) -> Self {
+        self.cache_threshold = threshold;
+        self
+    }
+
+    pub fn cancel(mut self, cancel: Cancel) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+}
+
 /// The per-run conditioning that is not the prompt.
 ///
 /// Bundled because the sampling loop needs all of it and none of it belongs to
@@ -214,6 +287,8 @@ struct Extras<'a> {
     /// Checked once per step. A step is not interruptible internally, so
     /// cancelling costs at most one step of latency.
     cancel: Option<Cancel>,
+    /// Wrap every convolution at the image edge, so the result tiles.
+    seamless: bool,
 }
 
 impl Default for Extras<'_> {
@@ -225,6 +300,7 @@ impl Default for Extras<'_> {
             regions: &[],
             cache_threshold: 0.0,
             cancel: None,
+            seamless: false,
         }
     }
 }
@@ -364,6 +440,43 @@ impl MlxPipeline {
     /// Load SD 1.5 from a `diffusers` model directory, on the GPU.
     pub fn load(root: &Path) -> Result<Self, PipelineError> {
         Self::load_on(root, Device::default())
+    }
+
+    /// [`Self::load`] on a named device, at a named precision.
+    ///
+    /// **f16 is a different sample, not a worse one.** Measured on SD 1.5 at
+    /// 768x768: 1.10x faster, 1.15 GB smaller, PSNR 36.8 dB against the f32
+    /// image. It is not the default because every golden test in this project
+    /// is verified at f32 tolerances, and because SD 1.5 fits either way — the
+    /// residency saving is the interesting half, and that matters for SDXL and
+    /// the DiTs rather than here.
+    pub fn load_with(
+        root: &Path,
+        device: Device,
+        precision: Precision,
+    ) -> Result<Self, PipelineError> {
+        let mut pipe = Self::load_on(root, device)?;
+        if precision == Precision::F16 {
+            pipe.cast_to_f16()?;
+        }
+        Ok(pipe)
+    }
+
+    /// Cast the diffusion weights to f16, in place.
+    ///
+    /// **The UNet and the VAE only.** The text encoder stays f32: CLIP's
+    /// activations peak around 851, and while that is inside f16's range the
+    /// conditioning is computed once per run rather than once per step, so
+    /// casting it saves nothing measurable and spends the one place in the
+    /// pipeline where a magnitude problem has already been found once.
+    fn cast_to_f16(&mut self) -> Result<(), PipelineError> {
+        let s = &self.stream;
+        for w in [&mut self.unet, &mut self.vae] {
+            for v in w.values_mut() {
+                *v = v.to_f16(s)?;
+            }
+        }
+        Ok(())
     }
 
     /// [`Self::load`] on a named device.
@@ -740,17 +853,18 @@ impl MlxPipeline {
     /// An empty prompt is *not* an empty sequence: it is BOS followed by 76
     /// EOS, which is what the tokenizer produces and what the model was trained
     /// against. Feeding a zero tensor instead is a different unconditional.
-    fn encode(&self, prompt: &str) -> Result<Array, PipelineError> {
+    fn encode(&self, prompt: &str, skip: usize) -> Result<Array, PipelineError> {
         if self.embeddings.is_empty() {
             let ids = self.token_ids(prompt)?;
-            return Ok(clip::text_encoder_with(
+            return Ok(clip::text_encoder_skipping(
                 &ids,
                 &self.clip_cfg,
+                skip,
                 &self.text_encoder,
                 &self.stream,
             )?);
         }
-        self.encode_with_embeddings(prompt)
+        self.encode_with_embeddings(prompt, skip)
     }
 
     /// Encode a prompt with textual-inversion embeddings spliced in.
@@ -762,7 +876,7 @@ impl MlxPipeline {
     ///
     /// The positions are found by matching token ids, **not character
     /// offsets**: BPE splits are not positions in the string.
-    fn encode_with_embeddings(&self, prompt: &str) -> Result<Array, PipelineError> {
+    fn encode_with_embeddings(&self, prompt: &str, skip: usize) -> Result<Array, PipelineError> {
         let s = &self.stream;
         let mut expanded = prompt.to_string();
         for (trigger, vectors) in &self.embeddings {
@@ -812,9 +926,10 @@ impl MlxPipeline {
                 }
             }
         }
-        Ok(clip::encode_from_embeds(
+        Ok(clip::encode_from_embeds_skipping(
             &embeds,
             &self.clip_cfg,
+            skip,
             &self.text_encoder,
             s,
         )?)
@@ -853,23 +968,28 @@ impl MlxPipeline {
     /// the unconditional. Reversing it runs and drives the image away from the
     /// prompt instead of toward it.
     fn conditioning(&self, cfg: &Txt2ImgConfig) -> Result<Array, PipelineError> {
-        let cond = self.encode(&cfg.prompt)?;
-        let uncond = self.encode(&cfg.negative_prompt)?;
+        let skip = cfg.clip_skip.get();
+        let cond = self.encode(&cfg.prompt, skip)?;
+        let uncond = self.encode(&cfg.negative_prompt, skip)?;
         Ok(concat(&[&uncond, &cond], 0, &self.stream)?)
     }
 
-    /// The sigma ladder for a sampler and step count.
-    fn sigmas(&self, sampler: SamplerKind, steps: usize) -> Vec<f64> {
-        match sampler {
+    /// The sigma ladder for a run.
+    ///
+    /// **LCM ignores the scheduler**, and that is not an oversight: its ladder
+    /// comes from the distillation's own timestep subset, so respacing it is
+    /// not a different schedule but a broken one.
+    fn sigmas(&self, cfg: &Txt2ImgConfig) -> Vec<f64> {
+        match cfg.sampler {
             SamplerKind::Lcm => sd_sample::lcm_sigmas(
                 &self.schedule,
                 &sd_sample::lcm_timesteps(
                     self.schedule.alphas_cumprod.len(),
                     sd_sample::ORIGINAL_INFERENCE_STEPS,
-                    steps,
+                    cfg.steps,
                 ),
             ),
-            _ => sigmas_for_steps(&self.schedule, steps),
+            _ => sd_sample::sigmas_for(cfg.scheduler, &self.schedule.sigmas(), cfg.steps),
         }
     }
 
@@ -906,6 +1026,12 @@ impl MlxPipeline {
         rng: &mut SeededRng,
         progress: ProgressFn<'_>,
     ) -> Result<Array, PipelineError> {
+        // **Held here, not at the public entry points.** Seamless has to reach
+        // every convolution, and there are eight ways into this function; a
+        // guard placed at each is a guard that one of them will come to miss,
+        // and a run that tiles in the sampler but not the decoder has a seam
+        // with nothing to point at. `decode` holds the other half.
+        let _seamless = sd_models::mlx::SeamlessGuard::new(extras.seamless);
         let s = &self.stream;
         let [nframes, lh, lw, lc] = latent.shape()[..] else {
             return Err(msg(format!(
@@ -951,12 +1077,12 @@ impl MlxPipeline {
         // moving and there is nothing to reuse — a caller who asked for
         // caching and got none would wonder why, and one who got it anyway
         // would get colour speckle.
-        if extras.cache_threshold > 0.0 && !matches!(sampler, SamplerKind::DpmPlusPlus2M) {
-            return Err(msg(
-                "mlx: step caching needs a deterministic sampler; euler_a and lcm re-noise \
-                 every step and leave nothing to reuse"
-                    .into(),
-            ));
+        if extras.cache_threshold > 0.0 && sampler.is_ancestral() {
+            return Err(msg(format!(
+                "mlx: step caching needs a deterministic sampler; {} re-noises every step and \
+                 leaves nothing to reuse. Try dpmpp2m, euler, heun or ddim",
+                sampler.name()
+            )));
         }
         // The reused prediction, the last timestep embedding, and the
         // accumulated *predicted* relative change in the model's output.
@@ -974,47 +1100,15 @@ impl MlxPipeline {
             }
             let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
 
-            let latent_in = sample::scale_model_input(&latent, sigma, s)?;
-            let t = self.timestep_for(sigma);
-            // One entry per row of the doubled batch, not one per guidance
-            // half.
-            let timestep = Array::from_slice_f32(&vec![t; 2 * nframes], &[2 * nframes])?;
-
-            // Several ControlNets sum. Running them here rather than once
-            // outside the loop is not an optimisation missed: each is
-            // conditioned on the current latent and timestep, so its
-            // corrections differ every step.
-            let control = self.control_for(&latent_in, &timestep, &context, extras.hint)?;
-            // The adapter walks its layers in visit order, so its counter has
-            // to start from zero on every step rather than continue across a
-            // run. `unet_forward_adapters` rewinds it.
-            let ip = extras.ip_tokens.as_ref().map(|tokens| {
-                ip::IpAdapter::new(
-                    &self.ip.as_ref().expect("tokens imply an adapter").weights,
-                    tokens.contiguous(s).expect("tokens"),
-                    self.ip.as_ref().expect("adapter").scale,
-                )
-            });
-            let m = self.motion.as_ref().map(|(w, frames)| Motion {
-                weights: w,
-                // The guidance batch doubles the rows, so the UNet sees
-                // `2 * f` and each half is one clip. Passing `f` here is what
-                // makes the regrouping split them correctly.
-                frames: *frames,
-            });
-            let ad = Adapters {
-                control: control.as_ref(),
-                ip: ip.as_ref(),
-                objs: extras.objs,
-                motion: m.as_ref(),
-            };
             // **The cache predictor is the timestep embedding**, not the
             // latent. TeaCache's method: measure how far the embedding moved,
             // rescale it through a fitted polynomial into an estimate of how
             // far the *output* would move, and accumulate. `cache_rescale` is
-            // scalar and shared with the candle path, so the two cannot fit
-            // different curves.
+            // scalar and shared with the config crate, so a caller cannot fit
+            // a different curve.
             let reuse = if extras.cache_threshold > 0.0 {
+                let t = self.timestep_for(sigma);
+                let timestep = Array::from_slice_f32(&vec![t; 2 * nframes], &[2 * nframes])?;
                 let temb = timestep_embedding(&timestep, 320, &self.unet, s)?;
                 let moved = match &previous_temb {
                     Some(prev) => sample::relative_l1(&temb, prev, s)?,
@@ -1035,29 +1129,14 @@ impl MlxPipeline {
                     .expect("reuse implies a cached prediction")
                     .contiguous(s)?
             } else {
-                let out = unet_forward_adapters(
-                    &latent_in,
-                    &timestep,
+                let guided = self.predict(
+                    &latent,
+                    sigma,
                     &context,
-                    None,
-                    class_embeds,
-                    &ad,
-                    &self.cfg,
-                    &self.unet,
-                    s,
-                )?;
-                let guided = sample::guidance(&out, cfg_scale, s)?;
-                // Regions blend *before* the step, not after: compositing two
-                // finished images produces visible joins because neither half
-                // ever saw the other.
-                let guided = self.blend_regions(
-                    &guided,
-                    &latent_in,
-                    &timestep,
                     cfg_scale,
                     class_embeds,
-                    &ad,
                     extras,
+                    nframes,
                     s,
                 )?;
                 evaluated += 1;
@@ -1068,13 +1147,75 @@ impl MlxPipeline {
             let denoised = sample::denoise_epsilon(&latent, &noise_pred, sigma, s)?;
 
             latent = match sampler {
-                // Ancestral: a fresh draw every step, which is why step
-                // caching is refused with it on the candle side too.
+                // Ancestral: the deterministic part lands at `sigma_down`,
+                // below `sigma_next`, and fresh noise brings it back up.
+                // Stepping to `sigma_next` *and* adding noise overshoots.
                 SamplerKind::EulerAncestral | SamplerKind::Lcm => {
                     let noise = draw_all(rng)?;
                     sample::euler_ancestral_step(&latent, &denoised, sigma, sigma_next, &noise, s)?
                 }
+                // Euler and DDIM at eta = 0 are the same update written in two
+                // coordinate systems; both names are offered because every
+                // paper reports against one of them.
+                SamplerKind::Euler | SamplerKind::Ddim => {
+                    sample::euler_step(&latent, &denoised, sigma, sigma_next, s)?
+                }
                 SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next, s)?,
+                // **Two evaluations.** An Euler step, then the model again at
+                // where it landed, then the average of the two derivatives.
+                // At the last step `sigma_next` is 0 and there is nothing to
+                // evaluate, so it degenerates to Euler rather than dividing by
+                // zero — the weights say so, and the branch avoids the wasted
+                // forward.
+                SamplerKind::Heun => {
+                    if sigma_next <= 0.0 {
+                        sample::euler_step(&latent, &denoised, sigma, sigma_next, s)?
+                    } else {
+                        let euler = sample::euler_step(&latent, &denoised, sigma, sigma_next, s)?;
+                        let pred_next = self.predict(
+                            &euler,
+                            sigma_next,
+                            &context,
+                            cfg_scale,
+                            class_embeds,
+                            extras,
+                            nframes,
+                            s,
+                        )?;
+                        evaluated += 1;
+                        let denoised_next =
+                            sample::denoise_epsilon(&euler, &pred_next, sigma_next, s)?;
+                        sample::heun_step(&latent, &denoised, &denoised_next, sigma, sigma_next, s)?
+                    }
+                }
+                // **Two evaluations**, and the midpoint is geometric in sigma
+                // — DPM-Solver integrates in `lambda = -log(sigma)`, so an
+                // arithmetic midpoint silently drops the method to first order.
+                SamplerKind::DpmPlusPlus2SAncestral => {
+                    let (sigma_up, sigma_down) = steps::ancestral_split(sigma, sigma_next, 1.0);
+                    let stepped = if sigma_down <= 0.0 {
+                        denoised.contiguous(s)?
+                    } else {
+                        let (sigma_mid, a, b) = steps::dpmpp_2s_midpoint(sigma, sigma_down);
+                        let mid = sample::blend(&latent, &denoised, a, b, s)?;
+                        let pred_mid = self.predict(
+                            &mid,
+                            sigma_mid,
+                            &context,
+                            cfg_scale,
+                            class_embeds,
+                            extras,
+                            nframes,
+                            s,
+                        )?;
+                        evaluated += 1;
+                        let denoised_mid = sample::denoise_epsilon(&mid, &pred_mid, sigma_mid, s)?;
+                        let (c, d) = steps::dpmpp_2s_step(sigma, sigma_down);
+                        sample::blend(&latent, &denoised_mid, c, d, s)?
+                    };
+                    let noise = draw_all(rng)?;
+                    sample::add_noise(&stepped, &noise, sigma_up, s)?
+                }
             };
 
             // Inpainting: restore outside the mask at every step, so the model
@@ -1093,6 +1234,90 @@ impl MlxPipeline {
             });
         }
         Ok(latent)
+    }
+
+    /// One model evaluation: latent and sigma in, a guided noise prediction out.
+    ///
+    /// Extracted from the sampling loop because **the second-order samplers
+    /// call it twice per step.** Heun evaluates again at the point its Euler
+    /// half landed on; DPM++ 2S evaluates at a midpoint. Inlining this in the
+    /// loop, as it used to be, made those samplers unimplementable without
+    /// duplicating the adapter plumbing — which is exactly where a ControlNet
+    /// or an IP-Adapter would come to be applied on one evaluation and not the
+    /// other.
+    ///
+    /// Returns the **guided epsilon**, not `denoised`, because that is what the
+    /// step cache stores: caching after the epsilon-to-x0 conversion would tie
+    /// a cached value to the sigma it was computed at.
+    #[allow(clippy::too_many_arguments)]
+    fn predict(
+        &self,
+        latent: &Array,
+        sigma: f64,
+        context: &Array,
+        cfg_scale: f64,
+        class_embeds: Option<&Array>,
+        extras: &Extras<'_>,
+        nframes: usize,
+        s: &Stream,
+    ) -> Result<Array, PipelineError> {
+        let latent_in = sample::scale_model_input(latent, sigma, s)?;
+        let t = self.timestep_for(sigma);
+        // One entry per row of the doubled batch, not one per guidance half.
+        let timestep = Array::from_slice_f32(&vec![t; 2 * nframes], &[2 * nframes])?;
+
+        // Several ControlNets sum. Running them here rather than once outside
+        // the loop is not an optimisation missed: each is conditioned on the
+        // current latent and timestep, so its corrections differ every step —
+        // and differ between the two halves of a second-order step too.
+        let control = self.control_for(&latent_in, &timestep, context, extras.hint)?;
+        // The adapter walks its layers in visit order, so its counter has to
+        // start from zero on every evaluation rather than continue across a
+        // run. `unet_forward_adapters` rewinds it.
+        let ip = extras.ip_tokens.as_ref().map(|tokens| {
+            ip::IpAdapter::new(
+                &self.ip.as_ref().expect("tokens imply an adapter").weights,
+                tokens.contiguous(s).expect("tokens"),
+                self.ip.as_ref().expect("adapter").scale,
+            )
+        });
+        let m = self.motion.as_ref().map(|(w, frames)| Motion {
+            weights: w,
+            // The guidance batch doubles the rows, so the UNet sees `2 * f` and
+            // each half is one clip. Passing `f` here is what makes the
+            // regrouping split them correctly.
+            frames: *frames,
+        });
+        let ad = Adapters {
+            control: control.as_ref(),
+            ip: ip.as_ref(),
+            objs: extras.objs,
+            motion: m.as_ref(),
+        };
+        let out = unet_forward_adapters(
+            &latent_in,
+            &timestep,
+            context,
+            None,
+            class_embeds,
+            &ad,
+            &self.cfg,
+            &self.unet,
+            s,
+        )?;
+        let guided = sample::guidance(&out, cfg_scale, s)?;
+        // Regions blend *before* the step, not after: compositing two finished
+        // images produces visible joins because neither half ever saw the other.
+        self.blend_regions(
+            &guided,
+            &latent_in,
+            &timestep,
+            cfg_scale,
+            class_embeds,
+            &ad,
+            extras,
+            s,
+        )
     }
 
     /// Blend each region's own noise prediction into the base one.
@@ -1217,7 +1442,16 @@ impl MlxPipeline {
     /// largest single allocation by `n` — which is how a three-frame 512
     /// decode reaches 6.8 GiB on the candle side. Looping gives identical
     /// output at one frame's peak.
-    fn decode(&self, latent: &Array) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+    fn decode(
+        &self,
+        latent: &Array,
+        seamless: bool,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        // A parameter rather than a field, so that adding a decode path is a
+        // compile error until it says whether it tiles. The decoder is
+        // convolutional too: a latent that wraps, decoded with zero padding,
+        // has a seam again.
+        let _seamless = sd_models::mlx::SeamlessGuard::new(seamless);
         let s = &self.stream;
         let n = latent.shape()[0];
         let mut out: Vec<u8> = Vec::new();
@@ -1321,7 +1555,7 @@ impl MlxPipeline {
         }
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
         let context = self.conditioning(cfg)?;
-        let sigmas = self.sigmas(cfg.sampler, cfg.steps);
+        let sigmas = self.sigmas(cfg);
 
         let ip_tokens = match reference {
             Some(image) => self.ip_tokens(image)?,
@@ -1335,6 +1569,7 @@ impl MlxPipeline {
             regions: extras_in.map_or(&[][..], |e| e.regions),
             cache_threshold: extras_in.map_or(0.0, |e| e.cache_threshold),
             cancel: extras_in.and_then(|e| e.cancel.clone()),
+            seamless: cfg.seamless,
         };
 
         // **One draw per frame, in order.** A clip is a batch, so the latent is
@@ -1361,33 +1596,47 @@ impl MlxPipeline {
             rng,
             progress,
         )?;
-        self.decode(&latent)
+        self.decode(&latent, cfg.seamless)
     }
 
-    /// [`Self::txt2img`] reporting progress after each step, with optional
-    /// step caching, cancellation and per-region prompts.
+    /// [`Self::txt2img`] with everything optional supplied by name.
     ///
-    /// `cache_threshold` is *predicted relative change in the model's output*,
-    /// accumulated since the last real evaluation — so 0.2 means "reuse until
-    /// the prediction is estimated to have drifted 20 %", which is a statement
-    /// about the model rather than an arbitrary metric. 0 disables it
-    /// bit-identically.
-    #[allow(clippy::too_many_arguments)]
-    pub fn txt2img_with(
+    /// This used to take eight positional parameters, two of them adjacent
+    /// `Option<&Array>` that the compiler cannot tell apart — so passing a
+    /// control map where a reference image belonged compiled and produced a
+    /// wrong picture. Build a [`Request`] instead:
+    ///
+    /// ```no_run
+    /// # use stable_diffusion_rs::mlx::{MlxPipeline, Request};
+    /// # use stable_diffusion_rs::config::Txt2ImgConfig;
+    /// # fn f(pipe: &MlxPipeline, cfg: &Txt2ImgConfig) -> Result<(), Box<dyn std::error::Error>> {
+    /// let (w, h, rgb) = pipe.run(Request::new(cfg).cache_threshold(0.2))?;
+    /// # Ok(()) }
+    /// ```
+    pub fn run(&self, request: Request<'_>) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        self.run_with(request, &mut |_| {})
+    }
+
+    /// [`Self::run`], reporting progress after each step.
+    pub fn run_with(
         &self,
-        cfg: &Txt2ImgConfig,
-        hint: Option<&Array>,
-        reference: Option<&Array>,
-        boxes: &[GroundedBox],
-        regions: &[Region],
-        cache_threshold: f64,
-        cancel: Option<Cancel>,
+        request: Request<'_>,
         progress: ProgressFn<'_>,
     ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        let Request {
+            cfg,
+            hint,
+            reference,
+            boxes,
+            regions,
+            cache_threshold,
+            cancel,
+        } = request;
         let extras = Extras {
             regions,
             cache_threshold,
             cancel,
+            seamless: cfg.seamless,
             ..Default::default()
         };
         let mut rng = SeededRng::new(cfg.seed);
@@ -1401,6 +1650,38 @@ impl MlxPipeline {
             Some(&extras),
             progress,
         )
+    }
+
+    /// Every image a [`Txt2ImgConfig::batch_count`] asks for, from one load.
+    ///
+    /// **Seeds run `seed`, `seed + 1`, ...**, so image 3 of a batch is the same
+    /// picture as a single run at `seed + 2`. A batch that shared one seed
+    /// would produce one image N times; a batch seeded from a clock would not
+    /// be reproducible at all.
+    pub fn run_batch(
+        &self,
+        request: Request<'_>,
+        progress: ProgressFn<'_>,
+    ) -> Result<Vec<(usize, usize, Vec<u8>)>, PipelineError> {
+        let n = request.cfg.batch_count.max(1);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let cfg = Txt2ImgConfig {
+                seed: request.cfg.seed_for(i),
+                ..request.cfg.clone()
+            };
+            let one = Request {
+                cfg: &cfg,
+                hint: request.hint,
+                reference: request.reference,
+                boxes: request.boxes,
+                regions: request.regions,
+                cache_threshold: request.cache_threshold,
+                cancel: request.cancel.clone(),
+            };
+            out.push(self.run_with(one, progress)?);
+        }
+        Ok(out)
     }
 
     /// Two passes: compose at `cfg`'s size, enlarge the latent, refine at the
@@ -1457,10 +1738,10 @@ impl MlxPipeline {
             seed: cfg.seed.wrapping_add(1),
             ..cfg.clone()
         };
-        let sigmas = self.sigmas(second.sampler, second.steps);
+        let sigmas = self.sigmas(&second);
         let start = strength.start_index(second.steps);
         if start >= second.steps {
-            return self.decode(&enlarged);
+            return self.decode(&enlarged, second.seamless);
         }
         let mut rng = SeededRng::new(second.seed);
         let noise = draw_noise(&mut rng, 4, lh, lw)?;
@@ -1478,7 +1759,7 @@ impl MlxPipeline {
             &mut rng,
             progress,
         )?;
-        self.decode(&latent)
+        self.decode(&latent, second.seamless)
     }
 
     /// One txt2img pass, stopping at the latent.
@@ -1490,7 +1771,7 @@ impl MlxPipeline {
     ) -> Result<Array, PipelineError> {
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
         let context = self.conditioning(cfg)?;
-        let sigmas = self.sigmas(cfg.sampler, cfg.steps);
+        let sigmas = self.sigmas(cfg);
         let latent =
             draw_noise(rng, 4, lh, lw)?.mul(&Array::scalar_f32(sigmas[0] as f32)?, &self.stream)?;
         self.denoise(
@@ -1557,11 +1838,11 @@ impl MlxPipeline {
             return Err(msg(format!("mlx: the encoder returned {:?}", init.shape())));
         };
 
-        let sigmas = self.sigmas(cfg.sampler, cfg.steps);
+        let sigmas = self.sigmas(cfg);
         let start = strength.start_index(cfg.steps);
         // Strength 0 means "return the input", and there is nothing to run.
         if start >= cfg.steps {
-            return self.decode(&init);
+            return self.decode(&init, cfg.seamless);
         }
 
         let mut rng = SeededRng::new(cfg.seed);
@@ -1582,7 +1863,7 @@ impl MlxPipeline {
             &mut rng,
             &mut |_| {},
         )?;
-        self.decode(&latent)
+        self.decode(&latent, cfg.seamless)
     }
 
     /// The stream this pipeline runs on, for callers that build their own

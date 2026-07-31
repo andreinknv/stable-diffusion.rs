@@ -21,13 +21,109 @@ fn main() {
 #[cfg(feature = "mlx")]
 use anyhow::{Context, Result};
 #[cfg(feature = "mlx")]
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 #[cfg(feature = "mlx")]
 use stable_diffusion_rs as sd;
 #[cfg(feature = "mlx")]
 use stable_diffusion_rs::config::Txt2ImgConfig;
 #[cfg(feature = "mlx")]
 use stable_diffusion_rs::tensor::mlx::Device;
+
+/// The flags that describe a *generation*, shared by every command that does
+/// one.
+///
+/// Flattened rather than repeated per subcommand: the previous shape passed
+/// eight of these positionally into a `config` helper, which is how `--seed`
+/// and `--steps` come to be swapped at one call site and not another.
+#[cfg(feature = "mlx")]
+#[derive(Args, Clone)]
+struct Generation {
+    #[arg(long)]
+    prompt: String,
+    #[arg(long, default_value = "")]
+    negative_prompt: String,
+    #[arg(long, default_value_t = 512)]
+    width: usize,
+    #[arg(long, default_value_t = 512)]
+    height: usize,
+    #[arg(long, default_value_t = 20)]
+    steps: usize,
+    #[arg(long, default_value_t = 7.5)]
+    cfg_scale: f64,
+    /// A batch runs `seed`, `seed + 1`, ... so each image is individually
+    /// reproducible rather than only the batch as a whole.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    /// `euler-a`, `euler`, `heun`, `dpmpp2m`, `dpmpp2s-a`, `ddim`, or `lcm`.
+    ///
+    /// **`heun` and `dpmpp2s-a` evaluate the model twice per step**, so twenty
+    /// of their steps cost about what forty Euler steps do.
+    #[arg(long, default_value = "euler-a")]
+    sampler: String,
+    /// `discrete`, `karras`, `exponential`, or `sgm-uniform`.
+    ///
+    /// **Karras is what most published step counts assume.** Running someone
+    /// else's "20 steps, DPM++ 2M" recipe on the discrete ladder compares two
+    /// different schedules.
+    #[arg(long, default_value = "discrete")]
+    scheduler: String,
+    /// How many CLIP layers to discard from the end. 1 is what SD 1.5 was
+    /// trained with; **2 is what most community finetunes expect**, and using
+    /// 1 on one of those is not an error, just a flatter picture.
+    #[arg(long, default_value_t = 1)]
+    clip_skip: usize,
+    /// Generate this many images. The model is loaded once for all of them.
+    #[arg(long, short = 'n', default_value_t = 1)]
+    batch_count: usize,
+    /// `f32` or `f16`. Measured on SD 1.5 at 768: f16 is 1.10x faster and
+    /// 1.15 GB smaller, at PSNR 36.8 dB from the f32 image — a different
+    /// sample of comparable quality, not a degraded one.
+    #[arg(long, default_value = "f32")]
+    precision: String,
+    /// Make the image tile: convolutions wrap at the edge, in the decoder as
+    /// well as the UNet, so opposite edges agree where they meet.
+    #[arg(long)]
+    seamless: bool,
+}
+
+#[cfg(feature = "mlx")]
+impl Generation {
+    fn to_config(&self) -> Result<Txt2ImgConfig> {
+        use stable_diffusion_rs::config::{ClipSkip, Precision, SamplerKind, Scheduler};
+        Ok(Txt2ImgConfig {
+            prompt: self.prompt.clone(),
+            negative_prompt: self.negative_prompt.clone(),
+            width: self.width,
+            height: self.height,
+            steps: self.steps,
+            cfg_scale: self.cfg_scale,
+            seed: self.seed,
+            sampler: SamplerKind::parse(&self.sampler).with_context(|| {
+                format!(
+                    "unknown sampler {:?}; try one of: {}",
+                    self.sampler,
+                    SamplerKind::all()
+                        .iter()
+                        .map(|s| s.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?,
+            scheduler: Scheduler::parse(&self.scheduler).with_context(|| {
+                format!(
+                    "unknown scheduler {:?}; try discrete, karras, exponential or sgm-uniform",
+                    self.scheduler
+                )
+            })?,
+            clip_skip: ClipSkip::new(self.clip_skip),
+            batch_count: self.batch_count.max(1),
+            precision: Precision::parse(&self.precision).with_context(|| {
+                format!("unknown precision {:?}; try f32 or f16", self.precision)
+            })?,
+            seamless: self.seamless,
+        })
+    }
+}
 
 #[cfg(feature = "mlx")]
 #[derive(Parser)]
@@ -57,25 +153,11 @@ enum Command {
     #[command(name = "txt2img")]
     Txt2Img {
         /// Model directory in the standard diffusers layout.
+        /// Model directory in the standard diffusers layout.
         #[arg(long)]
         model: String,
-        #[arg(long)]
-        prompt: String,
-        #[arg(long, default_value = "")]
-        negative_prompt: String,
-        #[arg(long, default_value_t = 512)]
-        width: usize,
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
-        #[arg(long, default_value_t = 7.5)]
-        cfg_scale: f64,
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-        /// `euler-a`, `dpmpp2m`, or `lcm` (needs an LCM model or --lora).
-        #[arg(long, default_value = "euler-a")]
-        sampler: String,
+        #[command(flatten)]
+        gen: Generation,
         #[arg(short, long, default_value = "out.png")]
         output: String,
         /// Treat the model directory as SDXL (two text encoders).
@@ -131,28 +213,14 @@ enum Command {
         model: String,
         #[arg(long)]
         init: String,
-        #[arg(long)]
-        prompt: String,
-        #[arg(long, default_value = "")]
-        negative_prompt: String,
         /// How much of the schedule to replace. 0 returns the input.
         #[arg(long, default_value_t = 0.75)]
         strength: f64,
         /// Repaint only where this mask is white.
         #[arg(long)]
         mask: Option<String>,
-        #[arg(long, default_value_t = 512)]
-        width: usize,
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
-        #[arg(long, default_value_t = 7.5)]
-        cfg_scale: f64,
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-        #[arg(long, default_value = "euler-a")]
-        sampler: String,
+        #[command(flatten)]
+        gen: Generation,
         #[arg(short, long, default_value = "out.png")]
         output: String,
     },
@@ -171,32 +239,137 @@ enum Command {
         output: String,
     },
 
+    /// Generate with Flux — schnell, dev, or flux-mini.
+    ///
+    /// **Quantised at rest by default.** Flux schnell is 12B parameters; held
+    /// dense it needs about 48 GB, and at 4 bits with the sensitive layers at
+    /// 8 it runs in 13.3 GB alongside T5-XXL.
+    Flux {
+        /// A `diffusers` Flux directory. With `--transformer-gguf` this is
+        /// only used for the pieces not given explicitly.
+        #[arg(long)]
+        model: String,
+        /// `schnell`, `dev`, or `mini`.
+        ///
+        /// **Not cosmetic.** schnell has 19 double blocks and no guidance
+        /// embedding; dev has 19 and one. Passing a guidance scale to schnell
+        /// is an error rather than a silent no-op.
+        #[arg(long, default_value = "schnell")]
+        variant: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+        #[arg(long, default_value_t = 4)]
+        steps: usize,
+        /// Distilled guidance. **dev only** — schnell refuses it.
+        #[arg(long, default_value_t = 3.5)]
+        guidance: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Bits for the bulk of the weights. The layers `quantized::sensitive`
+        /// names stay at 8 whatever this says.
+        #[arg(long, default_value_t = 4)]
+        bits: usize,
+        /// A Flux transformer GGUF, in black-forest-labs naming.
+        #[arg(long, requires = "t5_gguf")]
+        transformer_gguf: Option<String>,
+        /// A T5-XXL encoder GGUF, in llama.cpp naming.
+        #[arg(long)]
+        t5_gguf: Option<String>,
+        /// CLIP-L weights, when they are not under `--model`.
+        #[arg(long)]
+        clip: Option<String>,
+        /// VAE weights, when they are not under `--model`.
+        #[arg(long)]
+        vae: Option<String>,
+        /// The T5 sentencepiece model, when it is not under `--model`.
+        #[arg(long)]
+        t5_tokenizer: Option<String>,
+        #[arg(short, long, default_value = "out.png")]
+        output: String,
+    },
+
+    /// Generate with SD 3.5.
+    ///
+    /// Quantised at rest, like `flux`: SD 3.5 medium plus T5-XXL is 10.1 GB
+    /// at 4 bits against roughly 40 dense.
+    Sd3 {
+        /// An SD 3.5 directory. **The published one is incomplete** — it ships
+        /// no `text_encoder_3` and no tokenisers — so the explicit flags below
+        /// are the path a real checkpoint usually needs.
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+        #[arg(long, default_value_t = 512)]
+        width: usize,
+        #[arg(long, default_value_t = 512)]
+        height: usize,
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+        #[arg(long, default_value_t = 4.5)]
+        cfg_scale: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, default_value_t = 4)]
+        bits: usize,
+        /// The MMDiT weights, in Stability's original naming.
+        #[arg(long)]
+        transformer: Option<String>,
+        #[arg(long)]
+        vae: Option<String>,
+        #[arg(long)]
+        clip_l: Option<String>,
+        #[arg(long)]
+        clip_g: Option<String>,
+        /// T5-XXL, as safetensors or GGUF.
+        #[arg(long)]
+        t5: Option<String>,
+        #[arg(long)]
+        t5_tokenizer: Option<String>,
+        #[arg(short, long, default_value = "out.png")]
+        output: String,
+    },
+
+    /// Generate a variation of an image, or from a prompt through the prior.
+    ///
+    /// unCLIP conditions on a CLIP *image* embedding rather than a text one,
+    /// which is what makes "another picture like this one" a thing you can
+    /// ask for directly.
+    Unclip {
+        /// An unCLIP model directory.
+        #[arg(long)]
+        model: String,
+        /// A reference image. Without one the prompt goes through the prior.
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long, default_value = "")]
+        prompt: String,
+        #[arg(long, default_value_t = 768)]
+        width: usize,
+        #[arg(long, default_value_t = 768)]
+        height: usize,
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+        #[arg(long, default_value_t = 10.0)]
+        cfg_scale: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// How much noise to add to the image embedding. Higher is more
+        /// variation and less fidelity to the reference.
+        #[arg(long, default_value_t = 0)]
+        noise_level: usize,
+        #[arg(short, long, default_value = "out.png")]
+        output: String,
+    },
+
     /// Report what is on this machine.
     Info,
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(feature = "mlx")]
-fn config(
-    prompt: &str,
-    negative: &str,
-    width: usize,
-    height: usize,
-    steps: usize,
-    cfg_scale: f64,
-    seed: u64,
-    sampler: &str,
-) -> Result<Txt2ImgConfig> {
-    Ok(Txt2ImgConfig {
-        prompt: prompt.to_string(),
-        negative_prompt: negative.to_string(),
-        width,
-        height,
-        steps,
-        cfg_scale,
-        seed,
-        sampler: mlx_cli::parse_sampler(sampler)?,
-    })
 }
 
 /// Split `a=b` on its **first** `=`, so a prompt may contain one.
@@ -221,14 +394,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Txt2Img {
             model,
-            prompt,
-            negative_prompt,
-            width,
-            height,
-            steps,
-            cfg_scale,
-            seed,
-            sampler,
+            gen,
             output,
             sdxl,
             lora,
@@ -245,16 +411,7 @@ fn main() -> Result<()> {
             region,
             upscale,
         } => {
-            let cfg = config(
-                &prompt,
-                &negative_prompt,
-                width,
-                height,
-                steps,
-                cfg_scale,
-                seed,
-                &sampler,
-            )?;
+            let cfg = gen.to_config()?;
             let args = mlx_cli::Txt2ImgArgs {
                 model,
                 cfg,
@@ -289,28 +446,12 @@ fn main() -> Result<()> {
         Command::Img2Img {
             model,
             init,
-            prompt,
-            negative_prompt,
             strength,
             mask,
-            width,
-            height,
-            steps,
-            cfg_scale,
-            seed,
-            sampler,
+            gen,
             output,
         } => {
-            let cfg = config(
-                &prompt,
-                &negative_prompt,
-                width,
-                height,
-                steps,
-                cfg_scale,
-                seed,
-                &sampler,
-            )?;
+            let cfg = gen.to_config()?;
             for path in mlx_cli::run_img2img(
                 &model,
                 &cfg,
@@ -335,13 +476,148 @@ fn main() -> Result<()> {
             }
         }
 
+        Command::Flux {
+            model,
+            variant,
+            prompt,
+            width,
+            height,
+            steps,
+            guidance,
+            seed,
+            bits,
+            transformer_gguf,
+            t5_gguf,
+            clip,
+            vae,
+            t5_tokenizer,
+            output,
+        } => {
+            let args = mlx_cli::FluxArgs {
+                model,
+                variant,
+                cfg: stable_diffusion_rs::mlx::FluxRunConfig {
+                    prompt,
+                    width,
+                    height,
+                    steps,
+                    guidance,
+                    seed,
+                },
+                bits,
+                transformer_gguf,
+                t5_gguf,
+                clip,
+                vae,
+                t5_tokenizer,
+                output,
+            };
+            for path in mlx_cli::run_flux(&args, device)? {
+                println!("wrote {}", path.display());
+            }
+        }
+
+        Command::Sd3 {
+            model,
+            prompt,
+            negative_prompt,
+            width,
+            height,
+            steps,
+            cfg_scale,
+            seed,
+            bits,
+            transformer,
+            vae,
+            clip_l,
+            clip_g,
+            t5,
+            t5_tokenizer,
+            output,
+        } => {
+            let args = mlx_cli::Sd3Args {
+                model,
+                cfg: stable_diffusion_rs::mlx::Sd3RunConfig {
+                    prompt,
+                    negative_prompt,
+                    width,
+                    height,
+                    steps,
+                    cfg_scale,
+                    seed,
+                },
+                bits,
+                transformer,
+                vae,
+                clip_l,
+                clip_g,
+                t5,
+                t5_tokenizer,
+                output,
+            };
+            for path in mlx_cli::run_sd3(&args, device)? {
+                println!("wrote {}", path.display());
+            }
+        }
+
+        Command::Unclip {
+            model,
+            image,
+            prompt,
+            width,
+            height,
+            steps,
+            cfg_scale,
+            seed,
+            noise_level,
+            output,
+        } => {
+            let cfg = Txt2ImgConfig {
+                prompt,
+                width,
+                height,
+                steps,
+                cfg_scale,
+                seed,
+                ..Default::default()
+            };
+            for path in
+                mlx_cli::run_unclip(&model, &cfg, image.as_deref(), noise_level, &output, device)?
+            {
+                println!("wrote {}", path.display());
+            }
+        }
+
         Command::Info => {
+            use sd_tensor::ops::human_bytes;
             println!("sdrs {}", sd::VERSION);
             println!("backend: MLX ({device})");
             match sd_tensor::sysmem::available_bytes() {
-                Some(free) => println!("free memory: {}", sd_tensor::ops::human_bytes(free)),
+                Some(free) => println!("free memory: {}", human_bytes(free)),
                 None => println!("free memory: unknown"),
             }
+            // MLX's own accounting, not resident set size. On unified memory
+            // the two answer different questions, and RSS is the one that
+            // includes the memory-mapped checkpoint.
+            if let (Ok(active), Ok(cache)) = (
+                sd_tensor::mlx::active_memory(),
+                sd_tensor::mlx::cache_memory(),
+            ) {
+                println!(
+                    "mlx memory: {} live, {} cached",
+                    human_bytes(active as u64),
+                    human_bytes(cache as u64)
+                );
+            }
+            println!(
+                "samplers: {}",
+                stable_diffusion_rs::config::SamplerKind::all()
+                    .iter()
+                    .map(|s| s.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!("schedulers: discrete, karras, exponential, sgm-uniform");
         }
     }
     Ok(())

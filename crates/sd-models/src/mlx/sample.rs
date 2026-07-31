@@ -59,6 +59,59 @@ pub fn euler_ancestral_step(
     }
 }
 
+/// `a*x + b*denoised`, the shape every first-order step reduces to.
+///
+/// The weights come from `sd_sample::steps`, which is where the arithmetic is
+/// derived and tested; this is only the tensor spelling of it. Keeping the two
+/// apart is what lets Euler, DDIM and the deterministic half of an ancestral
+/// step share one implementation and one set of proofs.
+pub fn blend(x: &Array, denoised: &Array, a: f64, b: f64, s: &Stream) -> Result<Array> {
+    x.mul(&Array::scalar_f32(a as f32)?, s)?
+        .add(&denoised.mul(&Array::scalar_f32(b as f32)?, s)?, s)
+}
+
+/// A deterministic Euler step. Also DDIM at `eta = 0`, which is the same update.
+pub fn euler_step(
+    x: &Array,
+    denoised: &Array,
+    sigma: f64,
+    sigma_next: f64,
+    s: &Stream,
+) -> Result<Array> {
+    let (a, b) = sd_sample::steps::euler_weights(sigma, sigma_next);
+    blend(x, denoised, a, b, s)
+}
+
+/// The correction half of a Heun step.
+///
+/// `denoised_next` is the model's output at the point the Euler step landed on,
+/// which is why this takes two `denoised` tensors and why the sampler costs two
+/// evaluations. At `sigma_next == 0` the weights degenerate to Euler's and
+/// `denoised_next` contributes nothing — see `steps::heun_weights`.
+pub fn heun_step(
+    x: &Array,
+    denoised: &Array,
+    denoised_next: &Array,
+    sigma: f64,
+    sigma_next: f64,
+    s: &Stream,
+) -> Result<Array> {
+    let (a, b, c) = sd_sample::steps::heun_weights(sigma, sigma_next);
+    blend(x, denoised, a, b, s)?.add(&denoised_next.mul(&Array::scalar_f32(c as f32)?, s)?, s)
+}
+
+/// Add `sigma_up * noise` — the injection half of any ancestral step.
+///
+/// **A no-op at the last step**, where `sigma_up` is zero: the trajectory has
+/// arrived and adding noise back would hand the caller a noisy image with no
+/// error anywhere.
+pub fn add_noise(x: &Array, noise: &Array, sigma_up: f64, s: &Stream) -> Result<Array> {
+    if sigma_up <= 0.0 {
+        return x.contiguous(s);
+    }
+    x.add(&noise.mul(&Array::scalar_f32(sigma_up as f32)?, s)?, s)
+}
+
 /// Classifier-free guidance over a doubled batch, unconditional half first.
 ///
 /// **Splits in half rather than taking rows 0 and 1.** For a single image the

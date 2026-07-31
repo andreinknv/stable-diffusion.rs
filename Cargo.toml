@@ -29,6 +29,9 @@ stable-diffusion-rs = { path = "crates/stable-diffusion-rs", version = "0.0.1" }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+# PNG text chunks. The `image` crate has no way to attach one, and an image
+# that cannot say how it was made is the thing this replaces.
+png = "0.17"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

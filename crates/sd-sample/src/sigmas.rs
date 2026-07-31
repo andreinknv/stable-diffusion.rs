@@ -13,7 +13,15 @@ use super::Schedule;
 /// and returns noise. And it is `n + 1` long, because `n` steps need `n + 1`
 /// boundaries — the trailing zero is a real entry, not a sentinel.
 pub fn sigmas_for_steps(schedule: &Schedule, n: usize) -> Vec<f64> {
-    let train = schedule.sigmas();
+    sigmas_from(&schedule.sigmas(), n)
+}
+
+/// [`sigmas_for_steps`] over a training ladder that is already in hand.
+///
+/// Separate because `schedulers::sigmas_for` has the ladder and would
+/// otherwise rebuild the whole 1000-entry schedule to select twenty values
+/// from it.
+pub fn sigmas_from(train: &[f64], n: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(n + 1);
     if train.is_empty() || n == 0 {
         out.push(0.0);

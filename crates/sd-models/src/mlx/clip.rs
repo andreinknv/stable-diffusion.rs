@@ -222,8 +222,24 @@ pub fn encode_from_embeds(
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
+    encode_from_embeds_skipping(embeds, cfg, 1, w, s)
+}
+
+/// [`encode_from_embeds`] stopping `skip - 1` layers short of the end.
+///
+/// The clip-skip half of the textual-inversion path. `skip = 1` runs every
+/// layer, which is what SD 1.5 was trained with; see
+/// [`text_encoder_skipping`] for why the norm still applies.
+pub fn encode_from_embeds_skipping(
+    embeds: &Array,
+    cfg: &ClipConfig,
+    skip: usize,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
+    let run = cfg.layers.saturating_sub(skip.saturating_sub(1)).max(1);
     let mut h = embeds.contiguous(s)?;
-    for i in 0..cfg.layers {
+    for i in 0..run {
         h = encoder_layer(&h, cfg, w, &format!("text_model.encoder.layers.{i}"), s)?;
     }
     h.layer_norm(
@@ -243,6 +259,41 @@ pub fn text_encoder_with(
 ) -> Result<Array> {
     let mut h = embeddings(token_ids, w, s)?;
     for i in 0..cfg.layers {
+        h = encoder_layer(&h, cfg, w, &format!("text_model.encoder.layers.{i}"), s)?;
+    }
+    h.layer_norm(
+        Some(get(w, "text_model.final_layer_norm.weight")?),
+        Some(get(w, "text_model.final_layer_norm.bias")?),
+        CLIP_EPS,
+        s,
+    )
+}
+
+/// The tower run to `skip` layers from the end, then final-layer-normed.
+///
+/// **`skip = 1` is [`text_encoder_with`]** — every layer, which is what SD 1.5
+/// was trained with. `skip = 2` stops one short, which is what a large share of
+/// community finetunes expect; the picture is flatter and less on-model at the
+/// wrong setting, with nothing anywhere reporting a problem.
+///
+/// **Not the same as [`penultimate`]**, and the difference is the norm.
+/// `penultimate` returns the raw hidden state because that is SDXL's
+/// convention; clip-skip on SD 1.x still applies `final_layer_norm` to
+/// whichever layer it stopped at, because the model it conditions was trained
+/// on a normed sequence. The two are the same shape, so using one for the other
+/// runs and shifts the conditioning.
+pub fn text_encoder_skipping(
+    token_ids: &Array,
+    cfg: &ClipConfig,
+    skip: usize,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
+    // At least one layer runs, and skipping more than there are is clamped
+    // rather than underflowing into "all of them".
+    let run = cfg.layers.saturating_sub(skip.saturating_sub(1)).max(1);
+    let mut h = embeddings(token_ids, w, s)?;
+    for i in 0..run {
         h = encoder_layer(&h, cfg, w, &format!("text_model.encoder.layers.{i}"), s)?;
     }
     h.layer_norm(

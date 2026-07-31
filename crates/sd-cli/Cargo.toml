@@ -19,6 +19,7 @@ stable-diffusion-rs.workspace = true
 sd-tensor.workspace = true
 anyhow.workspace = true
 image.workspace = true
+png.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

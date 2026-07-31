@@ -1,15 +1,23 @@
 //! Noise schedules and samplers.
 //!
-//! Milestone 1 targets Euler ancestral and DPM++ 2M only. Breadth comes after
-//! the pipeline is verified end to end.
+//! Two independent choices, and conflating them is a common way to reproduce
+//! someone else's recipe and get a different picture:
+//!
+//! - **Which sigmas to visit** — [`schedulers`]. Karras, exponential,
+//!   sgm-uniform, or the discrete training ladder.
+//! - **How to step between them** — the sampler, in [`crate::steps`] for the
+//!   scalar coefficients and `sd_models::mlx::sample` for the tensor work.
 
 pub mod flow;
 pub mod lcm;
+pub mod schedulers;
 pub mod sigmas;
+pub mod steps;
 
 pub use flow::{flow_sigmas, flow_timesteps, FlowMatchConfig};
 pub use lcm::{lcm_sigmas, lcm_timesteps, ORIGINAL_INFERENCE_STEPS};
-pub use sigmas::sigmas_for_steps;
+pub use schedulers::{sigmas_for, Scheduler};
+pub use sigmas::{sigmas_for_steps, sigmas_from};
 
 /// Beta schedule shapes used by Stable Diffusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -89,7 +89,7 @@ impl Sd3Paths {
                 root.join("text_encoder_3/model-00002-of-00002.safetensors"),
             ],
             clip_tokenizer: root.join("tokenizer"),
-            t5_tokenizer: root.join("tokenizer_3/spiece.model"),
+            t5_tokenizer: root.join("tokenizer_3/tokenizer.json"),
         }
     }
 }
@@ -185,7 +185,7 @@ impl Sd3Pipeline {
 
         Ok(Self {
             clip_tokenizer: ClipTokenizer::open(&paths.clip_tokenizer)?,
-            t5_tokenizer: T5Tokenizer::from_file(&paths.t5_tokenizer, T5_LENGTH)?,
+            t5_tokenizer: T5Tokenizer::open(&paths.t5_tokenizer, T5_LENGTH)?,
             clip_l: load_safetensors(&paths.clip_l)?,
             clip_g: load_safetensors(&paths.clip_g)?,
             t5: t5w,
@@ -262,7 +262,7 @@ impl Sd3Pipeline {
 
         Ok(Self {
             clip_tokenizer: ClipTokenizer::open(clip_tokenizer)?,
-            t5_tokenizer: T5Tokenizer::from_file(t5_tokenizer, T5_LENGTH)?,
+            t5_tokenizer: T5Tokenizer::open(t5_tokenizer, T5_LENGTH)?,
             clip_l: load_safetensors(clip_l)?,
             clip_g: load_safetensors(clip_g)?,
             t5: t5w,

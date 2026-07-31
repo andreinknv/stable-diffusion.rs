@@ -28,7 +28,7 @@ use sd_models::mlx::{
     clip::{self, ClipConfig},
     normalise_legacy_attention, sample, unet_forward_adapters, vae, Adapters, UNetConfig, Weights,
 };
-use sd_sample::{sigmas_for_steps, Schedule};
+use sd_sample::{sigmas_for_steps, steps, Schedule};
 use sd_tensor::mlx::{concat, load_safetensors, Array, Device, Stream};
 use sd_tensor::rng::SeededRng;
 
@@ -185,12 +185,13 @@ impl SdxlPipeline {
         };
         let mut dpm = sample::DpmSolverPlusPlus2M::new();
 
-        for i in 0..sigmas.len().saturating_sub(1) {
-            let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
-            let latent_in = sample::scale_model_input(&latent, sigma, s)?;
+        // One model evaluation, as a closure rather than inline: the
+        // second-order samplers call it twice per step, at a point the first
+        // half of the step chooses.
+        let predict = |x: &Array, sigma: f64| -> Result<Array, PipelineError> {
+            let latent_in = sample::scale_model_input(x, sigma, s)?;
             let t = timestep_for(&self.schedule, sigma);
             let timestep = Array::from_slice_f32(&[t, t], &[2])?;
-
             let out = unet_forward_adapters(
                 &latent_in,
                 &timestep,
@@ -203,14 +204,45 @@ impl SdxlPipeline {
                 s,
             )?;
             let noise_pred = sample::guidance(&out, cfg_scale, s)?;
-            let denoised = sample::denoise_epsilon(&latent, &noise_pred, sigma, s)?;
+            Ok(sample::denoise_epsilon(x, &noise_pred, sigma, s)?)
+        };
+
+        for i in 0..sigmas.len().saturating_sub(1) {
+            let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+            let denoised = predict(&latent, sigma)?;
 
             latent = match sampler {
                 SamplerKind::EulerAncestral | SamplerKind::Lcm => {
                     let noise = draw_noise(rng, lc, lh, lw)?;
                     sample::euler_ancestral_step(&latent, &denoised, sigma, sigma_next, &noise, s)?
                 }
+                SamplerKind::Euler | SamplerKind::Ddim => {
+                    sample::euler_step(&latent, &denoised, sigma, sigma_next, s)?
+                }
                 SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next, s)?,
+                SamplerKind::Heun => {
+                    if sigma_next <= 0.0 {
+                        sample::euler_step(&latent, &denoised, sigma, sigma_next, s)?
+                    } else {
+                        let euler = sample::euler_step(&latent, &denoised, sigma, sigma_next, s)?;
+                        let denoised_next = predict(&euler, sigma_next)?;
+                        sample::heun_step(&latent, &denoised, &denoised_next, sigma, sigma_next, s)?
+                    }
+                }
+                SamplerKind::DpmPlusPlus2SAncestral => {
+                    let (sigma_up, sigma_down) = steps::ancestral_split(sigma, sigma_next, 1.0);
+                    let stepped = if sigma_down <= 0.0 {
+                        denoised.contiguous(s)?
+                    } else {
+                        let (sigma_mid, a, b) = steps::dpmpp_2s_midpoint(sigma, sigma_down);
+                        let mid = sample::blend(&latent, &denoised, a, b, s)?;
+                        let denoised_mid = predict(&mid, sigma_mid)?;
+                        let (c, d) = steps::dpmpp_2s_step(sigma, sigma_down);
+                        sample::blend(&latent, &denoised_mid, c, d, s)?
+                    };
+                    let noise = draw_noise(rng, lc, lh, lw)?;
+                    sample::add_noise(&stepped, &noise, sigma_up, s)?
+                }
             };
         }
         Ok(latent)

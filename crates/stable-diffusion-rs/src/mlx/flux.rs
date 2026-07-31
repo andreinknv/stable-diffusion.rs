@@ -72,7 +72,7 @@ impl FluxPaths {
             clip: root.join("text_encoder/model.safetensors"),
             t5: shards(&root.join("text_encoder_2"), "model"),
             clip_tokenizer: root.join("tokenizer"),
-            t5_tokenizer: root.join("tokenizer_2/spiece.model"),
+            t5_tokenizer: root.join("tokenizer_2/tokenizer.json"),
         }
     }
 }
@@ -216,7 +216,7 @@ impl FluxPipeline {
         };
         Ok(Self {
             clip_tokenizer: ClipTokenizer::open(&paths.clip_tokenizer)?,
-            t5_tokenizer: T5Tokenizer::from_file(&paths.t5_tokenizer, t5_len)?,
+            t5_tokenizer: T5Tokenizer::open(&paths.t5_tokenizer, t5_len)?,
             clip: load_safetensors(&paths.clip)?,
             t5: t5w,
             transformer,
@@ -277,7 +277,7 @@ impl FluxPipeline {
         };
         Ok(Self {
             clip_tokenizer: ClipTokenizer::open(clip_tokenizer)?,
-            t5_tokenizer: T5Tokenizer::from_file(t5_tokenizer, t5_len)?,
+            t5_tokenizer: T5Tokenizer::open(t5_tokenizer, t5_len)?,
             clip: load_safetensors(clip)?,
             t5: t5w,
             transformer,

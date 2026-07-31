@@ -354,6 +354,18 @@ unsafe extern "C" {
     ) -> i32;
     fn mlx_vector_array_free(vec: mlx_vector_array) -> i32;
     fn mlx_eval(outputs: mlx_vector_array) -> i32;
+
+    // Memory accounting. MLX tracks its own allocations, and on unified memory
+    // those are not visible as resident set size in any way you can attribute
+    // — which is why measuring a run with `/usr/bin/time -l` answers a
+    // different question from the one being asked.
+    fn mlx_get_active_memory(res: *mut usize) -> i32;
+    fn mlx_get_peak_memory(res: *mut usize) -> i32;
+    fn mlx_get_cache_memory(res: *mut usize) -> i32;
+    fn mlx_reset_peak_memory() -> i32;
+    fn mlx_set_wired_limit(res: *mut usize, limit: usize) -> i32;
+    fn mlx_set_cache_limit(res: *mut usize, limit: usize) -> i32;
+    fn mlx_clear_cache() -> i32;
     fn mlx_set_error_handler(
         handler: Option<unsafe extern "C" fn(*const c_char, *mut c_void)>,
         data: *mut c_void,
@@ -1184,6 +1196,43 @@ impl Array {
         self.mul(&gate, stream)
     }
 
+    /// Wrap `axes` by `amount`, taking the padding from the opposite edge.
+    ///
+    /// Circular padding, which is what makes an image tile: a convolution at
+    /// the left edge sees the right edge as its neighbour, so the two agree
+    /// where they meet. Zero padding instead makes every edge believe it
+    /// borders black, which is why an untreated image has a visible seam and a
+    /// darker border.
+    ///
+    /// Built from `narrow` and `concat` rather than a padding mode because MLX
+    /// exposes only zero padding in its convolution. **The convolution must
+    /// then be called with padding 0** — padding here *and* there pads twice.
+    pub fn pad_circular(&self, axes: &[usize], amount: usize, stream: &Stream) -> Result<Self> {
+        if amount == 0 {
+            return self.contiguous(stream);
+        }
+        let mut out = self.contiguous(stream)?;
+        for &axis in axes {
+            let len = *out
+                .shape()
+                .get(axis)
+                .ok_or_else(|| Error::Msg(format!("mlx: pad_circular axis {axis} out of range")))?;
+            // Wrapping by more than the axis is long would need the input
+            // repeated, which no convolution in this project asks for and
+            // which would silently produce a tiled input rather than a padded
+            // one.
+            if amount > len {
+                return Err(Error::Msg(format!(
+                    "mlx: cannot wrap axis {axis} of length {len} by {amount}"
+                )));
+            }
+            let tail = out.narrow(axis, len - amount, amount, stream)?;
+            let head = out.narrow(axis, 0, amount, stream)?;
+            out = concat(&[&tail, &out, &head], axis, stream)?;
+        }
+        Ok(out)
+    }
+
     /// Zero-pad `axes` by `(low, high)` each.
     ///
     /// Needed because MLX convolutions take one symmetric padding per spatial
@@ -1395,6 +1444,102 @@ pub fn eval(arrays: &[&Array]) -> Result<()> {
         check(status, "eval")?;
     }
     Ok(())
+}
+
+// -- memory -----------------------------------------------------------------
+
+/// What MLX currently holds in live arrays.
+///
+/// **Not resident set size, and the difference is the point.** On unified
+/// memory a GPU allocation is not distinguishable from any other page of the
+/// process, so `maximum resident set size` includes the memory-mapped
+/// checkpoint and MLX's allocator reserve alongside the tensors, and moves for
+/// reasons that have nothing to do with the model. This is MLX's own count.
+pub fn active_memory() -> Result<usize> {
+    init();
+    let mut out = 0usize;
+    check(
+        unsafe { mlx_get_active_memory(&mut out) },
+        "get_active_memory",
+    )?;
+    Ok(out)
+}
+
+/// The high-water mark since the process started or [`reset_peak_memory`].
+///
+/// The number worth reporting for "will this model fit": a run's peak is what
+/// has to be available, not its steady state.
+pub fn peak_memory() -> Result<usize> {
+    init();
+    let mut out = 0usize;
+    check(unsafe { mlx_get_peak_memory(&mut out) }, "get_peak_memory")?;
+    Ok(out)
+}
+
+/// Memory MLX is holding for reuse rather than because anything needs it.
+///
+/// Counted against the process by the OS but available to MLX immediately, so
+/// a peak that is mostly cache is not a peak that will fail on a smaller
+/// machine.
+pub fn cache_memory() -> Result<usize> {
+    init();
+    let mut out = 0usize;
+    check(
+        unsafe { mlx_get_cache_memory(&mut out) },
+        "get_cache_memory",
+    )?;
+    Ok(out)
+}
+
+/// Start the high-water mark again from here.
+///
+/// For measuring one phase of a run — a load, or a single step — without the
+/// phases before it setting the number.
+pub fn reset_peak_memory() -> Result<()> {
+    init();
+    check(unsafe { mlx_reset_peak_memory() }, "reset_peak_memory")
+}
+
+/// Ask the OS to keep this many bytes of MLX's memory resident.
+///
+/// **The difference between a large model running and the machine swapping.**
+/// On Apple silicon the GPU and CPU share one pool, so a model that fits in
+/// physical memory can still be paged out under pressure from anything else on
+/// the machine — and paging a weight back in mid-step costs more than the step.
+/// Returns the previous limit.
+///
+/// Setting this above what the machine has is refused by the OS rather than by
+/// MLX, so the caller should size it from
+/// [`crate::sysmem::available_bytes`] rather than from the model.
+pub fn set_wired_limit(bytes: usize) -> Result<usize> {
+    init();
+    let mut previous = 0usize;
+    check(
+        unsafe { mlx_set_wired_limit(&mut previous, bytes) },
+        "set_wired_limit",
+    )?;
+    Ok(previous)
+}
+
+/// Cap the memory MLX holds for reuse. Returns the previous limit.
+///
+/// Zero makes every free return to the OS immediately, which trades throughput
+/// for a smaller footprint — worth it when something else on the machine needs
+/// the room more than this process needs the speed.
+pub fn set_cache_limit(bytes: usize) -> Result<usize> {
+    init();
+    let mut previous = 0usize;
+    check(
+        unsafe { mlx_set_cache_limit(&mut previous, bytes) },
+        "set_cache_limit",
+    )?;
+    Ok(previous)
+}
+
+/// Return MLX's reuse cache to the OS now.
+pub fn clear_cache() -> Result<()> {
+    init();
+    check(unsafe { mlx_clear_cache() }, "clear_cache")
 }
 
 // -- quantisation -----------------------------------------------------------

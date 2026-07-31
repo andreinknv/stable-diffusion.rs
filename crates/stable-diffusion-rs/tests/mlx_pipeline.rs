@@ -16,8 +16,8 @@
 use std::path::PathBuf;
 
 use stable_diffusion_rs::mlx::{
-    Cancel, FluxPaths, FluxPipeline, GroundedBox, MlxPipeline, Region, Sd3Paths, Sd3Pipeline,
-    SdxlPipeline,
+    Cancel, FluxPaths, FluxPipeline, GroundedBox, MlxPipeline, Region, Request, Sd3Paths,
+    Sd3Pipeline, SdxlPipeline,
 };
 use stable_diffusion_rs::pipeline::{SamplerKind, Strength, Txt2ImgConfig};
 use stable_diffusion_rs::tensor::mlx::Array;
@@ -42,6 +42,7 @@ fn config() -> Txt2ImgConfig {
         cfg_scale: 7.5,
         seed: 42,
         sampler: SamplerKind::EulerAncestral,
+        ..Default::default()
     }
 }
 
@@ -664,7 +665,11 @@ fn sd3_paths_name_every_piece_including_both_t5_shards() {
     assert!(paths.t5[0].ends_with("model-00001-of-00002.safetensors"));
     assert!(paths.t5[1].ends_with("model-00002-of-00002.safetensors"));
     // T5's tokenizer is a sentencepiece model, not CLIP's tokenizer.json.
-    assert!(paths.t5_tokenizer.ends_with("tokenizer_3/spiece.model"));
+    // **`tokenizer.json`, not `spiece.model`.** Both ship in a T5 tokenizer
+    // directory and both are "the T5 tokenizer"; this project reads the fast
+    // form, and pointing at the sentencepiece one failed with "stream did not
+    // contain valid UTF-8" — an error naming neither the file nor the problem.
+    assert!(paths.t5_tokenizer.ends_with("tokenizer_3/tokenizer.json"));
 }
 
 /// A missing checkpoint is refused by name, not by whichever file is loaded
@@ -753,7 +758,8 @@ fn flux_paths_read_the_directory_rather_than_guessing_a_shard_count() {
     // is a *directory*, because a checkpoint may ship the fast form, the slow
     // form, or neither — `ClipTokenizer::open` decides, and falls back to the
     // vocabulary vendored in `sd-models` when it ships none.
-    assert!(paths.t5_tokenizer.ends_with("tokenizer_2/spiece.model"));
+    // See the SD 3 path test: the fast form, not the sentencepiece model.
+    assert!(paths.t5_tokenizer.ends_with("tokenizer_2/tokenizer.json"));
     assert!(paths.clip_tokenizer.ends_with("tokenizer"));
 }
 
@@ -978,7 +984,7 @@ fn progress_reports_every_step() {
 
     let mut seen: Vec<(usize, usize, f64)> = Vec::new();
     let (_, _, _) = pipe
-        .txt2img_with(&cfg, None, None, &[], &[], 0.0, None, &mut |p| {
+        .run_with(Request::new(&cfg), &mut |p| {
             seen.push((p.step, p.evaluated, p.sigma));
         })
         .expect("txt2img");
@@ -1012,21 +1018,13 @@ fn cancelling_stops_the_run_and_says_where() {
     let cancel = Cancel::new();
     let flag = cancel.clone();
 
-    let err = pipe.txt2img_with(
-        &config(),
-        None,
-        None,
-        &[],
-        &[],
-        0.0,
-        Some(cancel),
-        &mut |p| {
-            // Cancel after the second step; the third must not run.
-            if p.step == 2 {
-                flag.cancel();
-            }
-        },
-    );
+    let cfg = config();
+    let err = pipe.run_with(Request::new(&cfg).cancel(cancel), &mut |p| {
+        // Cancel after the second step; the third must not run.
+        if p.step == 2 {
+            flag.cancel();
+        }
+    });
     let message = format!(
         "{}",
         err.expect_err("a cancelled run must not return an image")
@@ -1055,7 +1053,7 @@ fn step_caching_skips_evaluations_and_refuses_ancestral_samplers() {
         ..config()
     };
     assert!(
-        pipe.txt2img_with(&ancestral, None, None, &[], &[], 0.2, None, &mut |_| {})
+        pipe.run_with(Request::new(&ancestral).cache_threshold(0.2), &mut |_| {})
             .is_err(),
         "caching with euler_a must be refused"
     );
@@ -1067,13 +1065,13 @@ fn step_caching_skips_evaluations_and_refuses_ancestral_samplers() {
         ..config()
     };
     let mut evaluated_cached = 0usize;
-    pipe.txt2img_with(&cfg, None, None, &[], &[], 0.3, None, &mut |p| {
+    pipe.run_with(Request::new(&cfg).cache_threshold(0.3), &mut |p| {
         evaluated_cached = p.evaluated;
     })
     .expect("cached run");
 
     let mut evaluated_plain = 0usize;
-    pipe.txt2img_with(&cfg, None, None, &[], &[], 0.0, None, &mut |p| {
+    pipe.run_with(Request::new(&cfg), &mut |p| {
         evaluated_plain = p.evaluated;
     })
     .expect("plain run");
@@ -1111,14 +1109,8 @@ fn a_region_prompt_changes_its_own_area_most() {
         prompt: "a field of bright yellow sunflowers".into(),
     };
     let (_, _, regional) = pipe
-        .txt2img_with(
-            &cfg,
-            None,
-            None,
-            &[],
-            std::slice::from_ref(&region),
-            0.0,
-            None,
+        .run_with(
+            Request::new(&cfg).regions(std::slice::from_ref(&region)),
             &mut |_| {},
         )
         .expect("regional");
@@ -1371,4 +1363,299 @@ fn device_names_round_trip() {
     );
     // The default is the GPU: a diffusion step is thousands of matmuls.
     assert_eq!(Device::default(), Device::Gpu);
+}
+
+/// **Seamless tiling: opposite edges must meet.**
+///
+/// Measured rather than eyeballed, and against the image's *own* smoothness
+/// rather than an absolute threshold — a photograph of grass and a photograph
+/// of a brick wall have very different neighbour statistics, so "the edges
+/// differ by less than N" would pass or fail on subject matter. The claim that
+/// means something is: **the wrap is no more of a discontinuity than an
+/// ordinary adjacent pixel pair.**
+#[test]
+fn seamless_makes_the_opposite_edges_meet() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR to an SD 1.5 checkpoint.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("loading the pipeline");
+    // **512, not the 256 the rest of this file uses.** At 256 with four steps
+    // SD 1.5 puts low-frequency mush at the borders, so the untiled image's
+    // edges happen to match and the comparison cannot distinguish tiling from
+    // luck. Measured: at 256 the untiled top/bottom wrap is 6.24 against an
+    // interior step of 5.94 — already "seamless" by any threshold — while at
+    // 512 it is 20.75 against 10.26. The test needs a size where a seam
+    // actually appears.
+    // Seed and step count are pinned to a run measured to discriminate
+    // clearly: untiled, the top/bottom wrap is 20.75 against an interior step
+    // of 10.26. Nearby settings give margins under 5%, which would make this
+    // flaky rather than wrong.
+    let base = Txt2ImgConfig {
+        prompt: "a field of grass, seamless texture".into(),
+        width: 512,
+        height: 512,
+        steps: 10,
+        seed: 7,
+        ..config()
+    };
+
+    // Mean absolute difference across the wrap, and across an ordinary
+    // interior column, in one pass.
+    let edges = |w: usize, h: usize, b: &[u8]| -> (f64, f64, f64) {
+        let at = |x: usize, y: usize, c: usize| b[(y * w + x) * 3 + c] as f64;
+        let mut lr = 0.0;
+        let mut tb = 0.0;
+        let mut interior = 0.0;
+        for y in 0..h {
+            for c in 0..3 {
+                lr += (at(0, y, c) - at(w - 1, y, c)).abs();
+            }
+        }
+        for x in 0..w {
+            for c in 0..3 {
+                tb += (at(x, 0, c) - at(x, h - 1, c)).abs();
+            }
+        }
+        for y in 0..h {
+            for x in 1..w {
+                for c in 0..3 {
+                    interior += (at(x, y, c) - at(x - 1, y, c)).abs();
+                }
+            }
+        }
+        (
+            lr / (h * 3) as f64,
+            tb / (w * 3) as f64,
+            interior / (h * (w - 1) * 3) as f64,
+        )
+    };
+
+    let tiled = Txt2ImgConfig {
+        seamless: true,
+        ..base.clone()
+    };
+    let (w, h, on) = pipe.txt2img(&tiled).expect("seamless");
+    let (w2, h2, off) = pipe.txt2img(&base).expect("plain");
+    assert_eq!((w, h), (w2, h2));
+
+    let (lr_on, tb_on, interior_on) = edges(w, h, &on);
+    let (_, tb_off, interior_off) = edges(w2, h2, &off);
+    eprintln!(
+        "seamless: wrap {lr_on:.2}/{tb_on:.2} vs neighbour {interior_on:.2}   \
+         plain: wrap ?/{tb_off:.2} vs neighbour {interior_off:.2}"
+    );
+
+    // The wrap is no worse than an ordinary neighbouring pair. A little slack,
+    // because an edge column is one specific pair rather than an average.
+    assert!(
+        lr_on <= interior_on * 1.5,
+        "left/right wrap {lr_on:.2} against a typical step of {interior_on:.2}: not seamless"
+    );
+    assert!(
+        tb_on <= interior_on * 1.5,
+        "top/bottom wrap {tb_on:.2} against a typical step of {interior_on:.2}: not seamless"
+    );
+    // And it changed something: an untiled image is discontinuous at the wrap.
+    assert!(
+        tb_off > interior_off,
+        "the untiled image already wrapped cleanly ({tb_off:.2} vs {interior_off:.2}); \
+         this test cannot tell whether --seamless did anything"
+    );
+    assert_ne!(on, off, "seamless produced a byte-identical image");
+}
+
+/// **Every sampler produces an image**, and no two produce the same one —
+/// except the pair that provably must.
+///
+/// The cheap check that a new sampler is wired up rather than silently falling
+/// through to another one, which is what a `match` arm copied and not edited
+/// looks like from outside. **DDIM is excluded**, because at `eta = 0` it is
+/// not merely similar to Euler but the identical update written in different
+/// coordinates — see `ddim_is_euler_and_that_is_not_a_bug`.
+#[test]
+fn every_sampler_runs_and_they_differ() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR to an SD 1.5 checkpoint.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("loading the pipeline");
+    let mut seen: Vec<(&str, Vec<u8>)> = Vec::new();
+
+    for &sampler in SamplerKind::all() {
+        // LCM needs a distilled model; on a stock checkpoint it runs but the
+        // image is not meaningful, so it is exercised for shape only.
+        let cfg = Txt2ImgConfig {
+            sampler,
+            ..config()
+        };
+        let (w, h, bytes) = pipe
+            .txt2img(&cfg)
+            .unwrap_or_else(|e| panic!("{} failed: {e}", sampler.name()));
+        assert_eq!((w, h), (256, 256));
+
+        if sampler == SamplerKind::Ddim {
+            continue;
+        }
+        if sampler != SamplerKind::Lcm {
+            let (mean, sd, step) = looks_like_an_image(w, h, &bytes);
+            eprintln!(
+                "{:<10} mean {mean:.1}  sd {sd:.1}  neighbour step {step:.1}",
+                sampler.name()
+            );
+            assert!(
+                (5.0..250.0).contains(&mean),
+                "{}: mean {mean:.1}",
+                sampler.name()
+            );
+            assert!(step < 40.0, "{}: neighbour step {step:.1}", sampler.name());
+            for (other, prev) in &seen {
+                assert_ne!(
+                    prev,
+                    &bytes,
+                    "{} and {other} produced identical images; one is not wired up",
+                    sampler.name()
+                );
+            }
+            seen.push((sampler.name(), bytes));
+        }
+    }
+}
+
+/// **Karras is a different schedule, and it reaches the image.**
+#[test]
+fn the_scheduler_changes_the_picture() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR to an SD 1.5 checkpoint.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("loading the pipeline");
+    let cfg = Txt2ImgConfig {
+        sampler: SamplerKind::DpmPlusPlus2M,
+        ..config()
+    };
+    let (_, _, discrete) = pipe.txt2img(&cfg).expect("discrete");
+
+    let mut previous: Vec<(&str, Vec<u8>)> = vec![("discrete", discrete)];
+    for scheduler in [
+        stable_diffusion_rs::config::Scheduler::Karras,
+        stable_diffusion_rs::config::Scheduler::Exponential,
+        stable_diffusion_rs::config::Scheduler::SgmUniform,
+    ] {
+        let (_, _, bytes) = pipe
+            .txt2img(&Txt2ImgConfig {
+                scheduler,
+                ..cfg.clone()
+            })
+            .expect("scheduler");
+        for (name, prev) in &previous {
+            assert_ne!(
+                prev,
+                &bytes,
+                "{} and {name} gave the same image; the scheduler is ignored",
+                scheduler.name()
+            );
+        }
+        previous.push((scheduler.name(), bytes));
+    }
+}
+
+/// **clip-skip reaches the conditioning.**
+///
+/// Two layers of CLIP is a different prompt embedding, so it must be a
+/// different image — and it must still be an image, not a broken one.
+#[test]
+fn clip_skip_changes_the_conditioning() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR to an SD 1.5 checkpoint.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("loading the pipeline");
+    let one = config();
+    let two = Txt2ImgConfig {
+        clip_skip: stable_diffusion_rs::config::ClipSkip::new(2),
+        ..one.clone()
+    };
+
+    let (w, h, a) = pipe.txt2img(&one).expect("clip_skip 1");
+    let (_, _, b) = pipe.txt2img(&two).expect("clip_skip 2");
+    assert_ne!(a, b, "clip_skip did not reach the text encoder");
+
+    let (mean, _, step) = looks_like_an_image(w, h, &b);
+    assert!((5.0..250.0).contains(&mean), "clip_skip 2: mean {mean:.1}");
+    assert!(step < 40.0, "clip_skip 2: neighbour step {step:.1}");
+}
+
+/// **A batch runs `seed`, `seed + 1`, ...**, so image `i` matches a single run
+/// at that seed. Otherwise a batch is not reproducible per image.
+#[test]
+fn a_batch_is_the_same_as_running_each_seed() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR to an SD 1.5 checkpoint.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("loading the pipeline");
+    let cfg = Txt2ImgConfig {
+        batch_count: 2,
+        ..config()
+    };
+    let batch = pipe
+        .run_batch(Request::new(&cfg), &mut |_| {})
+        .expect("batch");
+    assert_eq!(batch.len(), 2, "batch_count images");
+
+    for (i, (_, _, bytes)) in batch.iter().enumerate() {
+        let single = Txt2ImgConfig {
+            seed: cfg.seed_for(i),
+            batch_count: 1,
+            ..cfg.clone()
+        };
+        let (_, _, want) = pipe.txt2img(&single).expect("single");
+        assert_eq!(
+            bytes,
+            &want,
+            "image {i} of the batch is not seed {}",
+            cfg.seed_for(i)
+        );
+    }
+    assert_ne!(batch[0].2, batch[1].2, "a batch produced one image twice");
+}
+
+/// **DDIM and Euler produce the same image, and that is correct.**
+///
+/// At `eta = 0` DDIM's update and the Euler step are the same arithmetic in
+/// different coordinates — `x_{t-1} = sqrt(a_{t-1}) x0 + sqrt(1 - a_{t-1}) eps`
+/// becomes `x * (sigma_next/sigma) + denoised * (1 - sigma_next/sigma)` once
+/// the alphas are written as sigmas. Karras et al. note the equivalence.
+///
+/// Both names are offered because every paper reports against one or the
+/// other and a user who asks for DDIM should get it rather than be told it is
+/// a synonym. Pinned here so that the identity reads as a known property
+/// rather than as two arms of a `match` that were never wired up — which is
+/// exactly what it looks like from outside, and what this test was written
+/// after mistaking it for.
+#[test]
+fn ddim_is_euler_and_that_is_not_a_bug() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR to an SD 1.5 checkpoint.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("loading the pipeline");
+    let (_, _, euler) = pipe
+        .txt2img(&Txt2ImgConfig {
+            sampler: SamplerKind::Euler,
+            ..config()
+        })
+        .expect("euler");
+    let (_, _, ddim) = pipe
+        .txt2img(&Txt2ImgConfig {
+            sampler: SamplerKind::Ddim,
+            ..config()
+        })
+        .expect("ddim");
+    assert_eq!(
+        euler, ddim,
+        "DDIM at eta = 0 is the Euler step; if these differ, one of them has \
+         acquired arithmetic the other does not have"
+    );
 }

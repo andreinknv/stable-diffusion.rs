@@ -36,11 +36,48 @@ pub struct T5Tokenizer {
 }
 
 impl T5Tokenizer {
+    /// Load from a path that may name the file or the directory holding it.
+    ///
+    /// Unlike CLIP's, this has no embedded fallback: T5's vocabulary is 32,128
+    /// entries and, unlike CLIP's, **is not shared** — Flux and SD 3 use the
+    /// same T5 v1.1 XXL, but a checkpoint that used another would need its own.
+    /// So a missing T5 tokenizer is a real error, named rather than guessed at.
+    pub fn open<P: AsRef<Path>>(path: P, max_length: usize) -> Result<Self, TokenizeError> {
+        let path = path.as_ref();
+        if path.is_dir() {
+            return Self::from_file(path.join("tokenizer.json"), max_length);
+        }
+        if path.is_file() {
+            return Self::from_file(path, max_length);
+        }
+        // Named a file that is not there: look for the fast form beside it,
+        // which is what a `spiece.model` default points past.
+        match path.parent() {
+            Some(dir) if dir.join("tokenizer.json").is_file() => {
+                Self::from_file(dir.join("tokenizer.json"), max_length)
+            }
+            _ => Err(TokenizeError::NotFound(PathBuf::from(path))),
+        }
+    }
+
     /// Load from a `tokenizer.json`, padding to `max_length`.
     pub fn from_file<P: AsRef<Path>>(path: P, max_length: usize) -> Result<Self, TokenizeError> {
         let path = path.as_ref();
         if !path.exists() {
             return Err(TokenizeError::NotFound(PathBuf::from(path)));
+        }
+        // **`spiece.model` is not a `tokenizer.json`.** Both sit in a
+        // `tokenizer_2/` directory, both are "the T5 tokenizer", and handing
+        // the sentencepiece one to a JSON parser fails with "stream did not
+        // contain valid UTF-8" — which names neither the file nor the problem.
+        // This project reads the fast form; the sentencepiece protobuf would
+        // be a second BPE implementation to keep in agreement with the first.
+        if path.extension().is_some_and(|e| e == "model") {
+            return Err(TokenizeError::Load(format!(
+                "{} is a sentencepiece model; this wants T5's tokenizer.json, \
+                 which ships beside it",
+                path.display()
+            )));
         }
         let inner = tokenizers::Tokenizer::from_file(path)
             .map_err(|e| TokenizeError::Load(e.to_string()))?;
