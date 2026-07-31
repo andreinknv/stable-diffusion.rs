@@ -21,7 +21,8 @@
 use sd_tensor::mlx::{concat, Array, Stream};
 use sd_tensor::{Error, Result};
 
-use super::{get, linear, sinusoid_embedding, Weights};
+use super::quantized::WeightSource;
+use super::sinusoid_embedding;
 
 /// Width of the raw timestep sinusoid, before `t_embedder`.
 const TIME_EMBED_DIM: usize = 256;
@@ -87,7 +88,7 @@ fn head_rms_norm(x: &Array, weight: &Array, s: &Stream) -> Result<Array> {
 fn qkv(
     x: &Array,
     cfg: &Sd3Config,
-    w: &Weights,
+    w: &impl WeightSource,
     prefix: &str,
     s: &Stream,
 ) -> Result<(Array, Array, Array)> {
@@ -97,20 +98,21 @@ fn qkv(
     };
     let (heads, hd) = (cfg.num_heads, cfg.head_dim());
 
-    let t = linear(x, get(w, &p("qkv.weight"))?, w.get(&p("qkv.bias")), s)?
+    let t = w
+        .linear(x, &p("qkv.weight"), w.optional(&p("qkv.bias")), s)?
         .reshape(&[b, n, 3, heads, hd], s)?
         .transpose(&[2, 0, 3, 1, 4], s)?;
     let take = |i: usize| -> Result<Array> { t.narrow(0, i, 1, s)?.reshape(&[b, heads, n, hd], s) };
     Ok((
-        head_rms_norm(&take(0)?, get(w, &p("ln_q.weight"))?, s)?,
-        head_rms_norm(&take(1)?, get(w, &p("ln_k.weight"))?, s)?,
+        head_rms_norm(&take(0)?, w.dense(&p("ln_q.weight"))?, s)?,
+        head_rms_norm(&take(1)?, w.dense(&p("ln_k.weight"))?, s)?,
         take(2)?,
     ))
 }
 
 /// Merge heads and project. Absent on a `pre_only` block, whose output is
 /// discarded.
-fn post(attn: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
+fn post(attn: &Array, w: &impl WeightSource, prefix: &str, s: &Stream) -> Result<Array> {
     let [b, h, n, d] = attn.shape()[..] else {
         return Err(Error::Msg(format!("mlx: sd3 post got {:?}", attn.shape())));
     };
@@ -118,19 +120,21 @@ fn post(attn: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
         .transpose(&[0, 2, 1, 3], s)?
         .contiguous(s)?
         .reshape(&[b, n, h * d], s)?;
-    linear(
+    w.linear(
         &merged,
-        get(w, &format!("{prefix}.proj.weight"))?,
-        w.get(&format!("{prefix}.proj.bias")),
+        &format!("{prefix}.proj.weight"),
+        w.optional(&format!("{prefix}.proj.bias")),
         s,
     )
 }
 
 /// `fc2(gelu_new(fc1(x)))`. The tanh approximation, as SD 3 uses.
-fn mlp(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
+fn mlp(x: &Array, w: &impl WeightSource, prefix: &str, s: &Stream) -> Result<Array> {
     let p = |n: &str| format!("{prefix}.{n}");
-    let h = linear(x, get(w, &p("fc1.weight"))?, w.get(&p("fc1.bias")), s)?.gelu_approx(s)?;
-    linear(&h, get(w, &p("fc2.weight"))?, w.get(&p("fc2.bias")), s)
+    let h = w
+        .linear(x, &p("fc1.weight"), w.optional(&p("fc1.bias")), s)?
+        .gelu_approx(s)?;
+    w.linear(&h, &p("fc2.weight"), w.optional(&p("fc2.bias")), s)
 }
 
 /// This half-block's modulation parameters, `chunks` of `hidden_size` each.
@@ -141,14 +145,14 @@ fn modulation(
     c: &Array,
     chunks: usize,
     hidden: usize,
-    w: &Weights,
+    w: &impl WeightSource,
     prefix: &str,
     s: &Stream,
 ) -> Result<Vec<Array>> {
-    let out = linear(
+    let out = w.linear(
         &c.silu(s)?,
-        get(w, &format!("{prefix}.adaLN_modulation.1.weight"))?,
-        w.get(&format!("{prefix}.adaLN_modulation.1.bias")),
+        &format!("{prefix}.adaLN_modulation.1.weight"),
+        w.optional(&format!("{prefix}.adaLN_modulation.1.bias")),
         s,
     )?;
     let [b, _] = out.shape()[..] else {
@@ -172,7 +176,7 @@ fn joint_block(
     c: &Array,
     index: usize,
     cfg: &Sd3Config,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<(Option<Array>, Array)> {
     let path = format!("joint_blocks.{index}");
@@ -271,7 +275,7 @@ fn cropped_pos_embed(
     cfg: &Sd3Config,
     h: usize,
     w: usize,
-    wt: &Weights,
+    wt: &impl WeightSource,
     s: &Stream,
 ) -> Result<Array> {
     let max = cfg.pos_embed_max_size;
@@ -281,7 +285,7 @@ fn cropped_pos_embed(
         )));
     }
     let (top, left) = ((max - h) / 2, (max - w) / 2);
-    get(wt, "pos_embed")?
+    wt.dense("pos_embed")?
         .reshape(&[1, max, max, cfg.hidden_size], s)?
         .narrow(1, top, h, s)?
         .narrow(2, left, w, s)?
@@ -315,10 +319,12 @@ fn unpatchify(x: &Array, lh: usize, lw: usize, p: usize, c: usize, s: &Stream) -
 }
 
 /// `t_embedder` / `y_embedder`: `fc2(silu(fc1(x)))`, stored as `mlp.0`/`mlp.2`.
-fn embedder(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
+fn embedder(x: &Array, w: &impl WeightSource, prefix: &str, s: &Stream) -> Result<Array> {
     let p = |n: &str| format!("{prefix}.{n}");
-    let h = linear(x, get(w, &p("mlp.0.weight"))?, w.get(&p("mlp.0.bias")), s)?.silu(s)?;
-    linear(&h, get(w, &p("mlp.2.weight"))?, w.get(&p("mlp.2.bias")), s)
+    let h = w
+        .linear(x, &p("mlp.0.weight"), w.optional(&p("mlp.0.bias")), s)?
+        .silu(s)?;
+    w.linear(&h, &p("mlp.2.weight"), w.optional(&p("mlp.2.bias")), s)
 }
 
 /// The MMDiT forward: latents, T5 context, pooled CLIP and a timestep in; a
@@ -329,7 +335,7 @@ pub fn forward(
     pooled: &Array,
     timestep: &Array,
     cfg: &Sd3Config,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<Array> {
     let [_, _, lh, lw] = latents.shape()[..] else {
@@ -343,14 +349,21 @@ pub fn forward(
     // Flattened it is `[hidden, c*p*p]` running `(channel, ph, pw)` — which is
     // exactly the order `pack_latents` produces, and the reason that packing is
     // channel-major rather than position-major.
-    let pw_raw = get(w, "x_embedder.proj.weight")?;
+    // A convolution kernel reshaped into a linear, so it is read as a tensor
+    // rather than dispatched through `linear` — hence dense.
+    let pw_raw = w.dense("x_embedder.proj.weight")?;
     let flat = pw_raw.shape();
     let patch_weight = if flat.len() == 4 {
         pw_raw.reshape(&[flat[0], flat[1] * flat[2] * flat[3]], s)?
     } else {
         pw_raw.contiguous(s)?
     };
-    let mut xs = linear(&patches, &patch_weight, w.get("x_embedder.proj.bias"), s)?;
+    let mut xs = super::linear(
+        &patches,
+        &patch_weight,
+        w.optional("x_embedder.proj.bias"),
+        s,
+    )?;
     xs = xs.add(&cropped_pos_embed(cfg, ph, pw, w, s)?, s)?;
 
     let t = embedder(
@@ -360,10 +373,10 @@ pub fn forward(
         s,
     )?;
     let c = t.add(&embedder(pooled, w, "y_embedder", s)?, s)?;
-    let mut context = Some(linear(
+    let mut context = Some(w.linear(
         context,
-        get(w, "context_embedder.weight")?,
-        w.get("context_embedder.bias"),
+        "context_embedder.weight",
+        w.optional("context_embedder.bias"),
         s,
     )?);
 
@@ -379,10 +392,10 @@ pub fn forward(
     // The final layer modulates twice — shift and scale, nothing to gate.
     let fm = modulation(&c, 2, cfg.hidden_size, w, "final_layer", s)?;
     let xs = norm_modulate(&xs, &fm[0], &fm[1], s)?;
-    let xs = linear(
+    let xs = w.linear(
         &xs,
-        get(w, "final_layer.linear.weight")?,
-        w.get("final_layer.linear.bias"),
+        "final_layer.linear.weight",
+        w.optional("final_layer.linear.bias"),
         s,
     )?;
     unpatchify(&xs, lh, lw, p, cfg.in_channels, s)

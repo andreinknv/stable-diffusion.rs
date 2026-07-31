@@ -99,7 +99,9 @@ pub struct Sd3Pipeline {
     clip_g: Weights,
     /// **Quantised at rest.** T5-XXL is 4.7B parameters, 18.8 GB dense in f32.
     t5: QuantizedWeights,
-    transformer: Weights,
+    /// Likewise. SD 3.5 medium is 2.47B, which is 9.9 GB dense — it would fit
+    /// alone and does not fit beside T5 and two CLIP towers.
+    transformer: QuantizedWeights,
     vae: Weights,
     cfg: sd3::Sd3Config,
     vae_cfg: VaeConfig,
@@ -179,13 +181,102 @@ impl Sd3Pipeline {
             clip_l: load_safetensors(&paths.clip_l)?,
             clip_g: load_safetensors(&paths.clip_g)?,
             t5: t5w,
-            transformer: load_safetensors(&paths.transformer)?,
+            transformer: {
+                let dense = load_safetensors(&paths.transformer)?;
+                quantized::from_dense(&dense, quantized::DEFAULT_BITS, &stream)?
+            },
             vae: vae_w,
             cfg: sd3::Sd3Config::medium_35(),
             vae_cfg: VaeConfig::sd35(),
             flow: FlowMatchConfig::sd3(),
             stream,
         })
+    }
+
+    /// Assemble SD 3.5 from explicit pieces, quantising the two large ones.
+    ///
+    /// **The path a real checkpoint needs**, because the published SD 3.5
+    /// medium directory ships no `text_encoder_3` and no tokenizers — T5 and
+    /// both tokenisers come from elsewhere — and names its encoders
+    /// `model.fp16.safetensors` rather than `model.safetensors`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        transformer: &Path,
+        vae: &Path,
+        clip_l: &Path,
+        clip_g: &Path,
+        t5: &Path,
+        clip_tokenizer: &Path,
+        t5_tokenizer: &Path,
+        bits: usize,
+    ) -> Result<Self, PipelineError> {
+        for p in [
+            transformer,
+            vae,
+            clip_l,
+            clip_g,
+            t5,
+            clip_tokenizer,
+            t5_tokenizer,
+        ] {
+            require(p)?;
+        }
+        let stream = Stream::gpu();
+        let t5w = if t5.extension().is_some_and(|e| e == "gguf") {
+            // llama.cpp's naming, translated on the way in.
+            quantized::from_gguf_renamed(t5, bits, sd_loader::t5_key, &stream)?
+        } else {
+            let dense = load_safetensors(t5)?;
+            quantized::from_dense(&dense, bits, &stream)?
+        };
+        let transformer_q = {
+            // **Two namings ship for SD 3.5.** Stability's single-file release
+            // uses the original `x_embedder`/`final_layer` names under a
+            // `model.diffusion_model.` prefix; the `diffusers` directory
+            // renames them wholesale to `pos_embed.proj`, `norm_out.linear`
+            // and so on. This model was written against the former, so the
+            // prefix is stripped and a diffusers-named file is refused by the
+            // missing tensor it does not have rather than half-loaded.
+            let raw = load_safetensors(transformer)?;
+            let mut dense = Weights::with_capacity(raw.len());
+            for (name, v) in raw {
+                let stripped = name
+                    .strip_prefix("model.diffusion_model.")
+                    .map(str::to_string)
+                    .unwrap_or(name);
+                dense.insert(stripped, v);
+            }
+            quantized::from_dense(&dense, bits, &stream)?
+        };
+        let mut vae_w = load_safetensors(vae)?;
+        normalise_legacy_attention(&mut vae_w);
+
+        Ok(Self {
+            clip_tokenizer: ClipTokenizer::from_file(clip_tokenizer)?,
+            t5_tokenizer: T5Tokenizer::from_file(t5_tokenizer, T5_LENGTH)?,
+            clip_l: load_safetensors(clip_l)?,
+            clip_g: load_safetensors(clip_g)?,
+            t5: t5w,
+            transformer: transformer_q,
+            vae: vae_w,
+            cfg: sd3::Sd3Config::medium_35(),
+            vae_cfg: VaeConfig::sd35(),
+            flow: FlowMatchConfig::sd3(),
+            stream,
+        })
+    }
+
+    /// What this pipeline holds resident, in bytes.
+    pub fn resident_bytes(&self) -> usize {
+        self.transformer.resident_bytes()
+            + self.t5.resident_bytes()
+            + self
+                .clip_l
+                .values()
+                .chain(self.clip_g.values())
+                .chain(self.vae.values())
+                .map(|a| a.elem_count() * 4)
+                .sum::<usize>()
     }
 
     /// `(context, pooled)` for one prompt: `[1, 333, 4096]` and `[1, 2048]`.

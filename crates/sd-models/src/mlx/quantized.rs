@@ -135,6 +135,12 @@ pub fn indexed(name: &str) -> bool {
         || name.ends_with("pos_embed")
         || name.contains("prd_embedding")
         || name.contains("positional_embedding")
+        // SD 3's patch embedding is a convolution kernel that the forward
+        // *reshapes* into a linear before using. It is read as a tensor, not
+        // dispatched through `linear`, so it has to be a real array — and it
+        // ships already flattened to 2-D, which is exactly the shape that
+        // would otherwise be quantised.
+        || name == "x_embedder.proj.weight"
 }
 
 /// The default policy: [`indexed`] tensors dense, [`sensitive`] layers at 8
