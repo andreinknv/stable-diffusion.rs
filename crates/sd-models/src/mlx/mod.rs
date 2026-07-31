@@ -65,6 +65,15 @@ pub struct UNetConfig {
     pub transformer_layers: Vec<usize>,
     /// SDXL's micro-conditioning. `None` for everything else here.
     pub addition: Option<AdditionEmbedding>,
+    /// unCLIP's image conditioning: `class_embedding` projects a vector into
+    /// the timestep embedding. `true` for stable-diffusion-2-1-unclip, `false`
+    /// for everything else.
+    ///
+    /// A separate field from `addition` because they are separate tensors in
+    /// the checkpoint — `class_embedding` against `add_embedding` — and no
+    /// checkpoint carries both. Collapsing them would make that an assumption
+    /// rather than an observation.
+    pub class_projection: bool,
 }
 
 /// SDXL's extra conditioning: image size and crop offsets, sinusoidally
@@ -84,6 +93,18 @@ impl UNetConfig {
             use_linear_projection: false,
             transformer_layers: vec![1; 4],
             addition: None,
+            class_projection: false,
+        }
+    }
+
+    /// unCLIP — **SD 2.x exactly**, plus a `class_embedding` that projects a
+    /// CLIP *image* embedding into the timestep embedding. Every block, every
+    /// width and the text encoder behind it are unchanged, which is why this is
+    /// one field rather than an architecture.
+    pub fn unclip() -> Self {
+        Self {
+            class_projection: true,
+            ..Self::sd2()
         }
     }
 
@@ -101,6 +122,7 @@ impl UNetConfig {
             addition: Some(AdditionEmbedding {
                 time_embed_dim: 256,
             }),
+            class_projection: false,
         }
     }
 
@@ -698,7 +720,7 @@ pub fn unet_forward(
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
-    unet_forward_with(sample_nhwc, timestep, context, None, cfg, w, s)
+    unet_forward_with(sample_nhwc, timestep, context, None, None, cfg, w, s)
 }
 
 /// `unet_forward` plus SDXL's micro-conditioning: the pooled text embedding
@@ -713,6 +735,7 @@ pub fn unet_forward_with(
     timestep: &Array,
     context: &Array,
     added: Option<(&Array, &Array)>,
+    class_embeds: Option<&Array>,
     cfg: &UNetConfig,
     w: &Weights,
     s: &Stream,
@@ -758,6 +781,38 @@ pub fn unet_forward_with(
             ))
         }
         (None, None) => temb,
+    };
+
+    // unCLIP's image conditioning enters the same slot the micro-conditioning
+    // does — added to the timestep embedding — but from a different tensor.
+    let temb = match (cfg.class_projection, class_embeds) {
+        (true, Some(v)) => {
+            let h = linear(
+                v,
+                get(w, "class_embedding.linear_1.weight")?,
+                Some(get(w, "class_embedding.linear_1.bias")?),
+                s,
+            )?
+            .silu(s)?;
+            let h = linear(
+                &h,
+                get(w, "class_embedding.linear_2.weight")?,
+                Some(get(w, "class_embedding.linear_2.bias")?),
+                s,
+            )?;
+            temb.add(&h, s)?
+        }
+        (true, None) => {
+            return Err(Error::Msg(
+                "mlx: this UNet expects an unCLIP image embedding".into(),
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(Error::Msg(
+                "mlx: an image embedding was supplied to a UNet with no class_embedding".into(),
+            ))
+        }
+        (false, None) => temb,
     };
     let (h, mut skips) = down_pass(sample_nhwc, &temb, context, cfg, w, s)?;
     let mut h = mid_block(&h, &temb, context, cfg, w, s)?;

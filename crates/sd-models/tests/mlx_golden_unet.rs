@@ -16,6 +16,37 @@ use std::path::PathBuf;
 use sd_models::mlx::{down_pass, resnet_block, timestep_embedding, transformer_2d, UNetConfig};
 use sd_tensor::mlx::{load_safetensors, Array, Stream};
 
+/// `golden_unclip.rs`'s bounds, and its reasoning: the whole UNet is held to
+/// `UNET_RTOL = 1e-3` with `UNET_TOL = 1e-3` "against a reference noise floor
+/// of 2.757e-04". `DEFAULT_ATOL` is below what the candle port itself achieves
+/// on this fixture, so it would fail a correct implementation. Measured on the
+/// same run: candle 1.979e-4 conditioned and 6.233e-4 unconditional; this port
+/// 3.353e-4 and 3.496e-4.
+const UNET_RTOL: f32 = 1e-3;
+const UNCLIP_TOL: f32 = 1e-3;
+
+/// Worst violation of `|a - b| <= atol + rtol * |b|`, the form
+/// `testing::allclose_excess` computes. Compare against [`ATOL`].
+fn excess(got_nhwc: &Array, want_nchw: &Array, s: &Stream, what: &str) -> f32 {
+    let got = got_nhwc
+        .transpose(&[0, 3, 1, 2], s)
+        .expect("NHWC -> NCHW")
+        .to_vec_f32(s)
+        .expect("mlx result");
+    let want = want_nchw.to_vec_f32(s).expect("reference");
+    assert_eq!(got.len(), want.len(), "{what}: element count");
+    let (mut worst, mut peak, mut exc) = (0.0f32, 0.0f32, 0.0f32);
+    for (g, w) in got.iter().zip(&want) {
+        let d = (g - w).abs();
+        worst = worst.max(d);
+        peak = peak.max(w.abs());
+        exc = exc.max(d - UNET_RTOL * w.abs());
+    }
+    let exc = exc.max(0.0);
+    eprintln!("{what:<20} peak {peak:>7.3}  max_abs {worst:.3e}  excess {exc:.3e}");
+    exc
+}
+
 /// `sd_tensor::testing::DEFAULT_ATOL`.
 const ATOL: f32 = 1e-4;
 
@@ -310,6 +341,7 @@ fn the_sdxl_unet_matches_diffusers() {
         refs.get("timestep").unwrap(),
         context,
         Some((pooled, time_ids)),
+        None,
         &cfg,
         &w,
         &s,
@@ -339,7 +371,8 @@ fn micro_conditioning_is_required_when_the_config_declares_it() {
 
     // SDXL config, no conditioning supplied.
     assert!(
-        sd_models::mlx::unet_forward_with(&x, t, ctx, None, &UNetConfig::sdxl(), &w, &s).is_err(),
+        sd_models::mlx::unet_forward_with(&x, t, ctx, None, None, &UNetConfig::sdxl(), &w, &s)
+            .is_err(),
         "an SDXL config must refuse to run without micro-conditioning"
     );
     // SD 1.5 config, conditioning supplied.
@@ -349,11 +382,104 @@ fn micro_conditioning_is_required_when_the_config_declares_it() {
             t,
             ctx,
             Some((ctx, ctx)),
+            None,
             &UNetConfig::sd15(),
             &w,
             &s
         )
         .is_err(),
         "SD 1.5 must refuse micro-conditioning it cannot use"
+    );
+}
+
+/// unCLIP, against `tests/golden/unclip`.
+///
+/// **SD 2.x exactly**, plus a `class_embedding` that projects the noised CLIP
+/// image embedding into the timestep embedding. The fixture supplies both a
+/// real conditioning vector and the zero case, and they must give different
+/// outputs — otherwise the projection is being ignored and every unCLIP image
+/// would silently be an unconditioned one.
+///
+/// **Bounded with `golden_unclip.rs`'s criterion, not `DEFAULT_ATOL`.** That
+/// test uses `allclose_excess` at `UNET_RTOL = 1e-3` and records candle's own
+/// figure on this very fixture in its header: `peak 1.901, max_abs 2.757e-04,
+/// max_rel 1.450e-04`. An absolute 1e-4 is below what the candle port itself
+/// achieves here, so it would fail a correct implementation.
+#[test]
+fn the_unclip_unet_matches_diffusers() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/unclip");
+    let (refs_path, unet_path) = (
+        dir.join("reference.safetensors"),
+        dir.join("unet.safetensors"),
+    );
+    if !refs_path.exists() || !unet_path.exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no unclip fixture.");
+        return;
+    }
+    let refs = load_safetensors(&refs_path).expect("reference");
+    let w = load_safetensors(&unet_path).expect("weights");
+    let s = Stream::gpu();
+    let cfg = UNetConfig::unclip();
+
+    let x = refs
+        .get("unet_sample")
+        .expect("unet_sample")
+        .transpose(&[0, 2, 3, 1], &s)
+        .unwrap();
+    let t = refs.get("unet_timestep").expect("unet_timestep");
+    let text = refs.get("unet_text").expect("unet_text");
+    assert_eq!(text.shape(), vec![1, 77, 1024], "unCLIP is SD 2.x wide");
+
+    let conditioned = sd_models::mlx::unet_forward_with(
+        &x,
+        t,
+        text,
+        None,
+        Some(refs.get("noised_250").expect("noised_250")),
+        &cfg,
+        &w,
+        &s,
+    )
+    .unwrap();
+    let worst_cond = excess(
+        &conditioned,
+        refs.get("unet_out").unwrap(),
+        &s,
+        "unclip out",
+    );
+
+    // **Zeros, not `noised_0`.** The fixture's docstring is explicit: this row
+    // is `torch.zeros_like(class_labels)`, the guidance batch's unconditional
+    // half. `noised_0` is the image embedding at noise level 0, which is a
+    // different tensor entirely and produces a different image.
+    let zeros = Array::from_slice_f32(&vec![0.0; 2048], &[1, 2048]).unwrap();
+    let zeroed =
+        sd_models::mlx::unet_forward_with(&x, t, text, None, Some(&zeros), &cfg, &w, &s).unwrap();
+    let worst_zero = excess(
+        &zeroed,
+        refs.get("unet_out_zero").unwrap(),
+        &s,
+        "unclip out (zero)",
+    );
+    assert!(
+        worst_cond <= UNCLIP_TOL,
+        "unCLIP UNet is {worst_cond:.3e} beyond rtol={UNET_RTOL:.0e}"
+    );
+    assert!(
+        worst_zero <= UNCLIP_TOL,
+        "unCLIP UNet at zero conditioning is {worst_zero:.3e} beyond rtol={UNET_RTOL:.0e}"
+    );
+
+    // The conditioning must actually reach the output.
+    let a = conditioned.to_vec_f32(&s).unwrap();
+    let b = zeroed.to_vec_f32(&s).unwrap();
+    let spread = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        spread > 1e-3,
+        "the image embedding changed nothing ({spread:.3e}); the projection is being ignored"
     );
 }
