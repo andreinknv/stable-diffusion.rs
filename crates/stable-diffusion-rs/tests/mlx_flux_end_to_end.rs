@@ -51,6 +51,7 @@ fn schnell_generates_an_image_from_a_prompt() {
         &parts[5],
         FluxConfig::schnell(),
         sd_models::mlx::quantized::DEFAULT_BITS,
+        sd_tensor::mlx::Device::Gpu,
     )
     .expect("assembling schnell from gguf");
 
@@ -146,6 +147,7 @@ fn sd35_generates_an_image_from_a_prompt() {
         &parts[5],
         &parts[6],
         sd_models::mlx::quantized::DEFAULT_BITS,
+        sd_tensor::mlx::Device::Gpu,
     )
     .expect("assembling SD 3.5 from parts");
 

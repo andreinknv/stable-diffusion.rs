@@ -49,7 +49,7 @@ use sd_models::mlx::{
 };
 use sd_models::t5::T5Tokenizer;
 use sd_sample::flow::{flow_sigmas, flow_timesteps, FlowMatchConfig};
-use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
+use sd_tensor::mlx::{concat, load_safetensors, Array, Device, Stream};
 use sd_tensor::rng::SeededRng;
 
 use super::{draw_noise, msg};
@@ -148,8 +148,13 @@ fn require(path: &Path) -> Result<(), PipelineError> {
 }
 
 impl Sd3Pipeline {
-    /// Load SD 3.5 medium from a `diffusers` model directory.
+    /// Load SD 3.5 medium from a `diffusers` model directory, on the GPU.
     pub fn load(root: &Path) -> Result<Self, PipelineError> {
+        Self::load_on(root, Device::default())
+    }
+
+    /// [`Self::load`] on a named device.
+    pub fn load_on(root: &Path, device: Device) -> Result<Self, PipelineError> {
         let paths = Sd3Paths::in_dir(root);
         for p in [
             &paths.transformer,
@@ -161,7 +166,7 @@ impl Sd3Pipeline {
         ] {
             require(p)?;
         }
-        let stream = Stream::gpu();
+        let stream = Stream::for_device(device);
 
         // Both T5 shards, merged. A single-file assumption drops half the
         // encoder and surfaces as a missing tensor naming one arbitrary layer.
@@ -212,6 +217,7 @@ impl Sd3Pipeline {
         clip_tokenizer: &Path,
         t5_tokenizer: &Path,
         bits: usize,
+        device: Device,
     ) -> Result<Self, PipelineError> {
         for p in [
             transformer,
@@ -224,7 +230,7 @@ impl Sd3Pipeline {
         ] {
             require(p)?;
         }
-        let stream = Stream::gpu();
+        let stream = Stream::for_device(device);
         let t5w = if t5.extension().is_some_and(|e| e == "gguf") {
             // llama.cpp's naming, translated on the way in.
             quantized::from_gguf_renamed(t5, bits, sd_loader::t5_key, &stream)?

@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use sd_tensor::mlx::{load_safetensors, Array};
+use sd_tensor::mlx::{load_safetensors, Array, Device};
 use stable_diffusion_rs::mlx::{Cancel, MlxPipeline, Progress, Region, SdxlPipeline};
 use stable_diffusion_rs::pipeline::{SamplerKind, Strength, Txt2ImgConfig};
 
@@ -173,7 +173,7 @@ pub struct Txt2ImgArgs {
 }
 
 /// Run txt2img, with whatever was attached.
-pub fn run_txt2img(args: &Txt2ImgArgs) -> Result<Vec<PathBuf>> {
+pub fn run_txt2img(args: &Txt2ImgArgs, device: Device) -> Result<Vec<PathBuf>> {
     if args.sdxl {
         // SDXL has no adapter surface here yet; the flags that imply one are
         // refused rather than silently dropped.
@@ -184,12 +184,12 @@ pub fn run_txt2img(args: &Txt2ImgArgs) -> Result<Vec<PathBuf>> {
         {
             bail!("--sdxl does not yet take LoRA, ControlNet, motion or embeddings on MLX");
         }
-        let pipe = SdxlPipeline::load(Path::new(&args.model))?;
+        let pipe = SdxlPipeline::load_on(Path::new(&args.model), device)?;
         let (w, h, bytes) = pipe.txt2img(&args.cfg)?;
         return write_images(&args.output, w, h, &bytes);
     }
 
-    let mut pipe = MlxPipeline::load(Path::new(&args.model))?;
+    let mut pipe = MlxPipeline::load_on(Path::new(&args.model), device)?;
     if let Some((path, multiplier)) = &args.lora {
         let merged = pipe.attach_lora(Path::new(path), *multiplier)?;
         eprintln!("merged {merged} LoRA layers");
@@ -285,8 +285,9 @@ pub fn run_img2img(
     strength: f64,
     mask: Option<&str>,
     output: &str,
+    device: Device,
 ) -> Result<Vec<PathBuf>> {
-    let pipe = MlxPipeline::load(Path::new(model))?;
+    let pipe = MlxPipeline::load_on(Path::new(model), device)?;
     let image = load_signed(init, cfg.width, cfg.height)?;
     let (w, h, bytes) = match mask {
         Some(m) => {
@@ -299,9 +300,15 @@ pub fn run_img2img(
 }
 
 /// Upscale an existing image 4x.
-pub fn run_upscale(model: &str, weights: &str, input: &str, output: &str) -> Result<Vec<PathBuf>> {
+pub fn run_upscale(
+    model: &str,
+    weights: &str,
+    input: &str,
+    output: &str,
+    device: Device,
+) -> Result<Vec<PathBuf>> {
     let dims = image::image_dimensions(input).with_context(|| format!("reading {input}"))?;
-    let pipe = MlxPipeline::load(Path::new(model))?;
+    let pipe = MlxPipeline::load_on(Path::new(model), device)?;
     let w = load_safetensors(Path::new(weights))?;
     // **`[0, 1]`, which is ESRGAN's range and not the VAE's.**
     let image = load_unit(input, dims.0 as usize, dims.1 as usize)?;

@@ -1284,3 +1284,88 @@ fn upscaling_quadruples_the_image() {
     // Wrong byte count is a caller error rather than a reshape deep inside.
     assert!(pipe.upscale_bytes(w, h, &bytes[..10], &weights).is_err());
 }
+
+// -- device selection -------------------------------------------------------
+
+/// **The device is a choice, and both choices work.**
+///
+/// This exists because the alternative — `Stream::gpu()` written at every call
+/// site — is a device nobody running the program can pick. A CPU path that is
+/// bound but never exercised is a claim, not a capability.
+///
+/// The two must agree on the *picture*: MLX reduces in a different order per
+/// device, so bytes may differ slightly, but a diverging implementation would
+/// not land within a whisker.
+#[test]
+fn the_pipeline_runs_on_either_device_and_agrees() {
+    use sd_tensor::mlx::Device;
+
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let cfg = Txt2ImgConfig {
+        // Small and few-stepped: this asks whether the CPU path *works*, and
+        // the CPU is slow enough that asking anything more costs minutes.
+        width: 128,
+        height: 128,
+        steps: 2,
+        sampler: SamplerKind::DpmPlusPlus2M,
+        ..config()
+    };
+
+    let gpu = MlxPipeline::load_on(&dir, Device::Gpu).expect("gpu");
+    assert_eq!(gpu.device(), Device::Gpu);
+    let (w, h, on_gpu) = gpu.txt2img(&cfg).expect("gpu txt2img");
+
+    let cpu = MlxPipeline::load_on(&dir, Device::Cpu).expect("cpu");
+    assert_eq!(cpu.device(), Device::Cpu, "the choice must be remembered");
+    let (cw, ch, on_cpu) = cpu.txt2img(&cfg).expect("cpu txt2img");
+
+    assert_eq!((w, h), (cw, ch));
+    let worst = on_gpu
+        .iter()
+        .zip(&on_cpu)
+        .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let mean = on_gpu
+        .iter()
+        .zip(&on_cpu)
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .sum::<f64>()
+        / on_gpu.len() as f64;
+    eprintln!("gpu vs cpu: mean {mean:.3}/255, worst {worst}/255");
+    assert!(
+        mean < 2.0,
+        "the two devices produced different pictures: mean {mean:.2}/255"
+    );
+
+    // And `load` without a device is the GPU, so the default did not move.
+    assert_eq!(
+        MlxPipeline::load(&dir).expect("default").device(),
+        Device::Gpu
+    );
+}
+
+/// A device name round-trips through its string form, because the CLI parses
+/// one and prints the other.
+#[test]
+fn device_names_round_trip() {
+    use sd_tensor::mlx::Device;
+    for (text, want) in [
+        ("gpu", Device::Gpu),
+        ("metal", Device::Gpu),
+        ("cpu", Device::Cpu),
+    ] {
+        assert_eq!(text.parse::<Device>().unwrap(), want, "{text}");
+    }
+    assert_eq!(Device::Gpu.to_string(), "gpu");
+    assert_eq!(Device::Cpu.to_string(), "cpu");
+    assert!(
+        "tpu".parse::<Device>().is_err(),
+        "an unknown device must be named, not assumed"
+    );
+    // The default is the GPU: a diffusion step is thousands of matmuls.
+    assert_eq!(Device::default(), Device::Gpu);
+}

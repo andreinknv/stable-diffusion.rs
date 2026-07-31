@@ -85,66 +85,78 @@ rather than the 102 files that use tensors. Why MLX, what the move cost and
 what the seam does *not* protect against are in
 [docs/backends.md](docs/backends.md).
 
-## Build
+## Install
 
 ```bash
-brew install mlx-c      # pulls mlx; once, not per build
+brew install mlx-c          # once; pulls mlx
 cargo build --release
-```
-
-`build.rs` finds MLX through `MLX_C_PREFIX`/`MLX_PREFIX` or Homebrew, and
-links nothing at all without the `mlx` feature — so `--no-default-features`
-still compiles on a machine that has never seen it, which is what lets CI
-check the crate graph anywhere.
-
-**Apple silicon only, today.** MLX is Apple's. The seam is what would make
-another backend a bounded change rather than a rewrite — it has already
-survived one swap, from candle — but nothing else is wired up.
-
-```bash
 ./target/release/sdrs info
 ```
 
 The binary is `sdrs`, not `sd` — that name belongs to a
-[widely used find & replace tool](https://crates.io/crates/sd) and installing
-over it would be rude.
+[widely used find & replace tool](https://crates.io/crates/sd).
+
+**GPU or CPU, your choice.** `--cpu` runs the whole pipeline on MLX's CPU
+backend. Measured on an M4 Max, SD 1.5 at 256&times;256 and 4 steps: **8.2 s on
+the GPU, 14.5 s on the CPU**, producing the same picture — 99.8 % of bytes
+identical, largest difference 1/255. The gap widens sharply with size; the GPU
+is the point, and the flag exists because a machine whose GPU is busy should
+still be able to run.
+
+**Apple silicon, today.** MLX ships a Metal backend and upstream has added
+CUDA; this project has only ever been run on Apple silicon, so that is all it
+claims. The seam is what would keep another backend a bounded change rather
+than a rewrite — it has already survived one swap, from candle, which deleted
+37,928 lines and touched `sd-tensor` plus new model code rather than the 102
+files that use tensors.
 
 ## Use
 
-A model directory in the standard `diffusers` layout:
+Point `--model` at a directory in the standard `diffusers` layout.
 
 ```bash
-sdrs txt2img --model ./models/sd15 \
-  --prompt "a rusty crab on a beach" \
-  --steps 20 --seed 42 -o out.png
+# The basics
+sdrs txt2img --model models/sd15 --prompt "a rusty crab on a beach" -o out.png
 
-sdrs txt2img --sdxl --model ./models/sdxl \
-  --prompt "a rusty crab on a beach, golden hour" \
-  --width 1024 --height 1024 -o out.png
+# SDXL, at the size it was trained for
+sdrs txt2img --model models/sdxl --sdxl --width 1024 --height 1024 \
+  --prompt "a lighthouse at dusk" --steps 30 --sampler dpmpp2m -o out.png
 
-sdrs img2img --model ./models/sd15 --init-image out.png \
-  --prompt "a watercolour painting of a crab" --strength 0.75 -o painted.png
+# Redraw an existing image. --strength 0 returns it, 1 ignores it.
+sdrs img2img --model models/sd15 --init out.png --strength 0.6 \
+  --prompt "a watercolour painting" -o painted.png
 
-# Generate a variation of an image: its subject, not its pixels. No pixel of
-# the reference reaches the model — only one CLIP embedding of the whole image.
-sdrs unclip --model ./models/unclip --init-image ref.png --cfg-scale 5.0
+# Repaint only where the mask is white
+sdrs img2img --model models/sd15 --init photo.png --mask mask.png \
+  --prompt "a bunch of flowers" -o fixed.png
 
-# Or from a prompt alone, through the checkpoint's prior.
-sdrs unclip --model ./models/unclip-t2i --prompt "a crab on a beach"
-
-# A single quantised checkpoint, as stable-diffusion.cpp writes them. These
-# carry no tokenizer, so one has to be supplied.
-sdrs txt2img --gguf sd15-q4_k.gguf --tokenizer tokenizer.json \
-  --prompt "a rusty crab on a beach" -o out.png
-
-# No published SD 1.5 ships k-quants — its 320-channel blocks do not divide
-# into their 256-value blocks. Make one from any other GGUF:
-cargo run --release -p sd-cli --example requantise -- in.gguf out.gguf Q4_K
+# Make it 4x bigger
+sdrs upscale --model models/sd15 --weights esrgan_x4.safetensors \
+  --input out.png -o big.png
 ```
 
-The same seed on the same device and build reproduces a file byte for byte.
-Across devices it reproduces the *picture*, not the file — f32 reduction order
-differs per backend. Do not build a cache key on cross-device byte equality.
+### Going further
+
+Every flag below is optional and composes with the rest.
+
+| want | flag |
+|---|---|
+| a style adapter | `--lora lcm.safetensors --lora-scale 1.0` |
+| follow an image's edges/depth | `--controlnet cn.safetensors --control-map edges.png` |
+| a trained trigger word | `--embedding mystyle=mystyle.safetensors` |
+| a short animation | `--motion-adapter adapter.safetensors --frames 16` |
+| detail without duplicated subjects | `--hires 1024x1024 --hires-strength 0.55` |
+| different prompts in different places | `--region left.png="sunflowers"` |
+| fewer model evaluations | `--cache-threshold 0.2` (needs `--sampler dpmpp2m`) |
+| upscale in the same run | `--upscale esrgan_x4.safetensors` |
+
+**`--hires` is not the same as generating big.** A model composes at its
+training resolution and duplicates subjects above it — two heads, two horizons.
+Compose small, refine large.
+
+**`--cache-threshold` needs a deterministic sampler.** `euler-a` and `lcm` draw
+fresh noise every step, so there is nothing to reuse; asking anyway is an error
+rather than a silent no-op.
 
 ### Two things that will bite you
 
@@ -152,11 +164,26 @@ differs per backend. Do not build a cache key on cross-device byte equality.
 repositories ship the slow tokenizer (`vocab.json` + `merges.txt`). Copy
 `tokenizer.json` from `openai/clip-vit-large-patch14`. The error says so.
 
-**Large jobs are refused rather than allowed to thrash.** `sdrs` checks what
-the machine actually has free before loading, weights included, and declines
-if the run would not fit. That is why the same command can succeed and later
-be refused: something else took the memory. `SD_MEMORY_HEADROOM` overrides it.
-See [docs/backends.md](docs/backends.md).
+**The same seed reproduces the same picture, and on the same machine the same
+file.** Across machines the reduction order differs, so bytes will not match.
+Do not build a cache key on cross-machine byte equality.
+
+### As a library
+
+```rust
+use stable_diffusion_rs::mlx::MlxPipeline;
+use stable_diffusion_rs::config::Txt2ImgConfig;
+
+let pipe = MlxPipeline::load("models/sd15".as_ref())?;
+let (w, h, rgb) = pipe.txt2img(&Txt2ImgConfig {
+    prompt: "a rusty crab on a beach".into(),
+    ..Default::default()
+})?;
+```
+
+The library exposes more than the CLI does — SD 3.5 and Flux pipelines,
+unCLIP image variations, IP-Adapter and GLIGEN grounding all have entry points
+under `stable_diffusion_rs::mlx`.
 
 ## Verification
 

@@ -29,7 +29,7 @@ use sd_models::mlx::{
     normalise_legacy_attention, sample, unet_forward_adapters, vae, Adapters, UNetConfig, Weights,
 };
 use sd_sample::{sigmas_for_steps, Schedule};
-use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
+use sd_tensor::mlx::{concat, load_safetensors, Array, Device, Stream};
 use sd_tensor::rng::SeededRng;
 
 use super::{draw_noise, msg, timestep_for};
@@ -64,8 +64,13 @@ fn require(path: PathBuf) -> Result<PathBuf, PipelineError> {
 }
 
 impl SdxlPipeline {
-    /// Load SDXL from a `diffusers` model directory.
+    /// Load SDXL from a `diffusers` model directory, on the GPU.
     pub fn load(root: &Path) -> Result<Self, PipelineError> {
+        Self::load_on(root, Device::default())
+    }
+
+    /// [`Self::load`] on a named device.
+    pub fn load_on(root: &Path, device: Device) -> Result<Self, PipelineError> {
         let tok = require(root.join("tokenizer/tokenizer.json"))?;
         let tok2 = require(root.join("tokenizer_2/tokenizer.json"))?;
         let te = require(root.join("text_encoder/model.safetensors"))?;
@@ -73,7 +78,7 @@ impl SdxlPipeline {
         let unet_p = require(root.join("unet/diffusion_pytorch_model.safetensors"))?;
         let vae_p = require(root.join("vae/diffusion_pytorch_model.safetensors"))?;
 
-        let stream = Stream::gpu();
+        let stream = Stream::for_device(device);
         let mut vae_w = load_safetensors(&vae_p)?;
         normalise_legacy_attention(&mut vae_w);
         let mut unet = load_safetensors(&unet_p)?;

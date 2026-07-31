@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use stable_diffusion_rs as sd;
 use stable_diffusion_rs::config::Txt2ImgConfig;
+use stable_diffusion_rs::tensor::mlx::Device;
 
 #[derive(Parser)]
 #[command(
@@ -18,6 +19,15 @@ use stable_diffusion_rs::config::Txt2ImgConfig;
     about = "Diffusion inference in pure Rust, on MLX"
 )]
 struct Cli {
+    /// Run on the CPU instead of the GPU.
+    ///
+    /// **Slow — a diffusion step is thousands of matmuls and the GPU is the
+    /// point.** It exists because a machine whose GPU is busy should still be
+    /// able to run, and because "GPU or nothing" should be your choice rather
+    /// than a constant compiled in.
+    #[arg(long, global = true)]
+    cpu: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -184,7 +194,9 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let device = if cli.cpu { Device::Cpu } else { Device::Gpu };
+    match cli.command {
         Command::Txt2Img {
             model,
             prompt,
@@ -247,7 +259,7 @@ fn main() -> Result<()> {
                     .collect::<Result<Vec<_>>>()?,
                 upscale,
             };
-            for path in mlx_cli::run_txt2img(&args)? {
+            for path in mlx_cli::run_txt2img(&args, device)? {
                 println!("wrote {}", path.display());
             }
         }
@@ -277,9 +289,15 @@ fn main() -> Result<()> {
                 seed,
                 &sampler,
             )?;
-            for path in
-                mlx_cli::run_img2img(&model, &cfg, &init, strength, mask.as_deref(), &output)?
-            {
+            for path in mlx_cli::run_img2img(
+                &model,
+                &cfg,
+                &init,
+                strength,
+                mask.as_deref(),
+                &output,
+                device,
+            )? {
                 println!("wrote {}", path.display());
             }
         }
@@ -290,14 +308,14 @@ fn main() -> Result<()> {
             input,
             output,
         } => {
-            for path in mlx_cli::run_upscale(&model, &weights, &input, &output)? {
+            for path in mlx_cli::run_upscale(&model, &weights, &input, &output, device)? {
                 println!("wrote {}", path.display());
             }
         }
 
         Command::Info => {
             println!("sdrs {}", sd::VERSION);
-            println!("backend: MLX");
+            println!("backend: MLX ({device})");
             match sd_tensor::sysmem::available_bytes() {
                 Some(free) => println!("free memory: {}", sd_tensor::ops::human_bytes(free)),
                 None => println!("free memory: unknown"),

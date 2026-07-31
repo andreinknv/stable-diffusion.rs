@@ -33,7 +33,7 @@ use sd_models::mlx::{
     Weights,
 };
 use sd_sample::{sigmas_for_steps, Schedule};
-use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
+use sd_tensor::mlx::{concat, load_safetensors, Array, Device, Stream};
 use sd_tensor::rng::SeededRng;
 
 use crate::pipeline::{cache_rescale, PipelineError, SamplerKind, Strength, Txt2ImgConfig};
@@ -338,6 +338,7 @@ pub struct MlxPipeline {
     vae_cfg: vae::VaeConfig,
     schedule: Schedule,
     stream: Stream,
+    device: Device,
     /// Spatial conditioning, in attachment order. Empty is the common case.
     controlnets: Vec<Control>,
     ip: Option<IpAdapter>,
@@ -356,8 +357,16 @@ pub struct MlxPipeline {
 }
 
 impl MlxPipeline {
-    /// Load SD 1.5 from a `diffusers` model directory.
+    /// Load SD 1.5 from a `diffusers` model directory, on the GPU.
     pub fn load(root: &Path) -> Result<Self, PipelineError> {
+        Self::load_on(root, Device::default())
+    }
+
+    /// [`Self::load`] on a named device.
+    ///
+    /// The GPU is the point — a diffusion step is thousands of matmuls — but
+    /// the choice belongs to whoever runs the program, not to a constant.
+    pub fn load_on(root: &Path, device: Device) -> Result<Self, PipelineError> {
         let paths = ModelPaths::in_dir(root);
         let missing = paths.missing();
         if !missing.is_empty() {
@@ -371,7 +380,7 @@ impl MlxPipeline {
                     .join(", ")
             )));
         }
-        let stream = Stream::gpu();
+        let stream = Stream::for_device(device);
         let tokenizer = ClipTokenizer::from_file(&paths.tokenizer)?;
 
         // **The stock checkpoint may use the legacy attention names.** The
@@ -392,6 +401,7 @@ impl MlxPipeline {
             vae_cfg: vae::VaeConfig::sd15(),
             schedule: Schedule::sd15(),
             stream,
+            device,
             controlnets: Vec::new(),
             ip: None,
             unclip: None,
@@ -408,7 +418,12 @@ impl MlxPipeline {
     /// mandatory and the image tower is not: text-to-image unCLIP checkpoints
     /// ship no `image_encoder` at all, because a prompt is their only input.
     pub fn load_unclip(root: &Path) -> Result<Self, PipelineError> {
-        let mut pipe = Self::load(root)?;
+        Self::load_unclip_on(root, Device::default())
+    }
+
+    /// [`Self::load_unclip`] on a named device.
+    pub fn load_unclip_on(root: &Path, device: Device) -> Result<Self, PipelineError> {
+        let mut pipe = Self::load_on(root, device)?;
         pipe.cfg = UNetConfig::unclip();
         // unCLIP's text encoder is SD 2.x's OpenCLIP ViT-H — 1024 wide, 23
         // layers, plain gelu — not SD 1.5's CLIP-L.
@@ -1570,5 +1585,10 @@ impl MlxPipeline {
     /// tensors to hand in.
     pub fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    /// Which device this pipeline loaded onto.
+    pub fn device(&self) -> Device {
+        self.device
     }
 }

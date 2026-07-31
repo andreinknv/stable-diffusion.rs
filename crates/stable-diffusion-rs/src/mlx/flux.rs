@@ -41,7 +41,7 @@ use sd_models::mlx::{
 };
 use sd_models::t5::T5Tokenizer;
 use sd_sample::flow::{flow_sigmas, flow_timesteps, FlowMatchConfig};
-use sd_tensor::mlx::{load_safetensors, Array, Stream};
+use sd_tensor::mlx::{load_safetensors, Array, Device, Stream};
 use sd_tensor::rng::SeededRng;
 
 use super::{draw_noise, msg};
@@ -160,7 +160,7 @@ impl FluxPipeline {
     /// the VAE stay dense because together they are under a gigabyte and the
     /// VAE has no quantised convolution to use.
     pub fn load(root: &Path, cfg: flux::FluxConfig) -> Result<Self, PipelineError> {
-        Self::load_quantized(root, cfg, quantized::DEFAULT_BITS)
+        Self::load_quantized(root, cfg, quantized::DEFAULT_BITS, Device::default())
     }
 
     /// [`Self::load`] at an explicit bit width for the bulk of the weights.
@@ -172,6 +172,7 @@ impl FluxPipeline {
         root: &Path,
         cfg: flux::FluxConfig,
         bits: usize,
+        device: Device,
     ) -> Result<Self, PipelineError> {
         let paths = FluxPaths::in_dir(root);
         for p in [
@@ -190,7 +191,7 @@ impl FluxPipeline {
         if paths.t5.is_empty() {
             return Err(PipelineError::MissingFile(root.join("text_encoder_2")));
         }
-        let stream = Stream::gpu();
+        let stream = Stream::for_device(device);
 
         let mut dense_transformer = Weights::new();
         for shard in &paths.transformer {
@@ -249,6 +250,7 @@ impl FluxPipeline {
         t5_tokenizer: &Path,
         cfg: flux::FluxConfig,
         bits: usize,
+        device: Device,
     ) -> Result<Self, PipelineError> {
         for p in [
             transformer_gguf,
@@ -262,7 +264,7 @@ impl FluxPipeline {
                 return Err(PipelineError::MissingFile(p.to_path_buf()));
             }
         }
-        let stream = Stream::gpu();
+        let stream = Stream::for_device(device);
         let transformer = quantized::from_gguf(transformer_gguf, bits, &stream)?;
         let t5w = quantized::from_gguf_renamed(t5_gguf, bits, sd_loader::t5_key, &stream)?;
 

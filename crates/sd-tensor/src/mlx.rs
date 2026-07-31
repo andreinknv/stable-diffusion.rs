@@ -439,6 +439,59 @@ impl Stream {
         init();
         Self(unsafe { mlx_default_cpu_stream_new() })
     }
+
+    /// The stream for a named device.
+    ///
+    /// The reason this exists rather than callers writing `Stream::gpu()`: a
+    /// device that can only be chosen at the call site cannot be chosen at all
+    /// by whoever is running the program. Every pipeline takes a [`Device`] and
+    /// passes it here, so `--cpu` is a flag rather than a rebuild.
+    pub fn for_device(device: Device) -> Self {
+        match device {
+            Device::Gpu => Self::gpu(),
+            Device::Cpu => Self::cpu(),
+        }
+    }
+}
+
+/// Which device to run on.
+///
+/// **MLX's CPU backend is real, not a stub** — it computes, and on this
+/// machine it is what reads every `.safetensors` file, because MLX's `Load`
+/// primitive has no GPU implementation. What it is not is *fast*: a diffusion
+/// step is thousands of matmuls and the GPU is the point.
+///
+/// It is exposed because "GPU or nothing" should be the user's choice to make,
+/// not a constant compiled into 105 call sites — and because a machine whose
+/// GPU is busy or absent should still be able to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Device {
+    #[default]
+    Gpu,
+    Cpu,
+}
+
+impl std::str::FromStr for Device {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> crate::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "gpu" | "metal" => Ok(Self::Gpu),
+            "cpu" => Ok(Self::Cpu),
+            other => Err(crate::Error::Msg(format!(
+                "unknown device {other:?}; try `gpu` or `cpu`"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gpu => "gpu",
+            Self::Cpu => "cpu",
+        })
+    }
 }
 
 impl Drop for Stream {
