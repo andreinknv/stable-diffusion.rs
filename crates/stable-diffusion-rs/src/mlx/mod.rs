@@ -29,14 +29,15 @@ use std::path::{Path, PathBuf};
 use sd_models::clip::ClipTokenizer;
 use sd_models::mlx::{
     clip, clip_vision, controlnet, gligen, ip, lora::Lora, motion, normalise_legacy_attention,
-    sample, unclip, unet_forward_adapters, vae, Adapters, Motion, UNetConfig, Weights,
+    sample, timestep_embedding, unclip, unet_forward_adapters, vae, Adapters, Motion, UNetConfig,
+    Weights,
 };
 use sd_sample::{sigmas_for_steps, Schedule};
 use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
 use sd_tensor::rng::SeededRng;
 use sd_tensor::{Device, Tensor};
 
-use crate::pipeline::{PipelineError, SamplerKind, Strength, Txt2ImgConfig};
+use crate::pipeline::{cache_rescale, PipelineError, SamplerKind, Strength, Txt2ImgConfig};
 
 pub mod flux;
 pub mod sd3;
@@ -169,12 +170,42 @@ pub struct GroundedBox {
     pub phrase: String,
 }
 
+/// Progress after one step.
+///
+/// `denoised` is the model's estimate of the **finished image** as a latent —
+/// not the sampler's latent, and that difference is the whole value of the
+/// field. The latent at step 5 of 20 is `x0 + sigma*noise` with sigma still
+/// around 4, so decoding it shows noise; this is the `x0` the model predicts,
+/// which decodes blurry and sharpens as the run proceeds.
+pub struct Progress<'a> {
+    /// 1-based; equal to `total` on the last step.
+    pub step: usize,
+    pub total: usize,
+    pub sigma: f64,
+    pub denoised: &'a Array,
+    /// How many steps so far actually ran the model rather than reusing a
+    /// cached prediction. Equal to `step` when caching is off.
+    pub evaluated: usize,
+}
+
+/// A callback invoked after each step.
+pub type ProgressFn<'a> = &'a mut dyn FnMut(Progress<'_>);
+
+/// One region of the canvas, with its own prompt.
+pub struct Region {
+    /// `[1, h, w, 1]` in `[0, 1]` at **pixel** resolution. Downsampled to the
+    /// latent grid by **mean**, not max: a region boundary should fade over a
+    /// latent cell rather than claim it outright, which is the opposite of
+    /// what an inpainting mask wants and is worth not copying by reflex.
+    pub mask: Array,
+    pub prompt: String,
+}
+
 /// The per-run conditioning that is not the prompt.
 ///
 /// Bundled because the sampling loop needs all of it and none of it belongs to
 /// [`Txt2ImgConfig`], which is shared with the candle pipeline and holds no
 /// tensors.
-#[derive(Default)]
 struct Extras<'a> {
     /// A ControlNet's control map, `[1, h, w, 3]` in `[-1, 1]`.
     hint: Option<&'a Array>,
@@ -182,6 +213,125 @@ struct Extras<'a> {
     ip_tokens: Option<Array>,
     /// GLIGEN's grounding tokens, likewise doubled.
     objs: Option<&'a Array>,
+    /// Per-region prompts, blended into the noise prediction each step.
+    regions: &'a [Region],
+    /// Reuse the model's prediction between steps while it is estimated not to
+    /// have moved much. 0 disables it bit-identically.
+    cache_threshold: f64,
+    /// Checked once per step. A step is not interruptible internally, so
+    /// cancelling costs at most one step of latency.
+    cancel: Option<Cancel>,
+}
+
+impl Default for Extras<'_> {
+    fn default() -> Self {
+        Self {
+            hint: None,
+            ip_tokens: None,
+            objs: None,
+            regions: &[],
+            cache_threshold: 0.0,
+            cancel: None,
+        }
+    }
+}
+
+/// Replace one sequence position of `[1, seq, width]`.
+///
+/// Rebuilt rather than written in place: MLX arrays are immutable, so this
+/// concatenates the part before, the new row, and the part after.
+fn splice_row(embeds: &Array, row: &Array, at: usize, s: &Stream) -> Result<Array, PipelineError> {
+    let [_, seq, _] = embeds.shape()[..] else {
+        return Err(msg(format!("mlx: embeds {:?}", embeds.shape())));
+    };
+    if at >= seq {
+        return Err(msg(format!(
+            "mlx: position {at} is past the sequence's {seq}"
+        )));
+    }
+    let mut parts: Vec<Array> = Vec::with_capacity(3);
+    if at > 0 {
+        parts.push(embeds.narrow(1, 0, at, s)?);
+    }
+    parts.push(row.contiguous(s)?);
+    if at + 1 < seq {
+        parts.push(embeds.narrow(1, at + 1, seq - at - 1, s)?);
+    }
+    let refs: Vec<&Array> = parts.iter().collect();
+    Ok(concat(&refs, 1, s)?)
+}
+
+/// Nearest-neighbour 2x-and-beyond upsample of a latent, `[n, h, w, c]`.
+///
+/// Integer scaling only, which is what a hires pass wants: it is
+/// `broadcast_to` between two reshapes, so each source cell is copied into an
+/// exact block and no intermediate value is invented.
+fn nearest_upsample(
+    x: &Array,
+    out_h: usize,
+    out_w: usize,
+    s: &Stream,
+) -> Result<Array, PipelineError> {
+    let [n, h, w, c] = x.shape()[..] else {
+        return Err(msg(format!("mlx: upsample got {:?}", x.shape())));
+    };
+    if out_h % h != 0 || out_w % w != 0 {
+        return Err(msg(format!(
+            "mlx: {h}x{w} does not scale to {out_h}x{out_w} by an integer factor; a hires \
+             pass wants a whole multiple so no intermediate value is invented"
+        )));
+    }
+    let (fh, fw) = (out_h / h, out_w / w);
+    Ok(x.reshape(&[n, h, 1, w, 1, c], s)?
+        .broadcast_to(&[n, h, fh, w, fw, c], s)?
+        .contiguous(s)?
+        .reshape(&[n, out_h, out_w, c], s)?)
+}
+
+/// Reduce a pixel-resolution region mask to the latent grid by **mean**.
+///
+/// Not max. `sample::latent_mask` uses max because an inpaint needs a cell
+/// freed if *any* pixel under it is writeable; a region wants the opposite —
+/// a boundary that fades across a cell rather than claiming it. Reusing the
+/// inpainting reduction here gives every region a hard edge at latent
+/// resolution.
+fn mean_pool_to_latent(mask_px: &Array, s: &Stream) -> Result<Array, PipelineError> {
+    let [n, h, w, c] = mask_px.shape()[..] else {
+        return Err(msg(format!(
+            "mlx: a region mask should be [n, h, w, 1], got {:?}",
+            mask_px.shape()
+        )));
+    };
+    if h % 8 != 0 || w % 8 != 0 {
+        return Err(msg(format!(
+            "mlx: a {h}x{w} region mask does not divide into latent cells"
+        )));
+    }
+    Ok(mask_px
+        .reshape(&[n, h / 8, 8, w / 8, 8, c], s)?
+        .mean(&[2, 4], false, s)?)
+}
+
+/// A cancellation token, shared with whatever wants to stop a generation.
+///
+/// A token rather than a callback return value, so the ordinary progress
+/// callback stays a plain `FnMut` and callers who never cancel write nothing.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the generation to stop. Safe to call from any thread.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// A loaded SD 1.5-family pipeline on MLX.
@@ -205,6 +355,10 @@ pub struct MlxPipeline {
     /// unCLIP's image conditioning: the normalizer's statistics and the
     /// vision tower. Only an unCLIP checkpoint has these.
     unclip: Option<(Weights, Weights)>,
+    /// Textual-inversion embeddings, spliced into prompts by trigger word.
+    ///
+    /// Each is `(trigger, [vectors, width])`.
+    embeddings: Vec<(String, Array)>,
     /// An AnimateDiff motion adapter, and the clip length it will run at.
     ///
     /// The adapter is a separate checkpoint from the UNet, so it is held apart
@@ -252,6 +406,7 @@ impl MlxPipeline {
             controlnets: Vec::new(),
             ip: None,
             unclip: None,
+            embeddings: Vec::new(),
             motion: None,
         })
     }
@@ -328,6 +483,34 @@ impl MlxPipeline {
         let class_embeds = concat(&[&uncond, &conditioned], 0, s)?;
 
         self.generate_with_class(cfg, Some(&class_embeds), &mut rng)
+    }
+
+    /// Attach a textual-inversion embedding under a trigger word.
+    ///
+    /// **The width is checked here**, because an SDXL embedding in an SD 1.5
+    /// prompt is the common mistake and would otherwise surface as a shape
+    /// error from deep inside the transformer.
+    pub fn attach_embedding(&mut self, trigger: &str, vectors: Array) -> Result<(), PipelineError> {
+        let [n, width] = vectors.shape()[..] else {
+            return Err(msg(format!(
+                "mlx: an embedding should be [vectors, width], got {:?}",
+                vectors.shape()
+            )));
+        };
+        if width != self.clip_cfg.hidden {
+            return Err(msg(format!(
+                "mlx: the embedding `{trigger}` is {width} wide and this text encoder is {}; \
+                 an SDXL embedding in an SD 1.5 prompt is the usual cause",
+                self.clip_cfg.hidden
+            )));
+        }
+        if n == 0 {
+            return Err(msg(format!(
+                "mlx: the embedding `{trigger}` has no vectors"
+            )));
+        }
+        self.embeddings.push((trigger.to_string(), vectors));
+        Ok(())
     }
 
     /// Attach an AnimateDiff motion adapter and fix the clip length.
@@ -499,12 +682,82 @@ impl MlxPipeline {
     /// EOS, which is what the tokenizer produces and what the model was trained
     /// against. Feeding a zero tensor instead is a different unconditional.
     fn encode(&self, prompt: &str) -> Result<Array, PipelineError> {
-        let ids = self.token_ids(prompt)?;
-        Ok(clip::text_encoder_with(
-            &ids,
+        if self.embeddings.is_empty() {
+            let ids = self.token_ids(prompt)?;
+            return Ok(clip::text_encoder_with(
+                &ids,
+                &self.clip_cfg,
+                &self.text_encoder,
+                &self.stream,
+            )?);
+        }
+        self.encode_with_embeddings(prompt)
+    }
+
+    /// Encode a prompt with textual-inversion embeddings spliced in.
+    ///
+    /// The trigger is first **expanded** to as many copies of itself as the
+    /// embedding has vectors, so the tokeniser reserves that many positions;
+    /// then each position's vector is overwritten. Reserving is all the word
+    /// is for — its own token embeddings are discarded.
+    ///
+    /// The positions are found by matching token ids, **not character
+    /// offsets**: BPE splits are not positions in the string.
+    fn encode_with_embeddings(&self, prompt: &str) -> Result<Array, PipelineError> {
+        let s = &self.stream;
+        let mut expanded = prompt.to_string();
+        for (trigger, vectors) in &self.embeddings {
+            if !expanded.contains(trigger.as_str()) {
+                continue;
+            }
+            let n = vectors.shape()[0];
+            let repeated = std::iter::repeat_n(trigger.as_str(), n)
+                .collect::<Vec<_>>()
+                .join(" ");
+            expanded = expanded.replace(trigger.as_str(), &repeated);
+        }
+
+        let ids = self.token_ids(&expanded)?;
+        let mut embeds = clip::embeddings(&ids, &self.text_encoder, s)?;
+        let flat: Vec<i32> = ids
+            .to_f32(s)?
+            .to_vec_f32(s)?
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
+        let width = self.clip_cfg.hidden;
+
+        for (trigger, vectors) in &self.embeddings {
+            let trigger_ids: Vec<i32> = self
+                .tokenizer
+                .encode_content(trigger)?
+                .iter()
+                .map(|&x| x as i32)
+                .collect();
+            if trigger_ids.is_empty() {
+                continue;
+            }
+            let n = vectors.shape()[0];
+            let mut placed = 0usize;
+            let mut i = 0usize;
+            while i + trigger_ids.len() <= flat.len() && placed < n {
+                if flat[i..i + trigger_ids.len()] == trigger_ids[..] {
+                    let row = vectors
+                        .narrow(0, placed, 1, s)?
+                        .reshape(&[1, 1, width], s)?;
+                    embeds = splice_row(&embeds, &row, i, s)?;
+                    placed += 1;
+                    i += trigger_ids.len();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        Ok(clip::encode_from_embeds(
+            &embeds,
             &self.clip_cfg,
             &self.text_encoder,
-            &self.stream,
+            s,
         )?)
     }
 
@@ -592,6 +845,7 @@ impl MlxPipeline {
         extras: &Extras<'_>,
         class_embeds: Option<&Array>,
         rng: &mut SeededRng,
+        progress: ProgressFn<'_>,
     ) -> Result<Array, PipelineError> {
         let s = &self.stream;
         let [nframes, lh, lw, lc] = latent.shape()[..] else {
@@ -633,7 +887,32 @@ impl MlxPipeline {
             concat(&refs, 0, s)?
         };
 
-        for i in 0..sigmas.len().saturating_sub(1) {
+        // **Caching is refused with an ancestral sampler**, not ignored. Those
+        // draw fresh noise every step, so consecutive predictions never stop
+        // moving and there is nothing to reuse — a caller who asked for
+        // caching and got none would wonder why, and one who got it anyway
+        // would get colour speckle.
+        if extras.cache_threshold > 0.0 && !matches!(sampler, SamplerKind::DpmPlusPlus2M) {
+            return Err(msg(
+                "mlx: step caching needs a deterministic sampler; euler_a and lcm re-noise \
+                 every step and leave nothing to reuse"
+                    .into(),
+            ));
+        }
+        // The reused prediction, the last timestep embedding, and the
+        // accumulated *predicted* relative change in the model's output.
+        let mut cached: Option<Array> = None;
+        let mut previous_temb: Option<Array> = None;
+        let mut drift = 0f64;
+        let mut evaluated = 0usize;
+        let total = sigmas.len().saturating_sub(1);
+
+        for i in 0..total {
+            // Checked before the work, so a cancel between steps costs nothing
+            // and the error says how far it got.
+            if extras.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                return Err(msg(format!("mlx: cancelled after {i} of {total} steps")));
+            }
             let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
 
             let latent_in = sample::scale_model_input(&latent, sigma, s)?;
@@ -670,18 +949,63 @@ impl MlxPipeline {
                 objs: extras.objs,
                 motion: m.as_ref(),
             };
-            let out = unet_forward_adapters(
-                &latent_in,
-                &timestep,
-                &context,
-                None,
-                class_embeds,
-                &ad,
-                &self.cfg,
-                &self.unet,
-                s,
-            )?;
-            let noise_pred = sample::guidance(&out, cfg_scale, s)?;
+            // **The cache predictor is the timestep embedding**, not the
+            // latent. TeaCache's method: measure how far the embedding moved,
+            // rescale it through a fitted polynomial into an estimate of how
+            // far the *output* would move, and accumulate. `cache_rescale` is
+            // scalar and shared with the candle path, so the two cannot fit
+            // different curves.
+            let reuse = if extras.cache_threshold > 0.0 {
+                let temb = timestep_embedding(&timestep, 320, &self.unet, s)?;
+                let moved = match &previous_temb {
+                    Some(prev) => sample::relative_l1(&temb, prev, s)?,
+                    None => f64::INFINITY,
+                };
+                previous_temb = Some(temb);
+                if moved.is_finite() {
+                    drift += cache_rescale(moved);
+                }
+                cached.is_some() && drift < extras.cache_threshold
+            } else {
+                false
+            };
+
+            let noise_pred = if reuse {
+                cached
+                    .as_ref()
+                    .expect("reuse implies a cached prediction")
+                    .contiguous(s)?
+            } else {
+                let out = unet_forward_adapters(
+                    &latent_in,
+                    &timestep,
+                    &context,
+                    None,
+                    class_embeds,
+                    &ad,
+                    &self.cfg,
+                    &self.unet,
+                    s,
+                )?;
+                let guided = sample::guidance(&out, cfg_scale, s)?;
+                // Regions blend *before* the step, not after: compositing two
+                // finished images produces visible joins because neither half
+                // ever saw the other.
+                let guided = self.blend_regions(
+                    &guided,
+                    &latent_in,
+                    &timestep,
+                    cfg_scale,
+                    class_embeds,
+                    &ad,
+                    extras,
+                    s,
+                )?;
+                evaluated += 1;
+                drift = 0.0;
+                cached = Some(guided.contiguous(s)?);
+                guided
+            };
             let denoised = sample::denoise_epsilon(&latent, &noise_pred, sigma, s)?;
 
             latent = match sampler {
@@ -700,8 +1024,66 @@ impl MlxPipeline {
                 let noise = draw_all(rng)?;
                 latent = sample::restore_outside_mask(&latent, init, mask, &noise, sigma_next, s)?;
             }
+
+            progress(Progress {
+                step: i + 1,
+                total,
+                sigma,
+                denoised: &denoised,
+                evaluated,
+            });
         }
         Ok(latent)
+    }
+
+    /// Blend each region's own noise prediction into the base one.
+    ///
+    /// **Before the step, not after.** Generating separately and compositing
+    /// produces visible joins because neither half ever saw the other; blending
+    /// the predictions means every region is denoised in the context of its
+    /// neighbours.
+    ///
+    /// The mask is reduced to the latent grid by **mean**, not max — a region
+    /// boundary should fade over a latent cell rather than claim it outright,
+    /// which is the opposite of what an inpainting mask wants.
+    #[allow(clippy::too_many_arguments)]
+    fn blend_regions(
+        &self,
+        base: &Array,
+        latent_in: &Array,
+        timestep: &Array,
+        cfg_scale: f64,
+        class_embeds: Option<&Array>,
+        ad: &Adapters<'_>,
+        extras: &Extras<'_>,
+        s: &Stream,
+    ) -> Result<Array, PipelineError> {
+        if extras.regions.is_empty() {
+            return Ok(base.contiguous(s)?);
+        }
+        let mut out = base.contiguous(s)?;
+        for region in extras.regions {
+            let ctx = self.conditioning(&Txt2ImgConfig {
+                prompt: region.prompt.clone(),
+                ..Default::default()
+            })?;
+            let pred = unet_forward_adapters(
+                latent_in,
+                timestep,
+                &ctx,
+                None,
+                class_embeds,
+                ad,
+                &self.cfg,
+                &self.unet,
+                s,
+            )?;
+            let guided = sample::guidance(&pred, cfg_scale, s)?;
+            let mask = mean_pool_to_latent(&region.mask, s)?;
+            let keep = Array::scalar_f32(1.0)?.sub(&mask, s)?;
+            out = out.mul(&keep, s)?.add(&guided.mul(&mask, s)?, s)?;
+        }
+        Ok(out)
     }
 
     /// Every attached ControlNet's corrections, summed.
@@ -837,7 +1219,16 @@ impl MlxPipeline {
         boxes: &[GroundedBox],
     ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
         let mut rng = SeededRng::new(cfg.seed);
-        self.generate_inner(cfg, hint, reference, boxes, None, &mut rng)
+        self.generate_inner(
+            cfg,
+            hint,
+            reference,
+            boxes,
+            None,
+            &mut rng,
+            None,
+            &mut |_| {},
+        )
     }
 
     /// [`Self::generate`] with unCLIP's image conditioning, and a caller-owned
@@ -848,7 +1239,7 @@ impl MlxPipeline {
         class_embeds: Option<&Array>,
         rng: &mut SeededRng,
     ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
-        self.generate_inner(cfg, None, None, &[], class_embeds, rng)
+        self.generate_inner(cfg, None, None, &[], class_embeds, rng, None, &mut |_| {})
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -860,6 +1251,8 @@ impl MlxPipeline {
         boxes: &[GroundedBox],
         class_embeds: Option<&Array>,
         rng: &mut SeededRng,
+        extras_in: Option<&Extras<'_>>,
+        progress: ProgressFn<'_>,
     ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
         if cfg.width % 8 != 0 || cfg.height % 8 != 0 {
             return Err(msg(format!(
@@ -880,6 +1273,9 @@ impl MlxPipeline {
             hint,
             ip_tokens,
             objs: objs.as_ref(),
+            regions: extras_in.map_or(&[][..], |e| e.regions),
+            cache_threshold: extras_in.map_or(0.0, |e| e.cache_threshold),
+            cancel: extras_in.and_then(|e| e.cancel.clone()),
         };
 
         // **One draw per frame, in order.** A clip is a batch, so the latent is
@@ -904,8 +1300,152 @@ impl MlxPipeline {
             &extras,
             class_embeds,
             rng,
+            progress,
         )?;
         self.decode(&latent)
+    }
+
+    /// [`Self::txt2img`] reporting progress after each step, with optional
+    /// step caching, cancellation and per-region prompts.
+    ///
+    /// `cache_threshold` is *predicted relative change in the model's output*,
+    /// accumulated since the last real evaluation — so 0.2 means "reuse until
+    /// the prediction is estimated to have drifted 20 %", which is a statement
+    /// about the model rather than an arbitrary metric. 0 disables it
+    /// bit-identically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn txt2img_with(
+        &self,
+        cfg: &Txt2ImgConfig,
+        hint: Option<&Array>,
+        reference: Option<&Array>,
+        boxes: &[GroundedBox],
+        regions: &[Region],
+        cache_threshold: f64,
+        cancel: Option<Cancel>,
+        progress: ProgressFn<'_>,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        let extras = Extras {
+            regions,
+            cache_threshold,
+            cancel,
+            ..Default::default()
+        };
+        let mut rng = SeededRng::new(cfg.seed);
+        self.generate_inner(
+            cfg,
+            hint,
+            reference,
+            boxes,
+            None,
+            &mut rng,
+            Some(&extras),
+            progress,
+        )
+    }
+
+    /// Two passes: compose at `cfg`'s size, enlarge the latent, refine at the
+    /// larger one.
+    ///
+    /// **This fixes a real failure, not a cosmetic one.** SD 1.5 asked to
+    /// compose at 1024 directly produces duplicated subjects — three knights
+    /// where one was asked for — because it was trained at 512 and the extra
+    /// canvas reads as more room for content. Composing small and refining
+    /// large gives one, sharp, and is *faster*, because the first pass runs at
+    /// the smaller size.
+    ///
+    /// The second pass draws from `seed + 1`, so the two passes do not draw the
+    /// same noise for differently-sized latents.
+    pub fn txt2img_hires(
+        &self,
+        cfg: &Txt2ImgConfig,
+        width: usize,
+        height: usize,
+        strength: Strength,
+        progress: ProgressFn<'_>,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        if width % 8 != 0 || height % 8 != 0 {
+            return Err(msg(format!(
+                "mlx: {width}x{height} does not divide into 8-pixel latent cells"
+            )));
+        }
+        if width < cfg.width || height < cfg.height {
+            return Err(msg(format!(
+                "mlx: the second pass is {width}x{height}, smaller than the first at {}x{} — \
+                 hires enlarges",
+                cfg.width, cfg.height
+            )));
+        }
+        let s = &self.stream;
+
+        // Pass one, at the size the model composes well at.
+        let mut rng = SeededRng::new(cfg.seed);
+        let first = self.latent_for(cfg, &mut rng, progress)?;
+
+        // **Nearest, by default, introduces no colours that were not already
+        // there.** Every interpolating mode invents intermediate values, which
+        // is right for photographic work and destructive for a fixed palette.
+        let (lh, lw) = (height / 8, width / 8);
+        let enlarged = nearest_upsample(&first, lh, lw, s)?;
+
+        // Pass two: noise the enlarged latent to where `strength` starts and
+        // run the tail of the schedule.
+        let second = Txt2ImgConfig {
+            width,
+            height,
+            // A different seed, so the two passes do not draw the same noise
+            // for differently-sized latents.
+            seed: cfg.seed.wrapping_add(1),
+            ..cfg.clone()
+        };
+        let sigmas = self.sigmas(second.sampler, second.steps);
+        let start = strength.start_index(second.steps);
+        if start >= second.steps {
+            return self.decode(&enlarged);
+        }
+        let mut rng = SeededRng::new(second.seed);
+        let noise = draw_noise(&mut rng, 4, lh, lw)?;
+        let latent = sample::noise_to_sigma(&enlarged, &noise, sigmas[start], s)?;
+        let context = self.conditioning(&second)?;
+        let latent = self.denoise(
+            latent,
+            &context,
+            &sigmas[start..],
+            second.cfg_scale,
+            second.sampler,
+            None,
+            &Extras::default(),
+            None,
+            &mut rng,
+            progress,
+        )?;
+        self.decode(&latent)
+    }
+
+    /// One txt2img pass, stopping at the latent.
+    fn latent_for(
+        &self,
+        cfg: &Txt2ImgConfig,
+        rng: &mut SeededRng,
+        progress: ProgressFn<'_>,
+    ) -> Result<Array, PipelineError> {
+        let (lh, lw) = (cfg.height / 8, cfg.width / 8);
+        let context = self.conditioning(cfg)?;
+        let sigmas = self.sigmas(cfg.sampler, cfg.steps);
+        let latent =
+            draw_noise(rng, 4, lh, lw)?.mul(&Array::scalar_f32(sigmas[0] as f32)?, &self.stream)?;
+        self.denoise(
+            latent,
+            &context,
+            &sigmas,
+            cfg.cfg_scale,
+            cfg.sampler,
+            None,
+            &Extras::default(),
+            None,
+            rng,
+            progress,
+        )
     }
 
     /// An image and a prompt to pixels.
@@ -981,6 +1521,7 @@ impl MlxPipeline {
             &Extras::default(),
             None,
             &mut rng,
+            &mut |_| {},
         )?;
         self.decode(&latent)
     }

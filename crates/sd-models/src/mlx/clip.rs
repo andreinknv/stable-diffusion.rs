@@ -210,6 +210,30 @@ pub fn text_encoder(token_ids: &Array, w: &Weights, s: &Stream) -> Result<Array>
     text_encoder_with(token_ids, &ClipConfig::sd15(), w, s)
 }
 
+/// The tower run on an **already-embedded** sequence.
+///
+/// Textual inversion needs this: a trained embedding replaces the vectors at
+/// its trigger's positions, which happens after the token lookup and before
+/// the first layer. Re-tokenising afterwards would discard the substitution,
+/// so the two halves have to be separable.
+pub fn encode_from_embeds(
+    embeds: &Array,
+    cfg: &ClipConfig,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
+    let mut h = embeds.contiguous(s)?;
+    for i in 0..cfg.layers {
+        h = encoder_layer(&h, cfg, w, &format!("text_model.encoder.layers.{i}"), s)?;
+    }
+    h.layer_norm(
+        Some(get(w, "text_model.final_layer_norm.weight")?),
+        Some(get(w, "text_model.final_layer_norm.bias")?),
+        CLIP_EPS,
+        s,
+    )
+}
+
 /// [`text_encoder`] for any of the towers in [`ClipConfig`].
 pub fn text_encoder_with(
     token_ids: &Array,

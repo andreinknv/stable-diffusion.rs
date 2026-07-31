@@ -246,3 +246,30 @@ pub fn restore_outside_mask(
     let keep = Array::scalar_f32(1.0)?.sub(mask, s)?;
     latent.mul(mask, s)?.add(&restored.mul(&keep, s)?, s)
 }
+
+// -- step caching -----------------------------------------------------------
+
+/// Relative L1 distance, `|a - b|_1 / |b|_1`.
+///
+/// **Relative rather than absolute**, because the tensors involved span orders
+/// of magnitude across a run and an absolute threshold would mean something
+/// different at step 1 than at step 19. This is what TeaCache accumulates, and
+/// what makes the numbers comparable between steps.
+pub fn relative_l1(a: &Array, b: &Array, s: &Stream) -> Result<f64> {
+    let diff = a
+        .sub(b, s)?
+        .abs(s)?
+        .sum(&[], true, s)?
+        .to_vec_f32(s)?
+        .first()
+        .copied()
+        .unwrap_or(0.0) as f64;
+    let base = b
+        .abs(s)?
+        .sum(&[], true, s)?
+        .to_vec_f32(s)?
+        .first()
+        .copied()
+        .unwrap_or(0.0) as f64;
+    Ok(diff / base.max(f64::EPSILON))
+}

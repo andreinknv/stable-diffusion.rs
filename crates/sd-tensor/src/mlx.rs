@@ -126,6 +126,7 @@ unsafe extern "C" {
     fn mlx_multiply(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> i32;
     fn mlx_divide(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> i32;
     fn mlx_sigmoid(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
+    fn mlx_abs(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
     fn mlx_maximum(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> i32;
     fn mlx_erf(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
     fn mlx_sqrt(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
@@ -556,6 +557,11 @@ impl Array {
 
     pub fn matmul(&self, rhs: &Self, stream: &Stream) -> Result<Self> {
         self.binary(rhs, stream, "matmul", mlx_matmul)
+    }
+
+    /// Elementwise absolute value.
+    pub fn abs(&self, stream: &Stream) -> Result<Self> {
+        self.unary(stream, "abs", mlx_abs)
     }
 
     pub fn sigmoid(&self, stream: &Stream) -> Result<Self> {

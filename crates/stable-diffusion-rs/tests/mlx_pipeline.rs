@@ -16,7 +16,8 @@
 use std::path::PathBuf;
 
 use stable_diffusion_rs::mlx::{
-    FluxPaths, FluxPipeline, GroundedBox, MlxPipeline, Sd3Paths, Sd3Pipeline, SdxlPipeline,
+    Cancel, FluxPaths, FluxPipeline, GroundedBox, MlxPipeline, Region, Sd3Paths, Sd3Pipeline,
+    SdxlPipeline,
 };
 use stable_diffusion_rs::pipeline::{SamplerKind, Strength, Txt2ImgConfig};
 use stable_diffusion_rs::tensor::mlx::Array;
@@ -948,4 +949,285 @@ fn a_plain_pipeline_refuses_an_image_variation() {
         pipe.variation(&config(), &reference, 0).is_err(),
         "a pipeline loaded without `load_unclip` must refuse a variation"
     );
+}
+
+// -- orchestration ----------------------------------------------------------
+
+/// **Progress reports every step, and `evaluated` counts real model runs.**
+#[test]
+fn progress_reports_every_step() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("pipeline");
+    let cfg = config();
+
+    let mut seen: Vec<(usize, usize, f64)> = Vec::new();
+    let (_, _, _) = pipe
+        .txt2img_with(&cfg, None, None, &[], &[], 0.0, None, &mut |p| {
+            seen.push((p.step, p.evaluated, p.sigma));
+        })
+        .expect("txt2img");
+
+    assert_eq!(seen.len(), STEPS, "one report per step");
+    assert_eq!(seen[0].0, 1, "1-based");
+    assert_eq!(seen[STEPS - 1].0, STEPS, "and ends at total");
+    // With caching off, every step ran the model.
+    for (step, evaluated, _) in &seen {
+        assert_eq!(step, evaluated, "no caching means every step evaluates");
+    }
+    // Sigma descends.
+    for pair in seen.windows(2) {
+        assert!(
+            pair[1].2 < pair[0].2,
+            "sigma rose from {} to {}",
+            pair[0].2,
+            pair[1].2
+        );
+    }
+}
+
+/// **Cancelling stops the run**, and the error says how far it got.
+#[test]
+fn cancelling_stops_the_run_and_says_where() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("pipeline");
+    let cancel = Cancel::new();
+    let flag = cancel.clone();
+
+    let err = pipe.txt2img_with(
+        &config(),
+        None,
+        None,
+        &[],
+        &[],
+        0.0,
+        Some(cancel),
+        &mut |p| {
+            // Cancel after the second step; the third must not run.
+            if p.step == 2 {
+                flag.cancel();
+            }
+        },
+    );
+    let message = format!(
+        "{}",
+        err.expect_err("a cancelled run must not return an image")
+    );
+    eprintln!("cancelled: {message}");
+    assert!(
+        message.contains("cancelled after 2"),
+        "the error should name the step it stopped at, got {message:?}"
+    );
+}
+
+/// **Step caching skips model evaluations, and is refused where it cannot
+/// work.**
+#[test]
+fn step_caching_skips_evaluations_and_refuses_ancestral_samplers() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("pipeline");
+
+    // An ancestral sampler re-noises every step, so there is nothing to reuse.
+    // Refused rather than silently ignored.
+    let ancestral = Txt2ImgConfig {
+        sampler: SamplerKind::EulerAncestral,
+        ..config()
+    };
+    assert!(
+        pipe.txt2img_with(&ancestral, None, None, &[], &[], 0.2, None, &mut |_| {})
+            .is_err(),
+        "caching with euler_a must be refused"
+    );
+
+    // With a deterministic sampler and more steps, some are skipped.
+    let cfg = Txt2ImgConfig {
+        sampler: SamplerKind::DpmPlusPlus2M,
+        steps: 12,
+        ..config()
+    };
+    let mut evaluated_cached = 0usize;
+    pipe.txt2img_with(&cfg, None, None, &[], &[], 0.3, None, &mut |p| {
+        evaluated_cached = p.evaluated;
+    })
+    .expect("cached run");
+
+    let mut evaluated_plain = 0usize;
+    pipe.txt2img_with(&cfg, None, None, &[], &[], 0.0, None, &mut |p| {
+        evaluated_plain = p.evaluated;
+    })
+    .expect("plain run");
+
+    eprintln!("cached {evaluated_cached}/12 evaluated, plain {evaluated_plain}/12");
+    assert_eq!(evaluated_plain, 12, "caching off runs every step");
+    assert!(
+        evaluated_cached < evaluated_plain,
+        "caching skipped nothing: {evaluated_cached} against {evaluated_plain}"
+    );
+}
+
+/// **A region changes the image where its mask is, and less where it is not.**
+#[test]
+fn a_region_prompt_changes_its_own_area_most() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("pipeline");
+    let cfg = config();
+    let (w, h) = (cfg.width, cfg.height);
+
+    let (_, _, plain) = pipe.txt2img(&cfg).expect("plain");
+
+    // The left half only.
+    let mut m = vec![0f32; h * w];
+    for y in 0..h {
+        for x in 0..w / 2 {
+            m[y * w + x] = 1.0;
+        }
+    }
+    let region = Region {
+        mask: Array::from_slice_f32(&m, &[1, h, w, 1]).unwrap(),
+        prompt: "a field of bright yellow sunflowers".into(),
+    };
+    let (_, _, regional) = pipe
+        .txt2img_with(
+            &cfg,
+            None,
+            None,
+            &[],
+            std::slice::from_ref(&region),
+            0.0,
+            None,
+            &mut |_| {},
+        )
+        .expect("regional");
+
+    let (mut inside, mut outside, mut n_in, mut n_out) = (0.0f64, 0.0f64, 0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                let i = (y * w + x) * 3 + c;
+                let d = (plain[i] as f64 - regional[i] as f64).abs();
+                if x < w / 2 {
+                    inside += d;
+                    n_in += 1;
+                } else {
+                    outside += d;
+                    n_out += 1;
+                }
+            }
+        }
+    }
+    let (inside, outside) = (inside / n_in as f64, outside / n_out as f64);
+    eprintln!("region: inside {inside:.2}/255, outside {outside:.2}/255");
+    assert!(
+        inside > outside,
+        "the region moved the outside ({outside:.2}) more than its own area ({inside:.2})"
+    );
+}
+
+/// **Two-pass hires enlarges, and refuses to shrink.**
+#[test]
+fn hires_enlarges_and_refuses_to_shrink() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("pipeline");
+    let cfg = config();
+
+    let (w, h, bytes) = pipe
+        .txt2img_hires(&cfg, 512, 512, Strength::new(0.5), &mut |_| {})
+        .expect("hires");
+    assert_eq!((w, h), (512, 512));
+    let (mean, sd, step) = looks_like_an_image(w, h, &bytes);
+    eprintln!("hires: mean {mean:.1}  sd {sd:.1}  neighbour step {step:.1}");
+    assert!((5.0..250.0).contains(&mean), "mean {mean:.1}");
+    assert!(sd > 10.0, "a standard deviation of {sd:.1} is a flat field");
+
+    // Smaller than the first pass is a caller error: hires enlarges.
+    assert!(
+        pipe.txt2img_hires(&cfg, 128, 128, Strength::new(0.5), &mut |_| {})
+            .is_err(),
+        "a second pass smaller than the first must be refused"
+    );
+    // And a non-integer factor, because nearest upsampling would have to
+    // invent values.
+    assert!(
+        pipe.txt2img_hires(&cfg, 384, 384, Strength::new(0.5), &mut |_| {})
+            .is_err(),
+        "256 -> 384 is 1.5x and must be refused"
+    );
+}
+
+/// **A textual-inversion embedding changes the prompt it triggers on**, and
+/// leaves prompts without the trigger alone.
+///
+/// The vectors are synthetic — this checks the splicing machinery, not that a
+/// particular trained embedding means what its author intended.
+#[test]
+fn a_textual_inversion_embedding_changes_only_prompts_that_trigger_it() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let cfg = config();
+    let plain = MlxPipeline::load(&dir).expect("plain");
+    let (_, _, without) = plain.txt2img(&cfg).expect("txt2img");
+
+    // Four vectors of 768, distinctive enough to move the conditioning.
+    let n = 4usize;
+    let v: Vec<f32> = (0..n * 768)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.35)
+        .collect();
+    let vectors = Array::from_slice_f32(&v, &[n, 768]).unwrap();
+
+    let mut adapted = MlxPipeline::load(&dir).expect("adapted");
+    adapted
+        .attach_embedding("astronaut", vectors)
+        .expect("attach");
+
+    // The base prompt contains "astronaut", so it triggers.
+    let (_, _, with) = adapted.txt2img(&cfg).expect("triggered");
+    assert_ne!(without, with, "the embedding changed nothing");
+
+    // A prompt without the trigger must be unaffected — the splice is by
+    // token match, so an untriggered prompt takes the ordinary path.
+    let other = Txt2ImgConfig {
+        prompt: "a bowl of ripe fruit on a table".into(),
+        ..cfg.clone()
+    };
+    let (_, _, base_other) = plain.txt2img(&other).expect("plain other");
+    let (_, _, adapted_other) = adapted.txt2img(&other).expect("adapted other");
+    assert_eq!(
+        base_other, adapted_other,
+        "a prompt with no trigger must be identical with and without the embedding"
+    );
+}
+
+/// The width is checked at attach time, not deep inside the transformer.
+#[test]
+fn an_embedding_of_the_wrong_width_is_refused() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let mut pipe = MlxPipeline::load(&dir).expect("pipeline");
+    // 1024 is SD 2.x's width; this tower is 768.
+    let wrong = Array::from_slice_f32(&vec![0.0; 1024], &[1, 1024]).unwrap();
+    assert!(
+        pipe.attach_embedding("thing", wrong).is_err(),
+        "an SDXL-width embedding in an SD 1.5 prompt must be refused at attach"
+    );
+    // And an empty one.
+    let empty = Array::from_slice_f32(&[], &[0, 768]).unwrap();
+    assert!(pipe.attach_embedding("thing", empty).is_err());
 }
