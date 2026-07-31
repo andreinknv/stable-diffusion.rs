@@ -113,6 +113,9 @@ pub mod fused;
 /// The MLX backend. See the module docs and docs/handoff.md.
 #[cfg(feature = "mlx")]
 pub mod mlx;
+/// A GGUF reader that does not go through candle. See the module docs.
+#[cfg(feature = "mlx")]
+pub mod mlx_gguf;
 #[cfg(feature = "metal")]
 pub mod mps;
 
