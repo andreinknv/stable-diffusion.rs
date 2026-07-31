@@ -1659,3 +1659,147 @@ fn ddim_is_euler_and_that_is_not_a_bug() {
          acquired arithmetic the other does not have"
     );
 }
+
+/// **Instruction editing keeps the picture and changes what was asked.**
+///
+/// The signature that distinguishes a working edit from both failure modes:
+/// high structural correlation with the source (it did not regenerate from
+/// scratch) *and* a large change in the direction requested (it did not just
+/// return the input). Measured against `timbrooks/instruct-pix2pix`:
+/// correlation 0.843, mean brightness 94.8 -> 149.2 for "make it winter, with
+/// snow".
+///
+/// ```bash
+/// SD_TEST_INSTRUCT_DIR=... cargo test -p stable-diffusion-rs --features mlx \
+///   --test mlx_pipeline instruct
+/// ```
+#[test]
+fn instruction_editing_keeps_the_structure_and_changes_the_content() {
+    let Some(dir) = std::env::var("SD_TEST_INSTRUCT_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+    else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_INSTRUCT_DIR to an ip2p checkpoint.");
+        return;
+    };
+    let Some(plain_dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR too, for the source image.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("loading InstructPix2Pix");
+    // **A separate pipeline for the source.** The InstructPix2Pix UNet takes
+    // eight input channels, so it cannot generate one — asking it to is now
+    // refused by name rather than by a convolution shape error.
+    let plain = MlxPipeline::load(&plain_dir).expect("loading SD 1.5");
+
+    // **The source has to be a real image**, not a synthetic gradient. This
+    // codebase has already paid for that lesson once: `mlx_img2img` used a
+    // `torch.randn` source and measured nonsense, because noise is not
+    // something an autoencoder can represent. A synthetic block-and-gradient
+    // is the same mistake more subtly — measured at correlation 0.357, against
+    // 0.843 for a generated photograph, because InstructPix2Pix restructures
+    // an image that is off the VAE's manifold rather than editing it.
+    //
+    // So the source is generated here, which does make this test depend on
+    // txt2img — and that is the right trade: txt2img has its own gate.
+    let (w, h) = (512usize, 512usize);
+    let (_, _, src_bytes) = plain
+        .txt2img(&Txt2ImgConfig {
+            prompt: "a rusty crab on a beach".into(),
+            width: w,
+            height: h,
+            steps: 8,
+            ..config()
+        })
+        .expect("generating a source image");
+    let px: Vec<f32> = src_bytes.iter().map(|&b| b as f32 / 127.5 - 1.0).collect();
+    let image = Array::from_slice_f32(&px, &[1, h, w, 3]).unwrap();
+
+    let cfg = Txt2ImgConfig {
+        prompt: "make it winter, with snow".into(),
+        width: w,
+        height: h,
+        steps: 8,
+        cfg_scale: 7.5,
+        ..config()
+    };
+    let (ow, oh, out) = pipe.instruct(&cfg, &image, 1.5).expect("instruct");
+    assert_eq!((ow, oh), (w, h));
+
+    // Correlate the edit against the source, in bytes.
+    let src: Vec<f64> = src_bytes.iter().map(|&b| b as f64).collect();
+    let dst: Vec<f64> = out.iter().map(|&b| b as f64).collect();
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let (ms, md) = (mean(&src), mean(&dst));
+    let (mut num, mut ds, mut dd) = (0.0, 0.0, 0.0);
+    for (a, b) in src.iter().zip(&dst) {
+        num += (a - ms) * (b - md);
+        ds += (a - ms).powi(2);
+        dd += (b - md).powi(2);
+    }
+    let corr = num / (ds.sqrt() * dd.sqrt()).max(f64::EPSILON);
+    let changed = src
+        .iter()
+        .zip(&dst)
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f64>()
+        / src.len() as f64;
+    eprintln!("instruct: correlation {corr:.3}, mean change {changed:.1}");
+
+    // 0.6 against a measured 0.748 — enough margin for sampler noise, tight
+    // enough that the 256 case (0.325) would fail.
+    assert!(
+        corr > 0.6,
+        "correlation {corr:.3} with the source: this regenerated the image rather than editing it"
+    );
+    assert!(
+        changed > 5.0,
+        "mean change {changed:.1}: the instruction did nothing"
+    );
+}
+
+/// **A plain generation on an InstructPix2Pix checkpoint is refused by name.**
+#[test]
+fn a_plain_generation_on_an_instruct_checkpoint_is_refused() {
+    let Some(dir) = std::env::var("SD_TEST_INSTRUCT_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+    else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_INSTRUCT_DIR to an ip2p checkpoint.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("loading InstructPix2Pix");
+    assert_eq!(pipe.unet_in_channels(), 8);
+    let err = pipe
+        .txt2img(&config())
+        .expect_err("txt2img on an eight-channel UNet must be refused");
+    let text = format!("{err}");
+    assert!(
+        text.contains("InstructPix2Pix") && text.contains("instruct"),
+        "the error should name the checkpoint kind and the method to use, got: {text}"
+    );
+}
+
+/// **A plain SD 1.5 UNet is refused**, and the message says why.
+///
+/// InstructPix2Pix's `conv_in` takes eight channels; a four-channel one would
+/// otherwise fail with a shape mismatch deep inside the first block.
+#[test]
+fn instruction_editing_refuses_a_four_channel_unet() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR to an SD 1.5 checkpoint.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("loading the pipeline");
+    let image = Array::from_slice_f32(&vec![0.0f32; 256 * 256 * 3], &[1, 256, 256, 3]).unwrap();
+    let err = pipe
+        .instruct(&config(), &image, 1.5)
+        .expect_err("a plain SD 1.5 UNet cannot do instruction editing");
+    let text = format!("{err}");
+    assert!(
+        text.contains('8') && text.contains("InstructPix2Pix"),
+        "the error should name the channel count and the checkpoint kind, got: {text}"
+    );
+}

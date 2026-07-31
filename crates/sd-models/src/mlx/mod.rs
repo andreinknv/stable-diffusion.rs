@@ -38,6 +38,7 @@ pub mod ip;
 /// LoRA adapters, merged into a weight map before any model is built.
 pub mod lora;
 /// AnimateDiff motion modules: attention over time.
+pub mod merge;
 pub mod motion;
 /// unCLIP's prior: a diffusion model over a 768-vector.
 pub mod prior;

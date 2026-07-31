@@ -137,6 +137,21 @@ sdrs img2img --model models/sd15 --init photo.png --mask mask.png \
 # Make it 4x bigger
 sdrs upscale --model models/sd15 --weights esrgan_x4.safetensors \
   --input out.png -o big.png
+
+# Edit by instruction, rather than by describing the result
+sdrs instruct --model models/instruct-pix2pix --init photo.png \
+  --prompt "make it winter, with snow" -o edited.png
+
+# Flux schnell: 12B parameters, quantised at rest, on a 36 GB laptop
+sdrs flux --model models/flux --variant schnell \
+  --transformer-gguf flux1-schnell-Q4_K_S.gguf --t5-gguf t5xxl-Q4_K_S.gguf \
+  --prompt "a rusty crab on a beach at sunset" -o out.png
+
+# SD 3.5
+sdrs sd3 --model models/sd35 --prompt "a lighthouse at dusk" -o out.png
+
+# Blend two checkpoints
+sdrs merge --a base.safetensors --b style.safetensors --alpha 0.3 -o mix.safetensors
 ```
 
 ### Going further
@@ -145,6 +160,12 @@ Every flag below is optional and composes with the rest.
 
 | want | flag |
 |---|---|
+| the schedule everyone else's step counts assume | `--scheduler karras` |
+| a sampler other than the default | `--sampler dpmpp2m` (also `euler`, `heun`, `dpmpp2s-a`, `ddim`, `lcm`) |
+| what most community finetunes expect | `--clip-skip 2` |
+| several images from one load | `-n 4` (seeds run `seed`, `seed+1`, ...) |
+| a texture that tiles | `--seamless` |
+| less memory, a comparable picture | `--precision f16` |
 | a style adapter | `--lora lcm.safetensors --lora-scale 1.0` |
 | follow an image's edges/depth | `--controlnet cn.safetensors --control-map edges.png` |
 | a trained trigger word | `--embedding mystyle=mystyle.safetensors` |
@@ -158,9 +179,17 @@ Every flag below is optional and composes with the rest.
 training resolution and duplicates subjects above it — two heads, two horizons.
 Compose small, refine large.
 
-**`--cache-threshold` needs a deterministic sampler.** `euler-a` and `lcm` draw
-fresh noise every step, so there is nothing to reuse; asking anyway is an error
-rather than a silent no-op.
+**`--cache-threshold` needs a deterministic sampler.** `euler-a`, `dpmpp2s-a`
+and `lcm` draw fresh noise every step, so there is nothing to reuse; asking
+anyway is an error rather than a silent no-op.
+
+**`heun` and `dpmpp2s-a` evaluate the model twice per step**, so twenty of
+their steps cost about what forty Euler steps do. The progress line reports
+evaluations alongside steps, so the difference is visible rather than inferred.
+
+**Every image records how it was made.** The generation parameters go into the
+PNG as a text chunk in the format A1111 and its readers use, so an image a year
+later can still say its seed, sampler, schedule and step count.
 
 ### One thing that will bite you
 
@@ -186,6 +215,13 @@ unCLIP image variations, IP-Adapter and GLIGEN grounding all have entry points
 under `stable_diffusion_rs::mlx`.
 
 ## Verification
+
+Run the suite with [`scripts/test.sh`](scripts/test.sh), which sets
+`--test-threads=3`. That is not tuning: each pipeline test loads a full model
+into unified memory, and at cargo's default the OOM killer takes the test
+binary — surfacing as `signal: 9` with no failing assertion, which reads
+exactly like a crash in the code under test.
+
 
 Every component is checked against `diffusers`/`transformers` tensor by
 tensor, per module:

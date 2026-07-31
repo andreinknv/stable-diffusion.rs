@@ -1032,6 +1032,7 @@ impl MlxPipeline {
         // and a run that tiles in the sampler but not the decoder has a seam
         // with nothing to point at. `decode` holds the other half.
         let _seamless = sd_models::mlx::SeamlessGuard::new(extras.seamless);
+        self.refuse_if_instruct()?;
         let s = &self.stream;
         let [nframes, lh, lw, lc] = latent.shape()[..] else {
             return Err(msg(format!(
@@ -1863,6 +1864,191 @@ impl MlxPipeline {
             &mut rng,
             &mut |_| {},
         )?;
+        self.decode(&latent, cfg.seamless)
+    }
+
+    /// How many channels this UNet's `conv_in` takes.
+    ///
+    /// 4 for an ordinary latent model, **8 for InstructPix2Pix** — four for
+    /// the latent and four for the source image.
+    pub fn unet_in_channels(&self) -> usize {
+        self.unet
+            .get("conv_in.weight")
+            .and_then(|w| w.shape().get(1).copied())
+            .unwrap_or(0)
+    }
+
+    /// Refuse a plain generation on an InstructPix2Pix checkpoint.
+    ///
+    /// Without this the run fails inside the first convolution with
+    /// `Expect the input channels ... to match but got (2,32,32,4) and
+    /// (320,3,3,8)`, which is true and tells the caller nothing about what to
+    /// do. The checkpoint is not broken; it is being asked the wrong question.
+    fn refuse_if_instruct(&self) -> Result<(), PipelineError> {
+        if self.unet_in_channels() == 8 {
+            return Err(msg(
+                "mlx: this is an InstructPix2Pix checkpoint — its UNet takes eight input \
+                 channels, four of them the source image. Use `instruct` (`sdrs instruct`), \
+                 which supplies them"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Edit an image by instruction: "change the sky to sunset".
+    ///
+    /// **Not img2img.** img2img partially re-noises a picture and denoises it
+    /// against a prompt describing the *result*; this conditions on the source
+    /// image directly and takes a prompt describing the *change*. The
+    /// checkpoint is different too — InstructPix2Pix's UNet takes **eight**
+    /// input channels, four for the latent and four for the source.
+    ///
+    /// Three things here fail quietly if got wrong, and all three cost a
+    /// plausible image rather than an error:
+    ///
+    /// - **The guidance batch has three rows, not two**: instruction, image,
+    ///   and a true unconditional that sees neither. Two scales combine them.
+    /// - **The image latent is not scaled by `0.18215`.** Every other latent
+    ///   in this crate is; InstructPix2Pix was trained on the raw encoder
+    ///   output, and scaling multiplies the conditioning by 5.5, which returns
+    ///   a clean image that ignores the source.
+    /// - **The source joins on the channel axis**, not the batch axis, which
+    ///   is what the extra four input channels are for.
+    ///
+    /// `image` is `[1, h, w, 3]` in `[-1, 1]` — the VAE's range.
+    pub fn instruct(
+        &self,
+        cfg: &Txt2ImgConfig,
+        image: &Array,
+        image_guidance: f64,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        self.instruct_with(cfg, image, image_guidance, &mut |_| {})
+    }
+
+    /// [`Self::instruct`], reporting progress after each step.
+    pub fn instruct_with(
+        &self,
+        cfg: &Txt2ImgConfig,
+        image: &Array,
+        image_guidance: f64,
+        progress: ProgressFn<'_>,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        let s = &self.stream;
+        if cfg.width % 8 != 0 || cfg.height % 8 != 0 {
+            return Err(msg(format!(
+                "mlx: {}x{} does not divide into 8-pixel latent cells",
+                cfg.width, cfg.height
+            )));
+        }
+        if cfg.steps == 0 {
+            return Err(PipelineError::NoSteps);
+        }
+        // A plain SD 1.5 UNet has a four-channel `conv_in` and would fail on
+        // the eight-channel input with a shape error deep in the first block.
+        // Checked here so the message names the actual problem.
+        let conv_in = self
+            .unet
+            .get("conv_in.weight")
+            .ok_or_else(|| msg("mlx: the UNet has no conv_in.weight".into()))?;
+        let in_channels = conv_in.shape().get(1).copied().unwrap_or(0);
+        if in_channels != 8 {
+            return Err(msg(format!(
+                "mlx: this UNet takes {in_channels} input channels; instruction editing needs                  an InstructPix2Pix checkpoint, whose conv_in takes 8 — four for the latent                  and four for the source image"
+            )));
+        }
+
+        let _seamless = sd_models::mlx::SeamlessGuard::new(cfg.seamless);
+        let skip = cfg.clip_skip.get();
+        let cond = self.encode(&cfg.prompt, skip)?;
+        let uncond = self.encode(&cfg.negative_prompt, skip)?;
+        // Instruction, then the unconditional twice — matching the three rows
+        // the guidance below reads.
+        let context = concat(&[&cond, &uncond, &uncond], 0, s)?;
+
+        // **Unscaled**, unlike every other latent here. See the doc comment.
+        // `.0` is the distribution's mean, **unscaled** — `encode_scaled`,
+        // which every other path here calls, would multiply it by 0.18215.
+        let (image_latents, _) = vae::encode_dist_with(image, &self.vae_cfg, &self.vae, s)?;
+        let zeros = image_latents.mul(&Array::scalar_f32(0.0)?, s)?;
+        // The third row sees no image at all, which is what makes it the true
+        // unconditional rather than a second image row.
+        let image_rows = concat(&[&image_latents, &image_latents, &zeros], 0, s)?;
+
+        let sigmas = self.sigmas(cfg);
+        let (lh, lw) = (cfg.height / 8, cfg.width / 8);
+        let mut rng = SeededRng::new(cfg.seed);
+        let mut latent = self
+            .draw(&mut rng, 4, lh, lw)?
+            .mul(&Array::scalar_f32(sigmas[0] as f32)?, s)?;
+
+        let total = sigmas.len().saturating_sub(1);
+        let mut dpm = sample::DpmSolverPlusPlus2M::new();
+        for i in 0..total {
+            let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+            let tripled = concat(&[&latent, &latent, &latent], 0, s)?;
+            let latent_in =
+                tripled.div(&Array::scalar_f32((sigma * sigma + 1.0).sqrt() as f32)?, s)?;
+            // NHWC, so the channel axis is 3.
+            let latent_in = concat(&[&latent_in, &image_rows], 3, s)?;
+
+            let t = self.timestep_for(sigma);
+            let timestep = Array::from_slice_f32(&[t, t, t], &[3])?;
+            let out = unet_forward_adapters(
+                &latent_in,
+                &timestep,
+                &context,
+                None,
+                None,
+                &Adapters::default(),
+                &self.cfg,
+                &self.unet,
+                s,
+            )?;
+
+            let (text, img, none) = (
+                out.narrow(0, 0, 1, s)?,
+                out.narrow(0, 1, 1, s)?,
+                out.narrow(0, 2, 1, s)?,
+            );
+            // uncond + (text - img) * cfg_scale + (img - uncond) * image_guidance
+            let noise_pred = none
+                .add(
+                    &text
+                        .sub(&img, s)?
+                        .mul(&Array::scalar_f32(cfg.cfg_scale as f32)?, s)?,
+                    s,
+                )?
+                .add(
+                    &img.sub(&none, s)?
+                        .mul(&Array::scalar_f32(image_guidance as f32)?, s)?,
+                    s,
+                )?;
+
+            let denoised = sample::denoise_epsilon(&latent, &noise_pred, sigma, s)?;
+            latent = match cfg.sampler {
+                SamplerKind::EulerAncestral | SamplerKind::Lcm => {
+                    let noise = self.draw(&mut rng, 4, lh, lw)?;
+                    sample::euler_ancestral_step(&latent, &denoised, sigma, sigma_next, &noise, s)?
+                }
+                SamplerKind::Euler | SamplerKind::Ddim | SamplerKind::Heun => {
+                    // Heun's second evaluation would need the three-row batch
+                    // rebuilt at the midpoint; first-order is used rather than
+                    // silently running a half-Heun.
+                    sample::euler_step(&latent, &denoised, sigma, sigma_next, s)?
+                }
+                SamplerKind::DpmPlusPlus2M | SamplerKind::DpmPlusPlus2SAncestral => {
+                    dpm.step(&latent, &denoised, sigma, sigma_next, s)?
+                }
+            };
+            progress(Progress {
+                step: i + 1,
+                total,
+                sigma,
+                denoised: &denoised,
+                evaluated: i + 1,
+            });
+        }
         self.decode(&latent, cfg.seamless)
     }
 

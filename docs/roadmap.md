@@ -336,15 +336,65 @@ them, and nothing in `crates/*/tests` does either:
 
 | capability | state |
 |---|---|
-| seamless tiling | gone — no circular padding anywhere on MLX |
-| InstructPix2Pix | gone — no image-conditioned guidance path |
-| checkpoint merging | gone — was a candle-side weight-map utility |
+| seamless tiling | **restored** — circular padding, verified against edge statistics |
+| InstructPix2Pix | **restored** — verified against `timbrooks/instruct-pix2pix` |
+| checkpoint merging | **restored** — `sdrs merge`, with a safetensors writer |
 
-They are listed here rather than quietly unticked because the distinction
-matters: these were *ported once and verified*, so re-adding them is
-re-implementation against a known-good target, not new work. Seamless tiling is
-the smallest — circular padding on every convolution, a flag through
-`UNetConfig` and `VaeConfig`.
+All three are back, and re-adding them against the candle implementation as a
+known-good target was exactly as cheap as this section predicted. What each
+one cost is worth recording, because in every case the port was the easy half:
+
+**Seamless tiling.** `pad_circular` is twenty lines. The decision that took
+thought was where the mode lives: a thread-local guard held inside `denoise`
+and `decode` rather than at the eight public entry points, because a guard at
+each is a guard one of them will miss, and a run that tiles in the sampler but
+not the decoder has a seam with nothing to point at. `decode` takes it as a
+parameter, so a new decode path is a compile error until it says whether it
+tiles.
+
+Verified by measuring the wrap against the image's *own* smoothness rather than
+an absolute threshold — a photograph of grass and one of a brick wall have very
+different neighbour statistics. Tiled, opposite edges differ by 6.83 against a
+typical neighbouring-pixel step of 7.26; untiled, 20.75 against 10.26.
+
+The first attempt used 256x256 and could not tell the two apart: SD 1.5 puts
+low-frequency mush at the borders at that size, so the untiled image already
+wrapped cleanly. The test said so itself rather than passing vacuously, which
+is the property worth copying — a control assertion that fails when the setup
+cannot discriminate.
+
+**InstructPix2Pix.** Three things fail quietly here and all three cost a
+plausible image rather than an error: the guidance batch has *three* rows
+(instruction, image, and a true unconditional that sees neither); the image
+latent is **not** scaled by 0.18215, unlike every other latent in this
+codebase; and the source joins on the channel axis, which is what the extra
+four input channels are for.
+
+It also needed a guard in the other direction. A plain `txt2img` on an
+InstructPix2Pix checkpoint used to fail inside the first convolution with
+`Expect the input channels ... to match but got (2,32,32,4) and (320,3,3,8)` —
+true, and useless. It now names the checkpoint kind and the method to use.
+
+**And it is size-dependent**, which took measuring. InstructPix2Pix is SD 1.5
+based and trained at 512; at 256 it restructures the picture rather than
+editing it. On an identical source and instruction:
+
+| size | correlation with source | mean change |
+|---|---|---|
+| 256 | 0.325 | 100.3 |
+| 512 | 0.748 | 72.4 |
+
+The first version of that test used a synthetic gradient as its source and
+measured 0.357 at 512 — **the same trap this file already records for img2img**,
+which once used a `torch.randn` source and measured nonsense because noise is
+not something an autoencoder can represent. A block-and-gradient is the same
+mistake more subtly. The source is now generated.
+
+**Checkpoint merging** needed a safetensors *writer*, which the MLX port never
+had. Its one real hazard is laziness: MLX computes nothing until asked, so
+saving an unevaluated array writes a file of exactly the right shape holding
+whatever the buffer contained. `save_safetensors` evaluates first, and a test
+hands it a deliberately lazy expression to prove it.
 
 The lesson generalises, and it is the same one this file records about
 verifying against a published artifact: **a tick mark describes a backend, not
@@ -356,26 +406,39 @@ them were, silently, because the port was thorough. Three were not.
 This is the largest gap between what the project *is* and what a user can
 *run*, and it is bigger than any missing model.
 
-`sdrs` has four commands — `txt2img`, `img2img`, `upscale`, `info`. Everything
-below is implemented, verified against diffusers, and reachable only by writing
-Rust:
+`sdrs` had four commands — `txt2img`, `img2img`, `upscale`, `info` — while
+Flux, SD 3.5, quantised loading, GGUF and unCLIP were implemented, verified
+against diffusers, and reachable only by writing Rust. **The headline result of
+the whole project, a 12B Flux running quantised on a 36 GB laptop, had no
+command line.**
 
-| capability | verified at | reachable from `sdrs` |
-|---|---|---|
-| Flux (schnell, mini) | MMDiT 2.1e-6 rel | no |
-| SD 3.5 | MMDiT 5.5e-6 | no |
-| quantised-at-rest loading | Flux 13.3 GB, SD 3.5 10.1 GB | no |
-| GGUF checkpoints | f16 control row exact | no |
-| unCLIP / image variation | 9 components, all listed above | no |
-| IP-Adapter | image embeds 1.3e-6 | no |
-| GLIGEN | grounded boxes | no |
-| TAESD | — | no |
-| Canny preprocessing | — | no |
+Now nine commands, and that run works:
 
-**The headline result of the whole project — a 12B Flux running quantised on a
-36 GB laptop — has no command line.** It is exercised by a test. That is the
-single highest-value item in this file, and it is plumbing rather than
-research: the pipelines exist and take the same `Txt2ImgConfig`.
+```bash
+sdrs flux --model models/flux --variant schnell \
+  --transformer-gguf flux1-schnell-Q4_K_S.gguf --t5-gguf t5xxl-Q4_K_S.gguf \
+  --prompt "a rusty crab on a beach at sunset"
+# resident: 11.6 GiB      512x512 in 30 s
+```
+
+| capability | reachable from `sdrs` |
+|---|---|
+| Flux (schnell, dev, mini), from a directory or GGUF | `sdrs flux` |
+| SD 3.5 | `sdrs sd3` |
+| quantised-at-rest loading | `--bits` on both |
+| unCLIP / image variation | `sdrs unclip` |
+| instruction editing | `sdrs instruct` |
+| checkpoint merging | `sdrs merge` |
+
+That first Flux run paid for itself immediately by finding two real defects.
+`FluxPaths` defaulted the T5 tokenizer to `tokenizer_2/spiece.model`, which
+`T5Tokenizer` cannot read — so the *default* path failed for every checkpoint,
+with `stream did not contain valid UTF-8`, an error naming neither the file nor
+the problem. Both are fixed, and a sentencepiece path now says what it is.
+
+**Still not on the command line:** IP-Adapter, GLIGEN, TAESD and Canny
+preprocessing. All are implemented and verified; each needs an image argument
+and a flag, and none is load-bearing for the claim above.
 
 ## Against `stable-diffusion.cpp`
 
@@ -537,13 +600,37 @@ workaround.
 
 - **`mlx_compile`.** MLX's graph compiler fuses elementwise chains into single
   kernels — the same win the candle-era hand-written adaLN and GEGLU kernels
-  bought at 5.26x, except MLX generates them. Nothing here calls it. The
-  natural first target is the sampler step and the modulation chains, which
-  are exactly the "norm always followed by a modulation" shape that a general
-  tensor library cannot fuse but a compiler given the whole trace can.
-- **`mlx_fast_rope`.** Flux's rotary embedding is built by hand in
-  `flux.rs` — a `matmul` against a frequency table, then an interleaved pair
-  rotation. MLX ships a fused kernel for exactly this.
+  bought at 5.26x, except MLX generates them. Nothing here calls it.
+
+  It is reachable: `mlx_closure_new_func_payload` takes a `void*`, so a Rust
+  closure can be boxed and handed across. The obstacle is not the FFI but the
+  shape of the code — `compile` traces a function *of arrays*, and every
+  forward here takes a `HashMap<String, Array>` plus a config struct. Making
+  the weights explicit inputs to a traced function is the work, and it is a
+  real refactor of the model layer rather than a call to add.
+
+  **Unmeasured, and deliberately not guessed at.** The payoff is bounded by
+  how much of a step is elementwise: the candle-era profile put a step at
+  roughly three quarters convolution and matmul, which a fuser does not help.
+  Worth building the smallest version first — the modulation chain in one
+  Flux block — and measuring that before committing to the refactor.
+- ~~**`mlx_fast_rope`**~~ — **checked, and it does not fit.** Reading the
+  signature before writing the call is what caught it, exactly as it did for
+  the candle-era claim that no fused attention kernel existed:
+
+  ```c
+  int mlx_fast_rope(mlx_array* res, const mlx_array x, int dims,
+                    bool traditional, mlx_optional_float base, float scale,
+                    int offset, const mlx_array freqs, const mlx_stream s);
+  ```
+
+  `offset` is a **scalar**, so the kernel applies position `offset + index`
+  uniformly along the sequence. Flux's positions are not a sequence: `embed_nd`
+  takes `[seq, 3]` integer coordinates — a `(t, h, w)` grid flattened — and
+  splits the head dimension into three segments with *different* widths and so
+  different frequency sets per segment. Neither the arbitrary per-token
+  positions nor the three-way head split can be expressed through a scalar
+  offset and one `freqs` array. The hand-written `rotate` stays.
 - **`mlx_get_peak_memory` / `mlx_set_wired_limit` / `mlx_set_cache_limit`.**
   Cheap, and the right instrument for every measurement above: peak RSS was
   used here because MLX's own accounting is not bound, and `sdrs info` reports

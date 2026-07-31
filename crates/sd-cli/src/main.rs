@@ -239,6 +239,28 @@ enum Command {
         output: String,
     },
 
+    /// Edit an image by instruction: "change the sky to sunset".
+    ///
+    /// **Not img2img.** That re-noises a picture and denoises it against a
+    /// prompt describing the result; this conditions on the source directly
+    /// and takes a prompt describing the *change*. Needs an InstructPix2Pix
+    /// checkpoint, whose UNet takes eight input channels.
+    Instruct {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        init: String,
+        /// How strongly to follow the instruction. This is `--cfg-scale`.
+        #[command(flatten)]
+        gen: Generation,
+        /// How strongly to stay faithful to the source image. Raise it when
+        /// the edit changes too much, lower it when nothing changes.
+        #[arg(long, default_value_t = 1.5)]
+        image_guidance: f64,
+        #[arg(short, long, default_value = "out.png")]
+        output: String,
+    },
+
     /// Generate with Flux — schnell, dev, or flux-mini.
     ///
     /// **Quantised at rest by default.** Flux schnell is 12B parameters; held
@@ -368,6 +390,27 @@ enum Command {
         output: String,
     },
 
+    /// Merge two checkpoints by weighted average.
+    ///
+    /// `(1 - alpha) * a + alpha * b`, tensor by tensor. Only meaningful
+    /// between checkpoints of the same architecture, and mismatches are
+    /// refused rather than skipped — an SD 1.5 and an SDXL share enough tensor
+    /// names to produce a file that loads and renders noise.
+    Merge {
+        #[arg(long)]
+        a: String,
+        #[arg(long)]
+        b: String,
+        /// Weight of `--b`. 0 is `--a` exactly, 1 is `--b` exactly.
+        #[arg(long, default_value_t = 0.5)]
+        alpha: f64,
+        /// Carry through tensors only one side has, instead of refusing.
+        #[arg(long)]
+        allow_unmatched: bool,
+        #[arg(short, long, default_value = "merged.safetensors")]
+        output: String,
+    },
+
     /// Report what is on this machine.
     Info,
 }
@@ -472,6 +515,20 @@ fn main() -> Result<()> {
             output,
         } => {
             for path in mlx_cli::run_upscale(&model, &weights, &input, &output, device)? {
+                println!("wrote {}", path.display());
+            }
+        }
+
+        Command::Instruct {
+            model,
+            init,
+            gen,
+            image_guidance,
+            output,
+        } => {
+            let cfg = gen.to_config()?;
+            for path in mlx_cli::run_instruct(&model, &cfg, &init, image_guidance, &output, device)?
+            {
                 println!("wrote {}", path.display());
             }
         }
@@ -586,6 +643,20 @@ fn main() -> Result<()> {
             {
                 println!("wrote {}", path.display());
             }
+        }
+
+        Command::Merge {
+            a,
+            b,
+            alpha,
+            allow_unmatched,
+            output,
+        } => {
+            let report = mlx_cli::run_merge(&a, &b, alpha, allow_unmatched, &output)?;
+            println!(
+                "wrote {output}: {} blended, {} carried",
+                report.blended, report.carried
+            );
         }
 
         Command::Info => {

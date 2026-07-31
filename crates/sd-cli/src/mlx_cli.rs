@@ -409,6 +409,60 @@ pub fn run_upscale(
     write_images(output, uw, uh, &bytes, None, None)
 }
 
+/// Merge two checkpoints by weighted average.
+///
+/// **On the CPU regardless of `--cpu`.** This is file arithmetic: moving
+/// gigabytes onto the GPU to add them pays a transfer for no gain, and the
+/// result goes straight back out to disk.
+pub fn run_merge(
+    a: &str,
+    b: &str,
+    alpha: f64,
+    allow_unmatched: bool,
+    output: &str,
+) -> Result<stable_diffusion_rs::models::mlx::merge::Merged> {
+    use stable_diffusion_rs::models::mlx::merge::{merge, MergeOptions};
+    use stable_diffusion_rs::tensor::mlx::{save_safetensors, Stream};
+
+    let s = Stream::cpu();
+    let left = load_safetensors(Path::new(a)).with_context(|| format!("reading {a}"))?;
+    let right = load_safetensors(Path::new(b)).with_context(|| format!("reading {b}"))?;
+    eprintln!(
+        "merging {} tensors with {} at alpha {alpha}",
+        left.len(),
+        right.len()
+    );
+    let (merged, report) = merge(
+        &left,
+        &right,
+        &MergeOptions {
+            alpha,
+            allow_unmatched,
+        },
+        &s,
+    )?;
+    save_safetensors(Path::new(output), &merged).with_context(|| format!("writing {output}"))?;
+    Ok(report)
+}
+
+/// Edit an image by instruction.
+pub fn run_instruct(
+    model: &str,
+    cfg: &Txt2ImgConfig,
+    init: &str,
+    image_guidance: f64,
+    output: &str,
+    device: Device,
+) -> Result<Vec<PathBuf>> {
+    let pipe = MlxPipeline::load_with(Path::new(model), device, cfg.precision)?;
+    // **`[-1, 1]`, the VAE's range** — not CLIP's `[0, 1]`. The two are the
+    // same shape and dtype.
+    let image = load_signed(init, cfg.width, cfg.height)?;
+    let (w, h, bytes) = pipe.instruct_with(cfg, &image, image_guidance, &mut print_progress)?;
+    let meta = metadata(cfg, cfg.seed);
+    write_images(output, w, h, &bytes, Some(&meta), None)
+}
+
 /// Everything the `flux` command carries.
 pub struct FluxArgs {
     pub model: String,

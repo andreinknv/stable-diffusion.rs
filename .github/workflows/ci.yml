@@ -76,7 +76,12 @@ jobs:
       # locally against generated references — see xtask/golden/README.md, and
       # note that SD_REQUIRE_FIXTURES turns those skips into failures where the
       # data does exist.
-      - run: cargo test --workspace --features mlx
+      #
+      # `--test-threads=3` because each pipeline test loads a full model into
+      # unified memory; at cargo's default (the core count) the runner is
+      # OOM-killed, which surfaces as `signal: 9` with no failing assertion and
+      # reads exactly like a crash in the code under test.
+      - run: cargo test --workspace --features mlx -- --test-threads=3
 
   deny:
     name: cargo-deny (licenses, advisories)

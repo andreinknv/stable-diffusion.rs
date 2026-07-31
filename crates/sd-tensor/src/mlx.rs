@@ -294,6 +294,16 @@ unsafe extern "C" {
         s: mlx_stream,
     ) -> i32;
     fn mlx_map_string_to_array_new() -> mlx_map_string_to_array;
+    fn mlx_map_string_to_array_insert(
+        map: mlx_map_string_to_array,
+        key: *const c_char,
+        value: mlx_array,
+    ) -> i32;
+    fn mlx_save_safetensors(
+        file: *const c_char,
+        param: mlx_map_string_to_array,
+        metadata: mlx_map_string_to_string,
+    ) -> i32;
     fn mlx_map_string_to_array_free(map: mlx_map_string_to_array) -> i32;
     fn mlx_map_string_to_string_new() -> mlx_map_string_to_string;
     fn mlx_map_string_to_string_free(map: mlx_map_string_to_string) -> i32;
@@ -1444,6 +1454,45 @@ pub fn eval(arrays: &[&Array]) -> Result<()> {
         check(status, "eval")?;
     }
     Ok(())
+}
+
+/// Write a weight map as a safetensors file.
+///
+/// **Every array is evaluated first.** MLX is lazy, so an unevaluated array has
+/// no data to write, and saving one would produce a file of the right shape
+/// holding whatever the buffer happened to contain.
+pub fn save_safetensors(path: &Path, weights: &HashMap<String, Array>) -> Result<()> {
+    init();
+    let refs: Vec<&Array> = weights.values().collect();
+    eval(&refs)?;
+
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|e| Error::Msg(format!("mlx: path is not a valid C string: {e}")))?;
+    let map = unsafe { mlx_map_string_to_array_new() };
+    let meta = unsafe { mlx_map_string_to_string_new() };
+
+    let mut result = Ok(());
+    for (name, array) in weights {
+        let key = match CString::new(name.as_str()) {
+            Ok(k) => k,
+            Err(e) => {
+                result = Err(Error::Msg(format!("mlx: tensor name {name:?}: {e}")));
+                break;
+            }
+        };
+        let status = unsafe { mlx_map_string_to_array_insert(map, key.as_ptr(), array.raw) };
+        if let Err(e) = check(status, "map insert") {
+            result = Err(e);
+            break;
+        }
+    }
+    if result.is_ok() {
+        let status = unsafe { mlx_save_safetensors(c_path.as_ptr(), map, meta) };
+        result = check(status, "save_safetensors");
+    }
+    unsafe { mlx_map_string_to_string_free(meta) };
+    unsafe { mlx_map_string_to_array_free(map) };
+    result
 }
 
 // -- memory -----------------------------------------------------------------
