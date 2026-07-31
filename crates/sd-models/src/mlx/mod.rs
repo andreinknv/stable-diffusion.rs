@@ -23,6 +23,8 @@
 pub mod clip;
 /// ControlNet: a copy of the UNet's down stack that emits corrections.
 pub mod controlnet;
+/// Real-ESRGAN 4x upscaling. Runs after generation and knows about no model.
+pub mod esrgan;
 /// Flux's MMDiT transformer.
 pub mod flux;
 /// LoRA adapters, merged into a weight map before any model is built.
