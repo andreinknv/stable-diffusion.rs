@@ -17,7 +17,7 @@
 //! Names follow the black-forest-labs checkpoint layout
 //! (`double_blocks.0.img_attn.qkv`), not the diffusers renaming.
 
-use sd_tensor::mlx::{concat, Array, Stream};
+use sd_tensor::mlx::{concat, Array, Compiled, Stream};
 use sd_tensor::{Error, Result};
 
 use super::quantized::WeightSource;
@@ -175,8 +175,23 @@ pub fn rotate(x: &Array, pe: &Rope, s: &Stream) -> Result<Array> {
     let cos = pe.cos.reshape(&[1, 1, n, half], s)?;
     let sin = pe.sin.reshape(&[1, 1, n, half], s)?;
 
-    let out_even = even.mul(&cos, s)?.sub(&odd.mul(&sin, s)?, s)?;
-    let out_odd = even.mul(&sin, s)?.add(&odd.mul(&cos, s)?, s)?;
+    // Compiled when available. This is the one function MLX's own Flux port
+    // compiles — Apple's `_ab_plus_cd`, applied to q and k in every attention.
+    // `SDRS_NO_COMPILE=1` returns the composition for an A/B in one session.
+    let (out_even, out_odd) = with_compiled_rotation(|compiled| match compiled {
+        Some(c) => {
+            let out = c.call(&[&even, &odd, &cos, &sin])?;
+            let mut it = out.into_iter();
+            match (it.next(), it.next()) {
+                (Some(a), Some(b)) => Ok((a, b)),
+                _ => Err(Error::Msg("mlx: compiled rotation returned too few".into())),
+            }
+        }
+        None => Ok((
+            even.mul(&cos, s)?.sub(&odd.mul(&sin, s)?, s)?,
+            even.mul(&sin, s)?.add(&odd.mul(&cos, s)?, s)?,
+        )),
+    })?;
 
     concat(
         &[
@@ -187,6 +202,49 @@ pub fn rotate(x: &Array, pe: &Rope, s: &Stream) -> Result<Array> {
         s,
     )?
     .reshape(&[b, h, n, d], s)
+}
+
+thread_local! {
+    /// One compiled rotation per thread, built on first use.
+    ///
+    /// Tracing is the expensive part, so it is cached; MLX keys its kernels by
+    /// shape behind this. Thread-local because the suite runs its tests in
+    /// parallel.
+    ///
+    /// **`ManuallyDrop`, and that is not an optimisation.** A thread-local's
+    /// destructor runs at thread exit, which on the main thread is *after*
+    /// MLX's own globals have been torn down — freeing a closure into a
+    /// destroyed runtime segfaults. Measured: without this, the Kontext test
+    /// exits with `signal: 11, SIGSEGV` **after** printing its result, so the
+    /// work is complete and the process dies anyway. This is a
+    /// process-lifetime cache; there is no point at which freeing it is
+    /// useful.
+    static ROTATION: std::cell::OnceCell<Option<std::mem::ManuallyDrop<Compiled>>> =
+        const { std::cell::OnceCell::new() };
+}
+
+fn with_compiled_rotation<T>(f: impl FnOnce(Option<&Compiled>) -> Result<T>) -> Result<T> {
+    if std::env::var_os("SDRS_NO_COMPILE").is_some() {
+        return f(None);
+    }
+    ROTATION.with(|cell| {
+        let slot = cell.get_or_init(|| {
+            Compiled::new(move |args| {
+                // The stream is rebuilt inside: `Stream` is not `Clone`, and a
+                // traced function outlives the call that first ran it.
+                let s = Stream::gpu();
+                let (even, odd, cos, sin) = (&args[0], &args[1], &args[2], &args[3]);
+                Ok(vec![
+                    even.mul(cos, &s)?.sub(&odd.mul(sin, &s)?, &s)?,
+                    even.mul(sin, &s)?.add(&odd.mul(cos, &s)?, &s)?,
+                ])
+            })
+            // A compile failure is not fatal; the composition is correct.
+            .ok()
+            .map(std::mem::ManuallyDrop::new)
+        });
+        f(slot.as_deref())
+    })
 }
 
 /// LayerNorm with **no learned parameters at all**.

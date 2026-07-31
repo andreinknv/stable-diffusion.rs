@@ -44,6 +44,12 @@ mod block {
 pub enum GgmlType {
     F32,
     F16,
+    /// Brain float: f32's exponent with f16's width.
+    ///
+    /// Modern checkpoints use it for the tensors they leave unquantised, and
+    /// increasingly *instead* of f16 — which is why a file can be "mostly
+    /// Q4_K" and still be unreadable without this.
+    BF16,
     Q4_0,
     Q8_0,
     Q4K,
@@ -57,6 +63,7 @@ impl GgmlType {
             0 => Self::F32,
             1 => Self::F16,
             2 => Self::Q4_0,
+            30 => Self::BF16,
             8 => Self::Q8_0,
             12 => Self::Q4K,
             13 => Self::Q5K,
@@ -64,7 +71,7 @@ impl GgmlType {
             other => {
                 return Err(Error::Msg(format!(
                     "gguf: type {other} is not one this project's checkpoints use; \
-                     the supported set is F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K"
+                     the supported set is F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K"
                 )))
             }
         })
@@ -75,6 +82,7 @@ impl GgmlType {
         match self {
             Self::F32 => (1, 4),
             Self::F16 => (1, 2),
+            Self::BF16 => (1, 2),
             Self::Q4_0 => block::Q4_0,
             Self::Q8_0 => block::Q8_0,
             Self::Q4K => block::Q4_K,
@@ -253,6 +261,11 @@ impl Gguf {
                     out[i] = f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
                 }
             }
+            GgmlType::BF16 => {
+                for (i, c) in raw.chunks_exact(2).enumerate() {
+                    out[i] = bf16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                }
+            }
             GgmlType::Q4_0 => dequant_q4_0(&raw, &mut out),
             GgmlType::Q8_0 => dequant_q8_0(&raw, &mut out),
             GgmlType::Q4K => dequant_q4_k(&raw, &mut out),
@@ -269,6 +282,21 @@ impl Gguf {
 /// module exists to avoid dependencies. **The subnormal branch is the one that
 /// matters** — an earlier bit-twiddling version was wrong for all 2046
 /// subnormals by exactly a factor of two, which showed up as a 3.05e-5
+/// bf16 to f32: the bits **are** f32's top half.
+///
+/// bf16 is f32 truncated, not a separate encoding — same 8-bit exponent, a
+/// 7-bit mantissa instead of 23 — so widening is a shift and nothing else. No
+/// rounding, no special cases: NaN, infinity and subnormals all carry through
+/// because their bit patterns are f32's already.
+///
+/// **The trap is mistaking it for f16**, which has a 5-bit exponent and a
+/// 10-bit mantissa. Decoding bf16 as f16 succeeds on every byte and produces
+/// values wrong by many orders of magnitude — the exponent field is read from
+/// the wrong bits — so a checkpoint loads and renders noise.
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 /// disagreement with candle on Q4_0 weights: small enough to look like
 /// precision, structural enough to be a bug.
 fn f16_to_f32(h: u16) -> f32 {
@@ -463,5 +491,54 @@ mod tests {
         }
         let bits = (sign << 31) | ((exp + 112) << 23) | (frac << 13);
         f32::from_bits(bits)
+    }
+}
+
+#[cfg(test)]
+mod bf16_tests {
+    use super::bf16_to_f32;
+
+    /// **bf16 is f32's top half**, so widening is exact for every value bf16
+    /// can hold — there is nothing to round.
+    #[test]
+    fn widening_is_exact() {
+        for &v in &[0.0f32, 1.0, -1.0, 2.0, 0.5, -0.125, 3.0e38, -3.0e38] {
+            let truncated = f32::from_bits(v.to_bits() & 0xffff_0000);
+            let bits = (truncated.to_bits() >> 16) as u16;
+            assert_eq!(bf16_to_f32(bits), truncated, "{v}");
+        }
+    }
+
+    /// **Not f16.** The two are the same width and neither errors on the
+    /// other's bytes, so a mix-up is silent — and catastrophic, because bf16's
+    /// exponent is 8 bits where f16's is 5. `0x3f80` is 1.0 in bf16 and
+    /// 1.9375 in f16; `0x4900` is 524288 in bf16 and 10.0 in f16.
+    #[test]
+    fn bf16_is_not_f16() {
+        assert_eq!(bf16_to_f32(0x3f80), 1.0, "0x3f80 is 1.0 in bf16");
+        assert_eq!(bf16_to_f32(0x4900), 524288.0, "and 0x4900 is 524288");
+        // Read as f16 those are 1.9375 and 10.0 — plausible numbers, orders of
+        // magnitude out, and nothing anywhere reports a problem.
+        assert_ne!(bf16_to_f32(0x3f80), 1.9375);
+        assert_ne!(bf16_to_f32(0x4900), 10.0);
+    }
+
+    /// The range is f32's, which is the whole reason checkpoints use it: f16
+    /// stops at 65,504 and T5's activations pass 190,000.
+    #[test]
+    fn the_exponent_range_is_f32s() {
+        // 1e38 is representable in bf16 and not in f16.
+        let big = f32::from_bits(1.0e38f32.to_bits() & 0xffff_0000);
+        let bits = (big.to_bits() >> 16) as u16;
+        assert!(bf16_to_f32(bits) > 1.0e37, "bf16 holds 1e38");
+        assert!(bf16_to_f32(bits).is_finite());
+    }
+
+    /// Special values carry through, because their patterns are f32's already.
+    #[test]
+    fn infinities_and_nan_survive() {
+        assert!(bf16_to_f32((f32::INFINITY.to_bits() >> 16) as u16).is_infinite());
+        assert!(bf16_to_f32((f32::NAN.to_bits() >> 16) as u16).is_nan());
+        assert_eq!(bf16_to_f32(0x8000), -0.0);
     }
 }

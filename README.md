@@ -6,8 +6,9 @@ A ground-up Rust implementation: no cmake, no git submodules, no vendored
 inference engine. One system library — MLX, installed with `brew install
 mlx-c` — and then `cargo build`.
 
-> **Status: it renders.** Six architectures — Stable Diffusion 1.5, 2.x,
-> SDXL, SD 3.5, Flux schnell, and unCLIP — on Apple GPU via MLX, with
+> **Status: it renders.** Seven architectures — Stable Diffusion 1.5, 2.x,
+> SDXL, SD 3.5, Flux (schnell/dev), FLUX.1-Kontext, and unCLIP — on Apple GPU
+> via MLX, with
 > img2img, inpainting, ControlNet, LoRA, IP-Adapter, GLIGEN, textual
 > inversion, AnimateDiff clips, region prompts, two-pass hires, step caching
 > and 4x upscaling. Every model component is verified tensor-by-tensor
@@ -151,9 +152,10 @@ sdrs flux --model models/flux --variant schnell \
 sdrs sd3 --model models/sd35 --prompt "a lighthouse at dusk" \
   --slg-layers 7,8,9 -o out.png
 
-# FLUX.1-Kontext: edit by instruction
-sdrs flux --model models/kontext --variant dev --reference photo.png \
-  --prompt "make it winter" -o edited.png
+# FLUX.1-Kontext: edit by instruction, keeping the picture
+sdrs flux --model models/flux --variant dev --reference photo.png \
+  --transformer-gguf flux1-kontext-dev-Q4_K_S.gguf --t5-gguf t5xxl-Q4_K_S.gguf \
+  --prompt "make it winter, with snow" --guidance 2.5 -o edited.png
 
 # Blend two checkpoints
 sdrs merge --a base.safetensors --b style.safetensors --alpha 0.3 -o mix.safetensors

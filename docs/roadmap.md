@@ -509,9 +509,26 @@ nobody should trust.
 
 In rough order of cost, cheapest first:
 
-- **Chroma** is a Flux variant — same block structure, a different modulation
-  scheme and no pooled CLIP input. The closest to free.
-- **Qwen Image** and **Z-Image** are new DiTs of familiar shape.
+- **Chroma** was estimated here as "closest to free — a Flux variant with a
+  different modulation scheme". **Reading the implementation says otherwise**,
+  and the correction is worth keeping because the wrong estimate is the kind
+  that gets a port started and abandoned.
+
+  Chroma replaces Flux's conditioning wholesale. There is no `time_in`, no
+  `vector_in`, no `guidance_in`, and **no pooled CLIP input at all** — `y` is a
+  text mask rather than a vector. In their place is a
+  `distilled_guidance_layer`: a five-layer MLP at inner width 5120 that emits a
+  **table of 344 modulation vectors**, which every block then *indexes* instead
+  of computing its own through a per-block `img_mod.lin` / `txt_mod.lin`. So
+  the per-block modulation weights do not exist either.
+
+  The blocks and the attention are Flux's, which is real reuse. But the
+  conditioning path, the weight namespace and the modulation source are all
+  new, and it needs its own golden references like anything else. A port, not
+  a variant.
+- **Qwen Image** and **Z-Image** are new DiTs of familiar shape. On the
+  evidence of the Chroma estimate above, treat "familiar shape" as unverified
+  until someone reads the forward pass.
 - **FLUX.2** is a new generation, not a variant.
 - **The video models** are the largest by a wide margin: a temporal axis
   through every block, a 3D VAE, and memory characteristics this machine has
@@ -530,12 +547,36 @@ every ordinary image token at `t = 0`. The reference sits at `t = 1`, so the
 model can tell the picture it is making from the picture it was given while
 both occupy the same `(h, w)` grid. `image_ids_at` is that index.
 
-**Unverified for edit quality, and that is the honest state.** Running the
-mechanism on schnell's weights exercises the plumbing — the reference reaches
-the model, 99.4% of output bytes change, the shape survives — but schnell was
-not trained for it, so the result is not an edit. Verifying the capability
-needs FLUX.1-Kontext's own weights, which are gated. The structural test says
-so in its own doc comment rather than letting green read as "Kontext works".
+**Verified against the real checkpoint.** `QuantStack/FLUX.1-Kontext-dev-GGUF`
+is an ungated mirror of the gated weights, at Q4_K_S: luminance correlation
+**0.855** with the source against **-0.642** for the same prompt and seed with
+no reference. The crab keeps its pose, its shell and the rock cluster behind
+it, and acquires snow.
+
+Three things about that measurement were not obvious:
+
+**Luminance, not RGB.** The obvious check correlates the output against the
+source in RGB and measures the wrong thing, because "make it winter" is
+*supposed* to change the colours: 0.498 in RGB against 0.855 in luminance on
+the same pair, with the RGB figure tracking how drastic the recolouring was
+rather than how well the structure survived.
+
+**The control can be negative.** A snowy scene generated from scratch is close
+to the photographic negative of a sunset one, so the no-reference baseline
+came out at -0.642 — which makes `kept > baseline * 2` true for *anything*.
+The test asserts a fixed gap instead.
+
+**Edge correlation was tried and rejected.** Snow removes almost all
+high-frequency detail, so a correct edit has a neighbour step of 2.6 against
+the source's 11 and edge agreement goes *negative*. Recorded so it is not
+tried again.
+
+Getting there needed **bf16 in the GGUF reader**: modern checkpoints leave
+their unquantised tensors in bf16 (ggml type 30), so a file that is "mostly
+Q4_K" is unreadable without it. The conversion is a shift — bf16 is f32's top
+half — and the trap is that decoding it *as f16* succeeds on every byte and
+produces values orders of magnitude out, because f16's exponent is 5 bits
+where bf16's is 8.
 
 ### Features it has that are not about models
 
@@ -658,10 +699,26 @@ workaround.
   wiring was reverted rather than kept behind a flag — an unused code path and
   a thread-local for no measured gain is a worse trade than the composition.
 
-  Recorded at this length because the isolated number is genuinely encouraging
-  and would invite a second attempt. What would change the answer is a model
-  whose steps are *not* dominated by matmul, or fusing something much larger
-  than one chain — not this chain again.
+  **A second target, found by research rather than guessed at, does pay — a
+  little.** Reading MLX's own Flux port settled where Apple applies this: it
+  compiles exactly one function in the model, `_ab_plus_cd(a,b,c,d) = a*b+c*d`,
+  inside the *rotary application* — and it does not compile the modulation.
+  That is the site this project had not tried, and it runs on q and k in every
+  attention rather than once per stream per block.
+
+  Measured the same way: 1.38x in isolation on `[1, 24, 1536, 64]`, and end to
+  end across five alternated pairs at 16 steps, **56.8 s against 58.3 s — 2.7%**.
+  Small, consistent in four pairs of five, and free. Kept.
+
+  It also came with a real hazard worth recording. A `Compiled` held in a
+  thread-local is dropped at *thread exit*, which on the main thread is after
+  MLX's globals are gone — freeing a closure into a destroyed runtime
+  segfaults, `signal: 11` after the work is complete and the result printed.
+  It is `ManuallyDrop` now: a process-lifetime cache has no point at which
+  freeing it is useful.
+
+  What would change the answer for anything larger is a model whose steps are
+  not dominated by matmul — not another elementwise chain in this one.
 - ~~**`mlx_fast_rope`**~~ — **checked, and it does not fit.** Reading the
   signature before writing the call is what caught it, exactly as it did for
   the candle-era claim that no fused attention kernel existed:
