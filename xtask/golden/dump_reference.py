@@ -318,6 +318,105 @@ def dump_llm(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out}/reference.safetensors ({len(tensors)} tensors) and llm.safetensors")
 
 
+def dump_z_image(output: pathlib.Path, model_id: str) -> None:
+    """Z-Image's transformer, at a size that fits in a fixture.
+
+    Randomly initialised and small, for the reason `dump_t5` gives: every
+    published Z-Image is 3840 wide with 30 layers plus refiners.
+
+    **Its input is a list of `[C, F, H, W]` tensors, not a batch.** Z-Image
+    accepts images of differing sizes in one call and pads internally, so the
+    signature takes a list and a frame axis even for a single still. Passing a
+    `[C, H, W]` fails; passing a batched `[B, C, H, W]` is read as one image
+    with `B` channels.
+    """
+    torch = _require("torch")
+    from diffusers import ZImageTransformer2DModel
+    from safetensors.torch import save_file
+
+    out = output / "z_image"
+    out.mkdir(parents=True, exist_ok=True)
+
+    torch.manual_seed(SEED)
+    heads, dim, cap_dim = 4, 64, 48
+    model = ZImageTransformer2DModel(
+        in_channels=16,
+        dim=dim,
+        n_layers=2,
+        n_refiner_layers=1,
+        n_heads=heads,
+        n_kv_heads=heads,
+        cap_feat_dim=cap_dim,
+        axes_dims=[8, 4, 4],
+        axes_lens=[64, 32, 32],
+    ).eval()
+    print(f"  dim={dim} heads={heads} layers=2 refiners=1 cap_feat_dim={cap_dim}")
+
+    gen = torch.Generator().manual_seed(SEED)
+    latent = torch.randn(16, 1, 8, 6, generator=gen)
+    cap = torch.randn(7, cap_dim, generator=gen)
+    timestep = torch.tensor([0.7])
+
+    # Per-stage captures, so a divergence localises to a stack instead of
+    # being reported at the output. Z-Image has three of them and they run in
+    # sequence, which makes "the answer is wrong" otherwise uninformative.
+    stages = {}
+
+    def grab(name):
+        def hook(_module, _inputs, out):
+            stages[name] = out.detach().contiguous().clone()
+
+        return hook
+
+    def grab_input(name):
+        def hook(_module, inputs, _out):
+            stages[name] = inputs[0].detach().contiguous().clone()
+
+        return hook
+
+    handles = [
+        model.layers[0].register_forward_pre_hook(
+            lambda m, i: stages.__setitem__("unified_input", i[0].detach().contiguous().clone())
+        ),
+        model.layers[0].register_forward_hook(grab("after_layer0")),
+        model.noise_refiner[-1].register_forward_hook(grab("after_noise_refiner")),
+        model.context_refiner[-1].register_forward_hook(grab("after_context_refiner")),
+        model.layers[-1].register_forward_hook(grab("after_layers")),
+    ]
+    # The position ids themselves, so a rotary mismatch is checkable directly
+    # rather than inferred from a block's output.
+    ids_out = {}
+    orig_patchify = model.patchify_and_embed
+
+    def spy(*a, **k):
+        r = orig_patchify(*a, **k)
+        # (x, cap_feats, x_size, x_pos_ids, cap_pos_ids, ...)
+        ids_out["x_pos_ids"] = torch.cat(r[3], dim=0).to(torch.int32).contiguous().clone()
+        ids_out["cap_pos_ids"] = torch.cat(r[4], dim=0).to(torch.int32).contiguous().clone()
+        return r
+
+    model.patchify_and_embed = spy
+    with torch.no_grad():
+        result = model(x=[latent], t=timestep, cap_feats=[cap], return_dict=False)
+    model.patchify_and_embed = orig_patchify
+    stages.update(ids_out)
+    for h in handles:
+        h.remove()
+    result = result[0] if isinstance(result, tuple) else result
+
+    tensors = {
+        "latent": latent.contiguous(),
+        "cap_feats": cap.contiguous(),
+        "timestep": timestep.contiguous(),
+        "output": result[0].detach().contiguous().clone(),
+        **stages,
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    weights = {k: v.detach().contiguous().clone() for k, v in model.state_dict().items()}
+    save_file(weights, str(out / "z_image.safetensors"))
+    print(f"wrote {out}/reference.safetensors and z_image.safetensors ({len(weights)} tensors)")
+
+
 def dump_flux2(output: pathlib.Path, model_id: str) -> None:
     """FLUX.2's transformer, at a size that fits in a fixture.
 
@@ -2516,6 +2615,10 @@ def main() -> None:
     llm.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
     llm.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    zimg = sub.add_parser("z_image", help="dump Z-Image transformer references")
+    zimg.add_argument("--model-id", default="(random init)")
+    zimg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     flux2 = sub.add_parser("flux2", help="dump FLUX.2 transformer references")
     flux2.add_argument("--model-id", default="(random init)")
     flux2.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -2677,6 +2780,8 @@ def main() -> None:
         dump_t5(args.output, args.model_id)
     elif args.component == "llm":
         dump_llm(args.output, args.model_id)
+    elif args.component == "z_image":
+        dump_z_image(args.output, args.model_id)
     elif args.component == "flux2":
         dump_flux2(args.output, args.model_id)
     elif args.component == "flux_transformer":
