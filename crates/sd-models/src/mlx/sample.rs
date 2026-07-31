@@ -84,3 +84,80 @@ pub fn scale_model_input(latent: &Array, sigma: f64, s: &Stream) -> Result<Array
 pub fn denoise_epsilon(latent: &Array, output: &Array, sigma: f64, s: &Stream) -> Result<Array> {
     latent.sub(&output.mul(&Array::scalar_f32(sigma as f32)?, s)?, s)
 }
+
+/// DPM++ 2M solver state.
+///
+/// **Stateful and order-dependent**: each step uses the previous step's
+/// `denoised`. Calling steps out of order, or reusing a solver across images
+/// without [`DpmSolverPlusPlus2M::reset`], produces output that is subtly wrong
+/// in a way that reads as a bad seed rather than as a bug.
+#[derive(Debug, Default)]
+pub struct DpmSolverPlusPlus2M {
+    prev_denoised: Option<Array>,
+    /// `t` from the previous step, needed for the step-size ratio.
+    prev_t: Option<f64>,
+}
+
+impl DpmSolverPlusPlus2M {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Discard the carried state. Call between images.
+    pub fn reset(&mut self) {
+        self.prev_denoised = None;
+        self.prev_t = None;
+    }
+
+    /// One step. Call once per step, in order.
+    pub fn step(
+        &mut self,
+        x: &Array,
+        denoised: &Array,
+        sigma: f64,
+        sigma_next: f64,
+        s: &Stream,
+    ) -> Result<Array> {
+        // Final step: t_next would be -ln(0) = +inf. Branch before computing
+        // rather than letting an infinity propagate — the exact result here is
+        // the denoised prediction itself.
+        if sigma_next == 0.0 {
+            self.prev_denoised = Some(denoised.contiguous(s)?);
+            self.prev_t = Some(-sigma.ln());
+            return denoised.contiguous(s);
+        }
+        if sigma == 0.0 {
+            return x.contiguous(s);
+        }
+
+        let t = -sigma.ln();
+        let t_next = -sigma_next.ln();
+        let h = t_next - t;
+
+        // The denoised estimate the step actually uses: the current prediction
+        // on the first step, and a second-order extrapolation thereafter.
+        let d = match (&self.prev_denoised, self.prev_t) {
+            (Some(prev), Some(prev_t)) => {
+                let h_last = t - prev_t;
+                let r = h_last / h;
+                let inv = 1.0 / (2.0 * r);
+                denoised
+                    .mul(&Array::scalar_f32((1.0 + inv) as f32)?, s)?
+                    .sub(&prev.mul(&Array::scalar_f32(inv as f32)?, s)?, s)?
+            }
+            // First-order fallback until there is a previous step to use.
+            _ => denoised.contiguous(s)?,
+        };
+
+        let x_next = x
+            .mul(&Array::scalar_f32((sigma_next / sigma) as f32)?, s)?
+            .sub(
+                &d.mul(&Array::scalar_f32(((-h).exp() - 1.0) as f32)?, s)?,
+                s,
+            )?;
+
+        self.prev_denoised = Some(denoised.contiguous(s)?);
+        self.prev_t = Some(t);
+        Ok(x_next)
+    }
+}
