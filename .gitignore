@@ -32,3 +32,8 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+# Cartograph private agent configuration
+/.cartograph/
+/.claude/settings.local.json
+/.claude/skills/cartograph/SKILL.md
+/CLAUDE.local.md

@@ -34,6 +34,10 @@ objc2 = { version = "0.6", optional = true }
 
 [features]
 default = []
+# The MLX backend, per the decision in docs/handoff.md. Needs `mlx-c` and
+# `mlx` on the system; build.rs finds them via MLX_C_PREFIX/MLX_PREFIX or
+# Homebrew, and links nothing at all when this feature is off.
+mlx = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels", "dep:objc2-metal", "dep:objc2-metal-performance-shaders-graph", "dep:objc2-metal-performance-shaders", "dep:objc2-foundation", "dep:objc2"]
 # Apple's Accelerate: 1.7-1.9x on CPU (SD 1.5 512, 4 steps, interleaved:

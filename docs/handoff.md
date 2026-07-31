@@ -7,30 +7,59 @@ Saying **go** means: read this file, take the first unchecked item under
 
 ### Start here
 
-1. **Bind `mlx-c` behind `sd-tensor`.** Nothing else moves until this exists.
+1. **Decide the fork, and write the answer down.** Nothing else moves until
+   this exists — see [The fork to decide before writing any
+   code](#the-fork-to-decide-before-writing-any-code). Either `sd-tensor`
+   emulates candle's API over MLX and the 102 downstream files stay untouched,
+   or roughly 500 call sites change to MLX's own shape. The two do not share a
+   first commit, so guessing is more expensive than deciding.
+
+2. ~~**Spike GGUF before binding anything.**~~ — **done 2026-07-30, and it
+   does not block.** Reading and dequantising GGUF needs one Python library and
+   no candle. SD 3.5 medium dequantises to 4.9 GB of f16 and needs nothing
+   else; Flux schnell would be 23.8 GB and has to stay quantised, which costs a
+   cosine of ~0.995 through MLX's own 4-bit. Full numbers and the
+   double-quantisation trap under [Order of work](#order-of-work).
+
+3. **Bind `mlx-c` behind `sd-tensor`.** — **started 2026-07-30; the flag
+   exists and one op agrees.** `cargo test -p sd-tensor --features mlx` builds
+   against MLX and passes: elementwise add matches candle exactly, laziness is
+   asserted rather than assumed, and the default build links nothing new. What
+   is there is `Array`, `Stream`, `add` and `eval` — the skeleton, not the
+   surface. Continue from `src/mlx.rs`.
+   - **Install:** `brew install mlx-c` (pulls `mlx`). `build.rs` finds both via
+     `MLX_C_PREFIX`/`MLX_PREFIX` or Homebrew and links nothing when the feature
+     is off. Bindings are hand-written; `bindgen` would put libclang in every
+     build of this crate for a dozen declarations.
+   - **Owed, and known:** `mlx-c` reports errors through a process-global
+     handler, so `check()` currently surfaces a status code and no message.
+     A thread-local trampoline around `mlx_set_error_handler` is needed before
+     the error text is worth anything.
    - `mlx-c` is Apple's own C API (github.com/ml-explore/mlx-c). Bind it
      directly; `cargo search mlx` finds no first-party Rust crate, and the
-     third-party shims are 0.2.x.
+     third-party shims are still 0.2.x (`rlx-mlx` 0.2.13), as before.
    - It goes in `sd-tensor` and nowhere else. `scripts/check-seam.sh` enforces
      that no crate outside it names the backend, and CI runs it. That rule is
      what makes this migration bounded rather than total — do not weaken it to
      make the port easier.
-   - Target surface first: `Tensor`, dtype/shape/stride, and the ~20 ops that
-     `sd-models` actually calls. The full list of what candle currently
-     provides is in [roadmap.md](roadmap.md).
+   - Target surface: **not** "the ~20 ops `sd-models` calls" — that estimate
+     was wrong. Measured 2026-07-30: 49 distinct items over 596 import sites
+     in 102 files, and 85% of them are candle's own types re-exported by the
+     seam. See [What the seam actually
+     hides](#what-the-seam-actually-hides) before estimating this step.
    - Success looks like: `sd-tensor` compiles against MLX behind a feature
      flag, with candle still the default, and one trivial op agreeing between
      the two.
 
-2. **Port SD 1.5 end to end**, gated on `golden_unet` and `golden_vae`. The
+4. **Port SD 1.5 end to end**, gated on `golden_unet` and `golden_vae`. The
    checkpoint is at `models/sd15` and those are the strictest tests in the
    repo. Do not start a second model until the first is green.
 
-3. **Run both backends in parallel** until every golden test passes on MLX.
+5. **Run both backends in parallel** until every golden test passes on MLX.
    Delete candle in one commit, not gradually.
 
-4. **GGUF last**, gated on `flux_schnell_gguf`. This is the piece with no
-   measurement behind it and no obvious path — see the warning below.
+6. **Finish GGUF**, gated on `flux_schnell_gguf`, carrying whatever the spike
+   in step 2 established.
 
 Verification, unchanged and non-negotiable:
 
@@ -88,18 +117,168 @@ does not change with the backend.
 GGUF. MLX has its own quantisation and does not read GGUF natively. Flux
 schnell GGUF is in the test suite and will not port by itself.
 
+### What the seam actually hides
+
+Measured 2026-07-30, from source rather than from the index: cartograph's
+resolved edges undercount cross-crate Rust badly here (3,538 resolved against
+22,783 unresolved, and a cross-seam edge query returned 10 symbols), so every
+figure below was counted against the code and not taken from the graph.
+
+**596 import sites, 49 distinct items, 102 files, five crates** reach through
+`sd_tensor`:
+
+| what | sites | share |
+|---|---|---|
+| candle types re-exported verbatim | 467 | 78% |
+| `sd-tensor` shadows, deliberately candle-shaped | 40 | 7% |
+| genuinely `sd-tensor`'s own | 89 | 15% |
+| **candle-shaped overall** | **507** | **85%** |
+
+`lib.rs:23` hands out `Tensor, DType, Device, Error, Result, Module, Shape,
+IndexOp, D, Layout, CpuStorage, CustomOp1/2/3` straight from `candle_core`;
+`nn` hands out `Linear, LayerNorm, Embedding, VarBuilder, VarMap` from
+`candle_nn`. `sd_tensor::Tensor` **is** `candle_core::Tensor` — one type, two
+names.
+
+So `check-seam.sh` passes exactly as designed, and it is not lying: it greps
+for `use candle_(core|nn|transformers)` outside `sd-tensor`, and there is
+none. **The seam hides the crate name, not the API shape.** It does bound the
+blast radius to one crate, which is the valuable half and worth keeping. The
+other half — "in principle nothing above it changes" — holds only if MLX can
+be made to present candle's surface.
+
+**This does not change the decision.** Owning kernels forever, convolution at
+48% of a step, and candle's two silent wrong-answer bugs are all unaffected.
+It changes what step 1 is.
+
+#### The fork to decide before writing any code
+
+Step 1 is not "bind the ~20 ops `sd-models` calls". It is "reimplement
+candle's API on MLX for 102 files this project has committed to not touching".
+There are two ways, and they produce entirely different first commits:
+
+**(a) Emulate candle's API over MLX.** The 102 files do not change. The cost is
+a candle-compatibility layer owned forever — which recreates the thing this
+move exists to escape.
+
+**(b) Change the call sites.** Roughly 500 of them, in MLX's own shape. A much
+larger diff up front and nothing permanent to maintain. MLX's lazy graph fits
+candle's eager `Result`-per-op shape poorly, so a shim would be fighting the
+backend as well as carrying it.
+
+**Decided 2026-07-30: (b).** Recorded here because every later estimate depends
+on it.
+
+What settled it was reading `mlx-c`'s actual surface rather than reasoning
+about it. Ops are `int mlx_add(mlx_array* res, const mlx_array a, const
+mlx_array b, const mlx_stream s)`: out-param result, status return, an explicit
+stream per call, manual `mlx_array_free`, and a **global** error handler rather
+than per-call errors. Most of that wraps into candle's shape mechanically. Two
+things do not:
+
+- **Errors are global.** Reconstructing candle's `Result` per op needs a
+  thread-local trampoline around `mlx_set_error_handler`.
+- **Lazy against eager, which is the one that decides it.** candle's API means
+  every `Result<Tensor>` is a materialised value. MLX's speed *comes from*
+  fusing the graph before `mlx_eval`. Emulating candle faithfully forces a
+  choice between evaluating per op — discarding the fusion that produced the
+  2.53x — and staying lazy while `Result` reports success for work that has not
+  run, so failures surface at `eval` attributed to the wrong operation.
+
+(a) would therefore have spent a permanent shim to protect 102 files and risked
+the performance the move exists for. (b) changes roughly 500 call sites once,
+in mechanical batches, each gated by the golden tests.
+
+What makes this concrete, in order of how load-bearing it is:
+
+- **`VarBuilder`** — 46 imports across 47 files. Candle's prefixed lazy weight
+  loader, and how every model here is constructed. MLX has no equivalent;
+  something has to be written before a single model loads.
+- **`Result` / `Error`** — 33 imports of candle's error type. Already conceded
+  at `lib.rs:35`: "It cannot be an `Error` variant, because `Error` is
+  candle's."
+- **`CustomOp1/2/3`, `CpuStorage`, `Layout`** — candle's backend-extension
+  interface, and how all three fused Metal kernels dispatch. MLX extends
+  differently, so `fused.rs` does not port: it is rewritten or dropped. Budget
+  for that rather than assuming MLX's fusion subsumes it.
+- **`QTensor` / `GgmlDType` / gguf `Content`** — the GGUF path, which is the
+  scheduling problem noted below.
+
 ### Order of work
 
-1. **Bind `mlx-c` behind `sd-tensor`.** This is what the seam exists for: no
-   crate outside it may name the backend, so in principle nothing above it
-   changes. `mlx-c` is Apple's own C API — bind it directly rather than taking
-   a third-party shim (`cargo search mlx` finds no first-party Rust crate).
-2. **Port SD 1.5 first**, end to end, against `golden_unet` and
+1. **Decide (a) or (b) above, and write the answer down.** No binding work
+   until this is settled; the two paths do not share a first commit.
+2. **Spike GGUF**, ahead of the binding work rather than after it — see
+   **Why GGUF moved** below.
+3. **Bind `mlx-c` behind `sd-tensor`.** The seam bounds this to one crate —
+   but see [What the seam actually hides](#what-the-seam-actually-hides)
+   before estimating it: 85% of what crosses the seam is candle-shaped, so
+   this step carries the API surface, not just ~20 ops. `mlx-c` is Apple's own
+   C API — bind it directly rather than taking a third-party shim
+   (`cargo search mlx` finds no first-party Rust crate).
+4. **Port SD 1.5 first**, end to end, against `golden_unet` and
    `golden_vae`. The checkpoint is on disk and the tests are the strictest.
    Do not port a second model until the first is green.
-3. **Keep candle building in parallel** behind a feature until parity is
+5. **Keep candle building in parallel** behind a feature until parity is
    proven on every golden test. Delete it in one commit, not gradually.
-4. **GGUF last**, with `flux_schnell_gguf` as the gate.
+6. **Finish GGUF**, with `flux_schnell_gguf` as the gate, carrying whatever
+   the spike established.
+
+**Why GGUF moved.** This document previously said both "the hardest piece, and
+the reason to schedule it early" and "GGUF last". Both could not hold, and the
+early reading is the right one: quantisation is load-bearing here, not a
+finishing touch. SD 3.5 defaults to Q4_K_M (1.79 GB against 10.2 GB dense, and
+the dense build died in denoise step 1 under load), Flux schnell GGUF is a test
+gate, and Flux mini already does not fit on this machine. MLX has its own
+quantisation and does not read GGUF. If that cannot be bridged the port strands
+exactly the models that need it most — and leaving it last means finding that
+out after five architectures have been ported.
+
+#### Spike run 2026-07-30: GGUF is not a blocker, but Flux and SD 3.5 need different answers
+
+Reading the container needs nothing from candle and costs nothing: the
+`gguf` Python package parsed both checkpoints in 0.03 s, and dequantising the
+largest tensor took 0.10 s (SD 3.5) and 0.22 s (Flux). Handing the result to
+MLX is a plain `mx.array`. The feared piece — "MLX does not read GGUF" — is
+true and irrelevant: dequantisation is a library call, not a subsystem.
+
+What actually decides it is memory, and the two models diverge:
+
+| checkpoint | on disk | elements | dense f16 | verdict |
+|---|---|---|---|---|
+| SD 3.5 medium Q4_K_M | 1.7 GB | 2.47B | **4.9 GB** | dequantise on load, no requantisation, no quality loss |
+| Flux schnell Q4_K_S | 6.3 GB | 11.89B | **23.8 GB** | too tight beside activations on 36 GB — must stay quantised |
+
+Both are mixed containers, not uniformly quantised: SD 3.5 is 402 F16 / 215
+Q4_K / 48 Q5_K tensors, Flux is 468 F32 / 304 Q4_K / 4 F16. Quantised tensors
+carry 4.50 bits/weight on disk against 16 in MLX, a 3.6x expansion.
+
+So SD 3.5 medium can take the simple path and lose nothing. Flux cannot, and
+has to be requantised into MLX's own scheme. Round-tripping the largest tensor
+through `mx.quantize`/`mx.dequantize` at group size 64, against the values GGUF
+dequantised to:
+
+```text
+  Flux    4-bit   max|diff| 3.35e-2   mean 3.13e-3   cosine 0.995822
+  Flux    8-bit   max|diff| 2.00e-3   mean 1.86e-4   cosine 0.999973
+  SD 3.5  4-bit   max|diff| 2.18e-2   mean 7.65e-4   cosine 0.994762
+  SD 3.5  8-bit   max|diff| 1.28e-3   mean 4.56e-5   cosine 0.999978
+```
+
+8-bit is near-lossless and roughly halves the f16 footprint; 4-bit costs a
+cosine of ~0.995 and is the only thing that keeps Flux comfortably in memory.
+
+**The trap in those 4-bit numbers.** They compare MLX's quantisation against
+*GGUF-dequantised* values, so the error sits on top of Q4_K's own loss — two
+lossy quantisations in series. If MLX quantisation is used at all, quantise
+from the original f16 checkpoint rather than from the GGUF.
+`models--adamo1139--stable-diffusion-3.5-medium-ungated` is already in the
+cache, so this is measurable rather than theoretical.
+
+**Consequence for the gates.** `flux_schnell_gguf` would then be checking a
+differently-quantised model, not the same one. That tolerance must be
+re-derived from `xtask/golden/reference_precision.py`, not widened until the
+test passes — rule 3, and it does not bend for a port.
 
 ### Numbers to beat
 
@@ -117,6 +296,134 @@ convolution is im2col plus a matmul, materialising up to 283 MB per call at
 ~25 GB/s, and **Apple's own conv is 1.99x faster** (`--example mps_conv`).
 Convolution is ~48% of a step. If MLX does not beat candle's conv, the move
 has not paid for itself.
+
+#### It does. Measured 2026-07-30: MLX's conv is 4.1x candle's
+
+Every 3x3 convolution in one SD 1.5 forward, the shapes in
+`examples/sd15_inventory.txt`, batch 2, f32 both sides, min of 10 after warmup
+on both sides:
+
+```text
+  candle Metal (--example conv_breakdown)   336.7 ms   = 211.0 gemm + 125.7 im2col
+  MLX 0.29.3  (mx.conv2d, NHWC)              81.3 ms
+                                            -------
+                                              4.14x
+```
+
+MLX's convolution is also **faster than the bare gemm candle performs under
+it** (81.3 against candle's 211.0 gemm alone), which is the signature of a
+direct convolution rather than an im2col round trip. The 37% ceiling the
+`conv_breakdown` header derives — "a perfect direct convolution could remove at
+most 37% of it" — bounds what removing im2col could win *within candle's
+structure*. MLX beats it by not having that structure.
+
+Verified before being believed: `mx.conv2d` at this exact call shape agrees
+with an independent numpy float64 im2col reference to 1.3e-6 relative at
+f32, across four shapes including the 4->320 and 320->4 extremes. The 4.1x is
+not a mis-shaped call that skips work.
+
+**Two caveats that matter more than the headline.**
+
+- **MLX convolutions are channels-last.** These numbers are NHWC in, `(out,
+  kh, kw, in)` weights. That is MLX's native layout and candle's is NCHW, so
+  each framework was measured in its own idiom — fair for "which is faster",
+  but a port carries an NHWC conversion through every model, or eats a
+  transpose per call. Budget it; do not discover it.
+- **candle's gemm here is 2.4x slower than MLX's own** (211.0 against 89.2 at
+  identical shapes and dtype). [roadmap.md](roadmap.md) argues the gemm quarter
+  is unbeatable because candle's matmul kernels *are* Apple's MLX code. The
+  kernel may well be the same; this path is not. The gap is dispatch and
+  layout around it, most likely `broadcast_matmul` materialising its broadcast.
+  That is worth confirming, because it means part of the "already optimal"
+  quarter is in fact on the table.
+
+#### End to end, measured 2026-07-30: MLX is 2.5x at equal precision
+
+Same weights (`models/sd15`), 512x512, 20 steps, CFG 7.5, one image. Both sides
+load outside the clock, take one warm run for shader compilation, and
+synchronise before stopping — the methodology in `examples/sd15_step_time.rs`,
+mirrored on the MLX side. Denoise **and** VAE decode are inside the clock on
+both, because the Rust `pipeline.run` returns an image. Interleaved three
+times each on an otherwise idle machine:
+
+```text
+  candle  f32   12.780 s   639.0 ms/step   (12.780, 12.834, 12.780)
+  MLX     f32    5.047 s   252.3 ms/step   ( 5.066,  5.047,  5.044)   2.53x
+  MLX     f16    3.916 s   195.8 ms/step   ( 3.912,  3.916,  3.923)   3.26x
+```
+
+**f32 is the honest comparison.** `Txt2ImgPipeline` loads every module as
+`DType::F32` (txt2img.rs), so 2.53x is like for like. The f16 row is what MLX
+would actually be run at and is listed separately rather than being passed off
+as the same test; candle would need its own f16 path to claim it.
+
+Peak memory: 8.49 GB at f32, 6.66 GB at f16.
+
+**The trap that cost the first three attempts, recorded so it is not paid
+again.** MLX keeps a buffer pool that grows across generations. On a machine
+also hosting a 15 GB colima VM this tips into swap, and a swapping run measures
+the pager rather than the backend: run 2 of one loop took 10.8 s and run 4 of
+the *same loop* took 115.5 s, a 10x swing with nothing changed. `mx.clear_cache()`
+between timed runs fixes it; stopping colima for the measurement removed the
+last of the variance and took the spread under 0.5%. Any re-measurement needs
+both, or the numbers are fiction. This is rule 2 and rule 6 arriving together.
+
+**Held to `golden_unet`, not to eyesight — it failed, and the cause was one
+constant.** Run against the same `tests/golden/unet_full` fixture, the same
+weights and the same bound as `full_unet_matches_diffusers`:
+
+```text
+  before   max_abs 5.628e-4   atol 1e-4   FAIL
+  after    max_abs 1.061e-5   atol 1e-4   PASS
+  this project's UNet, same fixture:  1.1e-5
+```
+
+**MLX now agrees with diffusers as closely as the candle port does.** All
+twelve skips are clean, and `mid_output` lands at 1.224e-4 — which is the
+regime `UNET_RTOL` exists for, since `reference_precision.py` measured
+diffusers missing its *own* f64 by 1.108e-4 on that tensor. Its excess beyond
+the relative term is 5.085e-5, well inside `UNET_ATOL`.
+
+**The bug: `Transformer2DModel`'s GroupNorm epsilon.** `mlx-examples` builds it
+as `nn.GroupNorm(norm_num_groups, in_channels, pytorch_compatible=True)` with no
+`eps`, taking MLX's default of 1e-5. diffusers hardcodes **1e-6** there. That is
+precisely the trap `unet/attention.rs` already warns about at the top of the
+file — *"Three `eps` values are in play... unifying them would be tidier and
+wrong"* — committed by someone else, in sixteen places. Setting
+`SPATIAL_NORM_EPS` on those norms is the entire fix, and it costs nothing: same
+ops, same shapes, one different scalar inside a normalisation already being
+computed.
+
+**How it was found, because the method generalises.** Localised by first bad
+skip, exactly as `down_pass_skips_match_diffusers` is written to do: `conv_in`
+exact at 7.153e-7 ruled out weight loading and the NCHW/NHWC transposes;
+`down_01` at 2.425e-4 put it in the first block; bisecting that block against a
+float64 recomputation of diffusers' arithmetic showed the resnet faithful at
+9.402e-6, which left the transformer. **Two hypotheses were tested and both were
+wrong** — recorded so they are not re-tested:
+
+- The sinusoidal timestep embedding. `mlx-examples` genuinely parameterises
+  those frequencies differently (2.131e-4 on `temb`), but substituting
+  diffusers' exact formula moved the output 5.628e-4 -> 5.540e-4, 1.5% of it.
+- The attention formulation. MLX dispatches to the fused
+  `mx.fast.scaled_dot_product_attention` where diffusers materialises the score
+  matrix; swapping in the materialised form left `down_01` bit-identical at
+  2.425e-4.
+
+**What this means for the 2.53x.** It was measured before the fix, on code that
+failed the gate — but the fix is a scalar, not an algorithm, so the figure
+stands. Re-timed after it at 5.540 s against 5.047 s, the difference being that
+colima was running; op count is unchanged by construction.
+
+Two further patches were needed to load SD 1.5 at all, and both are the sort of
+thing a real port will hit:
+
+- SD 1.5's text encoder ships a `position_ids` buffer that SD 2.1 does not. It
+  is a non-learned arange and is dropped.
+- SD 1.5's VAE predates diffusers' `to_q`/`to_k`/`to_v` rename and uses
+  `query`/`key`/`value`/`proj_attn`. Plain Linear at identical shapes, so a
+  rename — but a silent mismatch here decodes to colour-corrupted output rather
+  than failing, which is exactly the failure mode `golden_vae` exists to catch.
 
 ---
 

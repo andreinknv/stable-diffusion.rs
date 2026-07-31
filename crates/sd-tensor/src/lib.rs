@@ -110,6 +110,9 @@ pub mod nn {
 /// Convolution with optional circular padding, for seamless tiling.
 pub mod conv;
 pub mod fused;
+/// The MLX backend. See the module docs and docs/handoff.md.
+#[cfg(feature = "mlx")]
+pub mod mlx;
 #[cfg(feature = "metal")]
 pub mod mps;
 
