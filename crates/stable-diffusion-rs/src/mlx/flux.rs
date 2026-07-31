@@ -227,6 +227,65 @@ impl FluxPipeline {
         })
     }
 
+    /// Assemble Flux from explicit pieces, quantising the two large ones as
+    /// they load.
+    ///
+    /// **The path that makes full-size schnell runnable on this machine.** A
+    /// stock `diffusers` directory ships the transformer and T5 as f16
+    /// safetensors — 23.8 GB and 9.5 GB — and neither this loader nor any
+    /// other can hold both. From GGUF, each tensor is dequantised,
+    /// requantised and dropped, so the peak is one tensor.
+    ///
+    /// `transformer_gguf` is in Flux's own naming, which is what the model
+    /// asks for. `t5_gguf` is in llama.cpp's, so it is translated through
+    /// `sd_loader::t5_key` on the way in.
+    pub fn from_gguf(
+        transformer_gguf: &Path,
+        t5_gguf: &Path,
+        clip: &Path,
+        vae: &Path,
+        clip_tokenizer: &Path,
+        t5_tokenizer: &Path,
+        cfg: flux::FluxConfig,
+        bits: usize,
+    ) -> Result<Self, PipelineError> {
+        for p in [
+            transformer_gguf,
+            t5_gguf,
+            clip,
+            vae,
+            clip_tokenizer,
+            t5_tokenizer,
+        ] {
+            if !p.exists() {
+                return Err(PipelineError::MissingFile(p.to_path_buf()));
+            }
+        }
+        let stream = Stream::gpu();
+        let transformer = quantized::from_gguf(transformer_gguf, bits, &stream)?;
+        let t5w = quantized::from_gguf_renamed(t5_gguf, bits, |k| sd_loader::t5_key(k), &stream)?;
+
+        let mut vae_w = load_safetensors(vae)?;
+        normalise_legacy_attention(&mut vae_w);
+        let t5_len = if cfg.guidance_embed {
+            T5_LENGTH_DEV
+        } else {
+            T5_LENGTH_SCHNELL
+        };
+        Ok(Self {
+            clip_tokenizer: ClipTokenizer::from_file(clip_tokenizer)?,
+            t5_tokenizer: T5Tokenizer::from_file(t5_tokenizer, t5_len)?,
+            clip: load_safetensors(clip)?,
+            t5: t5w,
+            transformer,
+            vae: vae_w,
+            cfg,
+            vae_cfg: VaeConfig::flux(),
+            flow: FlowMatchConfig::flux(),
+            stream,
+        })
+    }
+
     /// `(txt, pooled)`: T5's sequence and CLIP's **raw pooled** vector.
     pub fn conditioning(&self, prompt: &str) -> Result<(Array, Array), PipelineError> {
         let s = &self.stream;

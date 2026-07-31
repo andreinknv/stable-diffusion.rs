@@ -372,3 +372,69 @@ fn the_flux_transformer_agrees_with_itself_quantised() {
         measured.push((label, c, ratio));
     }
 }
+
+/// **Full-size schnell actually runs, quantised.**
+///
+/// The claim this whole module exists to support. `mlx_gguf_large` asserts
+/// schnell's dense footprint is 47.6 GB and does not fit; this loads the same
+/// checkpoint quantised and pushes a real activation through all 57 blocks.
+///
+/// The conditioning is synthetic rather than a real prompt, because **no T5
+/// tokenizer is on this machine** — `tests/golden/flux/` ships CLIP's but not
+/// sentencepiece. That is a fixture gap and not a code one: the transformer
+/// cannot tell where its 4096-wide context came from. A genuine
+/// prompt-to-pixels Flux run wants that one small file.
+#[test]
+fn schnell_runs_quantised_at_full_size() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/flux/flux-schnell-q4_k_s.gguf");
+    if !path.exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no Flux schnell gguf.");
+        return;
+    }
+    let s = Stream::gpu();
+    let w = quantized::from_gguf(&path, DEFAULT_BITS, &s).expect("load schnell quantised");
+    eprintln!(
+        "schnell quantised: {:.2} GB resident",
+        w.resident_bytes() as f64 / 1e9
+    );
+
+    // A 512x512 image: a 64x64 latent, so a 32x32 patch grid.
+    let (lat_h, lat_w) = (64usize, 64usize);
+    let img_len = (lat_h / 2) * (lat_w / 2);
+    let cfg = sd_models::mlx::flux::FluxConfig::schnell();
+    let ids = sd_models::mlx::flux::image_ids(lat_h, lat_w);
+
+    let img = activation(img_len, 64);
+    let img = img.reshape(&[1, img_len, 64], &s).unwrap();
+    let txt = activation(256, 4096).reshape(&[1, 256, 4096], &s).unwrap();
+    let pooled = activation(1, 768);
+    let timestep = Array::from_slice_f32(&[1.0], &[1]).unwrap();
+
+    let out = sd_models::mlx::flux::forward(
+        &img, &ids, &txt, &timestep, &pooled,
+        // schnell is not distilled on a guidance scale.
+        None, &cfg, &w, &s,
+    )
+    .expect("schnell forward");
+
+    assert_eq!(
+        out.shape(),
+        vec![1, img_len, 64],
+        "a velocity of the packed latent's shape"
+    );
+    let v = out.to_vec_f32(&s).unwrap();
+    assert!(
+        v.iter().all(|x| x.is_finite()),
+        "the output has non-finite values"
+    );
+
+    // Not degenerate: a model that silently read zeros would return something
+    // constant, and 57 blocks of quantised weights that failed to resolve
+    // would too.
+    let peak = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    let mean = v.iter().sum::<f32>() / v.len() as f32;
+    let spread = (v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32).sqrt();
+    eprintln!("schnell velocity: peak {peak:.3}, mean {mean:.4}, sd {spread:.4}");
+    assert!(spread > 1e-3, "the velocity is constant ({spread:.3e})");
+}

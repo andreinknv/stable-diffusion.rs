@@ -170,6 +170,50 @@ pub fn from_gguf(path: &Path, bits: usize, s: &Stream) -> Result<QuantizedWeight
     Ok(QuantizedWeights { quantized, dense })
 }
 
+/// Load a GGUF whose names need translating, quantising as it reads.
+///
+/// `rename` maps a file name to the name the model asks for, and returns
+/// `None` for a tensor that is not part of this model. `sd_loader::t5_key` is
+/// one such mapping and `sd_loader::ldm` holds the others — they are pure
+/// string logic, so both backends call the same ones and cannot come to
+/// disagree about which tensor is which.
+pub fn from_gguf_renamed(
+    path: &Path,
+    bits: usize,
+    rename: impl Fn(&str) -> Option<String>,
+    s: &Stream,
+) -> Result<QuantizedWeights> {
+    let mut g = mlx_gguf::Gguf::open(path)?;
+    let infos = g.tensors.clone();
+    let mut quantized = HashMap::new();
+    let mut dense: Weights = HashMap::new();
+
+    for info in &infos {
+        let Some(name) = rename(&info.name) else {
+            continue;
+        };
+        let values = g.dequantize(info)?;
+        let array = Array::from_slice_f32(&values, &info.shape)?;
+        drop(values);
+
+        let want = if sensitive(&name) { 8 } else { bits };
+        if want >= 2 && quantizable(&info.shape) {
+            let q = QuantizedArray::quantize(&array, GROUP_SIZE, want, s)?;
+            sd_tensor::mlx::eval(&[&q.weight, &q.scales, &q.biases])?;
+            quantized.insert(name, q);
+        } else {
+            dense.insert(name, array.contiguous(s)?);
+        }
+    }
+    if quantized.is_empty() && dense.is_empty() {
+        return Err(Error::Msg(format!(
+            "gguf: {} carries no tensors this model recognises",
+            path.display()
+        )));
+    }
+    Ok(QuantizedWeights { quantized, dense })
+}
+
 /// Quantise an already-loaded dense map.
 ///
 /// **Preferred over [`from_gguf`] when the original checkpoint is available**,
