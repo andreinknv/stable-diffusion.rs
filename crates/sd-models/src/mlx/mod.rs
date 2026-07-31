@@ -29,6 +29,8 @@ pub mod controlnet;
 pub mod esrgan;
 /// Flux's MMDiT transformer.
 pub mod flux;
+/// Loading MLX weights from a GGUF checkpoint.
+pub mod gguf;
 /// GLIGEN's grounded generation: boxes and phrases into the blocks.
 pub mod gligen;
 /// IP-Adapter's decoupled cross-attention.
