@@ -22,8 +22,10 @@
 //! every build of this crate to generate the declarations below.
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_void, CStr};
+use std::collections::HashMap;
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::fmt;
+use std::path::Path;
 use std::sync::Once;
 
 use crate::{Error, Result};
@@ -48,6 +50,24 @@ struct mlx_stream {
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct mlx_vector_array {
+    ctx: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct mlx_map_string_to_array {
+    ctx: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct mlx_map_string_to_string {
+    ctx: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct mlx_map_string_to_array_iterator {
     ctx: *mut c_void,
 }
 
@@ -194,8 +214,30 @@ unsafe extern "C" {
         s: mlx_stream,
     ) -> i32;
 
+    // weight loading
+    fn mlx_load_safetensors(
+        res_0: *mut mlx_map_string_to_array,
+        res_1: *mut mlx_map_string_to_string,
+        file: *const c_char,
+        s: mlx_stream,
+    ) -> i32;
+    fn mlx_map_string_to_array_new() -> mlx_map_string_to_array;
+    fn mlx_map_string_to_array_free(map: mlx_map_string_to_array) -> i32;
+    fn mlx_map_string_to_string_new() -> mlx_map_string_to_string;
+    fn mlx_map_string_to_string_free(map: mlx_map_string_to_string) -> i32;
+    fn mlx_map_string_to_array_iterator_new(
+        map: mlx_map_string_to_array,
+    ) -> mlx_map_string_to_array_iterator;
+    fn mlx_map_string_to_array_iterator_free(it: mlx_map_string_to_array_iterator) -> i32;
+    fn mlx_map_string_to_array_iterator_next(
+        key: *mut *const c_char,
+        value: *mut mlx_array,
+        it: mlx_map_string_to_array_iterator,
+    ) -> i32;
+
     // streams, evaluation, errors
     fn mlx_default_gpu_stream_new() -> mlx_stream;
+    fn mlx_default_cpu_stream_new() -> mlx_stream;
     fn mlx_stream_free(s: mlx_stream) -> i32;
     fn mlx_vector_array_new_value(val: mlx_array) -> mlx_vector_array;
     fn mlx_vector_array_free(vec: mlx_vector_array) -> i32;
@@ -273,6 +315,17 @@ impl Stream {
     pub fn gpu() -> Self {
         init();
         Self(unsafe { mlx_default_gpu_stream_new() })
+    }
+
+    /// The default CPU stream.
+    ///
+    /// Reading a `.safetensors` file needs this: MLX's `Load` primitive has no
+    /// GPU implementation, and submitting it to the GPU stream fails at eval
+    /// with `[Load::eval_gpu] Not implemented`, long after the call that
+    /// chose the stream.
+    pub fn cpu() -> Self {
+        init();
+        Self(unsafe { mlx_default_cpu_stream_new() })
     }
 }
 
@@ -862,6 +915,59 @@ impl fmt::Debug for Array {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "mlx::Array{:?}", self.shape())
     }
+}
+
+/// Every tensor in a `.safetensors` file, by name.
+///
+/// MLX reads the container itself, so this replaces `VarBuilder`'s job of
+/// walking a prefix tree — the models name what they want and get it, and a
+/// missing key is an error at load rather than a silently zero weight.
+pub fn load_safetensors(path: &Path) -> Result<HashMap<String, Array>> {
+    init();
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|e| Error::Msg(format!("mlx: path is not a valid C string: {e}")))?;
+    // CPU, not GPU: see `Stream::cpu`. Later ops on these arrays may use the
+    // GPU stream as usual; MLX carries the dependency across.
+    let stream = Stream::cpu();
+
+    let mut arrays = unsafe { mlx_map_string_to_array_new() };
+    let mut meta = unsafe { mlx_map_string_to_string_new() };
+    let status = unsafe { mlx_load_safetensors(&mut arrays, &mut meta, c_path.as_ptr(), stream.0) };
+    unsafe { mlx_map_string_to_string_free(meta) };
+    if let Err(e) = check(status, "load_safetensors") {
+        unsafe { mlx_map_string_to_array_free(arrays) };
+        return Err(e);
+    }
+
+    let mut out = HashMap::new();
+    let it = unsafe { mlx_map_string_to_array_iterator_new(arrays) };
+    loop {
+        let mut key: *const c_char = std::ptr::null();
+        let mut value = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        // Returns non-zero once the iterator is exhausted.
+        if unsafe { mlx_map_string_to_array_iterator_next(&mut key, &mut value, it) } != 0 {
+            break;
+        }
+        if key.is_null() || value.ctx.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr(key) }
+            .to_string_lossy()
+            .into_owned();
+        out.insert(name, Array { raw: value });
+    }
+    unsafe { mlx_map_string_to_array_iterator_free(it) };
+    unsafe { mlx_map_string_to_array_free(arrays) };
+
+    if out.is_empty() {
+        return Err(Error::Msg(format!(
+            "mlx: {} contained no tensors",
+            path.display()
+        )));
+    }
+    Ok(out)
 }
 
 /// Join `arrays` along `axis` — candle's `Tensor::cat`, and how the UNet's up
