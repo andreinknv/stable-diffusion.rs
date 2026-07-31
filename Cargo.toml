@@ -35,6 +35,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 safetensors = "0.6"
 memmap2 = "0.9"
 
+# Only for the vendored CLIP vocabulary, which is a JSON object of 49,408
+# entries. Already compiled as part of `tokenizers`, so this adds a name
+# rather than a build.
+serde_json = "1"
+
 # CLIP tokenization. default-features = false is deliberate: the default
 # feature set pulls `onig`, which builds the oniguruma C library and would
 # undo this project's "no C toolchain" property. The pure-Rust path is enough

@@ -328,540 +328,298 @@ is why `Q4_K` is publishable for SD 3.5 and not for SD 1.5.
   per backend up front is 8–15 months before anything renders.
 - **A GUI.** A good library first; someone else can build the UI.
 
-## ~~Highest-value optimisation available now~~ — resolved without a kernel
+## Corrections to the tick marks above
 
-This entry used to call for a hand-written fused attention kernel for Metal,
-on the grounds that our attention materialises a 4096x4096 score matrix and
-that "candle does not expose [a fused kernel] for our shapes". **That was
-wrong, and checking it before writing the kernel is what caught it.**
+Three capabilities in the Milestone 3 line were ticked on the candle backend
+and **did not survive its removal**. Nothing in `crates/*/src` mentions any of
+them, and nothing in `crates/*/tests` does either:
 
-candle 0.11 ships `candle_nn::ops::sdpa`, a fused Metal kernel accepting head
-dimensions of 32, 64, 72, 80, 96, 128, 256 and 512 — which covers Flux (128),
-SD 3.5 (64), T5 (64), CLIP (64) and SDXL (64). `attention_with_path` was
-already routing to it; only the doc comment claiming it was unreachable was
-stale, written when SD 1.5 and SDXL were the only models here.
+| capability | state |
+|---|---|
+| seamless tiling | gone — no circular padding anywhere on MLX |
+| InstructPix2Pix | gone — no image-conditioned guidance path |
+| checkpoint merging | gone — was a candle-side weight-map utility |
 
-Measured with `--example attention_path`:
+They are listed here rather than quietly unticked because the distinction
+matters: these were *ported once and verified*, so re-adding them is
+re-implementation against a known-good target, not new work. Seamless tiling is
+the smallest — circular padding on every convolution, a flag through
+`UNetConfig` and `VaeConfig`.
 
-| shape | CPU | Metal | |
-|---|---|---|---|
-| SDXL UNet 1024 | 453.7 ms | **14.8 ms** | fused |
-| Flux 1024 | 957.0 ms | **43.8 ms** | fused |
-| Flux 512 | 108.8 ms | **8.5 ms** | fused |
-| SD 3.5 512 | 37.1 ms | **2.7 ms** | fused |
-| T5-XXL 154 tok | 12.6 ms | **0.3 ms** | fused |
-| SD 1.5 UNet 512 | 110.7 ms | 16.8 ms | chunked |
+The lesson generalises, and it is the same one this file records about
+verifying against a published artifact: **a tick mark describes a backend, not
+a project.** When the backend changed, the ticks needed re-earning and most of
+them were, silently, because the port was thorough. Three were not.
 
-So Metal is no longer slower than CPU for attention — it is 12-30x faster
-wherever the fused path applies. Chunked attention remains the fallback and
-still earns its place: it bounds the allocation, and it is what SD 1.5's
-40- and 160-wide heads use, along with any masked shape, since the kernel
-wants a `[batch, heads, seq_q, seq_k]` mask and `causal_mask` is `[1, 1, s, s]`.
+## What the command line cannot reach
 
-### ~~Metal end to end: fast, and currently wrong~~ — fixed
+This is the largest gap between what the project *is* and what a user can
+*run*, and it is bigger than any missing model.
 
-Flux schnell at 512x512, 4 steps: **20.8 s on Metal against 159.3 s on CPU**,
-a 7.7x speedup, and the image is now the same crab the CPU renders. It used to
-be a flat orange field with a corrupted strip along the top.
+`sdrs` has four commands — `txt2img`, `img2img`, `upscale`, `info`. Everything
+below is implemented, verified against diffusers, and reachable only by writing
+Rust:
 
-Verified across the workspace afterwards, since nothing quantised was
-separable from this bug while it stood:
-
-| model | CPU | Metal | agreement with CPU |
-|---|---|---|---|
-| SD 1.5 512, 20 steps | 113 s | **17.5 s** | max 1/255, 98.8% of pixels exact |
-| SDXL 1024, 20 steps | — | **86.5 s** | renders correctly |
-| Flux schnell 512, 4 steps | 159 s | **20.8 s** | mean 9.2/255, same image |
-| SD 3.5 medium 512, 20 steps | 230 s (dense) | **24.5 s** | now Q4_K_M by default |
-| SD 3.5 medium 256, 20 steps | 71.8 s | **9.0 s** | mean 7.0/255, same image |
-| Flux mini 512, 20 steps | 212 s | does not fit | dense f32, 12.8 GB resident |
-
-SD 1.5's near-exact agreement and Flux's mean 9.2/255 are both expected: SD 1.5
-is 20 steps through a shallow UNet, Flux is 4 steps through 57 blocks whose CPU
-path carries 0.3-1.9% quantisation noise per layer that Metal does not. Same
-picture either way; not interchangeable as files.
-
-**SD 3.5's 25.1 s is a real run but not a reliable one, and the reason is
-worth recording.** Its transformer is dense f32 — 10.2 GB — and loading it
-leaves about 1.1 GB free on a 36 GB machine; with anything else running, the
-job dies in denoise **step 1**. It was recorded here and in the handoff as a
-*VAE decode* failure, which was wrong: candle queues Metal work and inspects
-the command buffer only when something synchronises, so the failure is
-attributed to whatever waits first, and the decode was simply the first thing
-to wait. A `synchronize()` after each step moves it to step 1.
-
-The fix was not a smaller decode tile — it was the 1.79 GB Q4_K_M GGUF sitting
-unused in the fixtures. **That turned out to need no name mapping at all**,
-which is worth recording because the handoff predicted otherwise: city96's
-SD 3.5 GGUF carries the original Stability names
-(`joint_blocks.0.context_block.attn.qkv.weight`, `x_embedder`, `pos_embed`,
-`final_layer.linear`) and `sd_models::sd3` already asks for exactly those. The
-Flux GGUF loader does no renaming either — it was rejecting the file purely on
-a `double_blocks.` sentinel check.
-
-So `sd3_qtensors_from_gguf` is `flux_qtensors_from_gguf` with a different
-sentinel, and the two share one body. Reading the tensor names out of the file
-answered in two minutes what had been written up as a mapping project.
-
-SD 3.5 now loads in ~4 s instead of 14.7 s, renders 512 on Metal in 24.5 s,
-and keeps working under memory pressure that killed the dense build. The cost
-is CPU speed — 93 s against 72 s at 256 — because candle's CPU quantised
-matmul quantises the activation per call where a dense f32 matmul just runs
-gemm.
-
-**Root cause: candle 0.11's Metal quantised matmul ignores the activation's
-`start_offset`.** A tensor that is a view into the middle of a larger buffer is
-read *from the beginning of that buffer*. Nothing errors — the shapes are
-right, the kernel runs, and the answer is the product of the wrong rows.
-
-The trap that makes it survive review is that **`contiguous()` does not save
-you**. `narrow` along anything but the last axis of a contiguous tensor yields
-a layout candle already calls contiguous — the elements are consecutive, they
-merely start late — so `contiguous()` is a no-op and the offset persists.
-`force_contiguous()` is the one that always copies.
-
-Flux hit it in every double-stream block. Attention runs on the text and image
-tokens joined, then splits them apart again:
-
-```text
-  txt_attn = attn.narrow(1, 0, 512)        offset 0          -> correct
-  img_attn = attn.narrow(1, 512, 1024)     offset 512*3072   -> read the text rows
-```
-
-So all 19 blocks projected the text half of the attention output in place of
-the image half. The fix is `sd_tensor::quantized::without_storage_offset`,
-applied inside `QLinear::forward` — one place, because the seam is where every
-quantised matmul in the workspace passes.
-
-**Why the per-op check missed it for three sessions.** `--example metal_check`
-compared freshly built tensors, and a fresh tensor always owns its buffer at
-offset 0. The op is correct exactly when tested and wrong exactly when used.
-Every isolated check passed — attention at 1.9e-7 across every sequence
-length, QLinear at every row count and quantisation type, norms, RoPE, trig,
-`cat`/`narrow`, weight loading, dequantisation to 1e-8 — while the composed
-model was 50% wrong. `metal_check` now includes an offset case, and it fails
-loudly when the workaround is removed.
-
-**What actually localised it**, in order, each step halving the space:
-
-1. Cross-decode each device's latent on *both* devices — the VAE agreed to
-   4e-5 both ways, so the decode was innocent and the latent was already bad.
-2. Compare the loop's inputs — noise bit-identical, CLIP pooled 1e-5, T5 2%.
-3. Feed the transformer *identical* inputs on both devices — 50% divergence,
-   so the transformer alone was enough.
-4. Dump every intermediate against a **dense f32 reference built from the same
-   weights**, not against the other device. That is what made it readable:
-   Metal tracked full precision better than CPU (≤0.12%) up to the attention
-   output and then jumped to 36% at one projection.
-5. Recompute that projection in numpy from Metal's *own* dumped input — 36%
-   off, so the op was wrong rather than its input.
-6. Compare against the product of the buffer's first rows — matched to 1.6e-2.
-
-Step 4 is the transferable one. CPU-vs-Metal conflates two error sources and
-reads as noise; against a full-precision reference the culprit is a single
-line in a table.
-
-### CPU flash attention: a short-sequence win, not a general one
-
-candle 0.11's `candle_nn::attention::flash_attn` is now wired in as
-`ops::flash_attention_cpu` and reported as `AttentionPath::FlashCpu`. The
-survey below called it "potentially the largest single win available". It is
-not, and the shape of *why* is the useful part.
-
-The kernel streams one output row at a time under a running softmax maximum,
-so it never materialises the score matrix — but it also gets no register
-blocking across query rows and re-reads the key axis for each one. Against a
-tuned gemm that is a losing trade at large sequences and a winning one at
-small, and the crossover is sharp. Measured across `head_dim`
-{40, 64, 80, 128, 160}, `heads` {8, 12, 20, 24, 64}, batch {1, 2}:
-
-| seq | 64 | 128 | 256 | 512 | 768 | 1024 | 4096 |
-|---|---|---|---|---|---|---|---|
-| h=24, d=128 | 2.9x | 5.5x | 2.4x | 1.2x | 1.0x | 0.9x | 1.0x |
-| h=8, d=40 | 1.5x | 4.6x | 2.4x | 1.1x | 0.7x | 0.6x | 0.5x |
-
-So it is taken only at or below 512 tokens (`ops::DEFAULT_FLASH_CPU_MAX_SEQ`,
-override with `SD_FLASH_CPU_MAX_SEQ`, `0` disables). That covers CLIP and
-SD 1.5/SDXL's two deepest UNet levels, and deliberately excludes SD 3.5
-(1178), Flux (1536+) and the UNet levels that dominate a denoise step.
-
-**T5 is excluded too, and not by the length rule.** Its relative-position bias
-is a full `[batch, heads, n, n]` tensor; the kernel indexes a mask flat as
-`q_pos * seq_k + kv_pos` with no head axis, so `flash_cpu_supported` refuses
-it. This is worth spelling out because the benchmark actively misleads here:
-`--example attention_path` times T5's 154-token shape *unmasked* and reports
-5-8x, and an earlier draft of this section turned that into a claim that
-"every text encoder" benefits. It does not, and no measurement of a shape the
-model never produces could have caught it — reading the caller did.
-`the_real_text_encoder_shapes_take_the_paths_we_think_they_do` in sd-models'
-`api_contract` now pins both halves.
-
-**End to end the effect is below this machine's noise floor**, which is what
-the mechanism predicts: the eligible calls add up to roughly 0.4 s of an
-SD 1.5 generation, and about 13 ms of an SD 3.5 one. SD 1.5 at 512x512, 20
-steps ran 113.3 s with it against 114.4 s without. SD 3.5 was run four times
-alternating:
-
-| | flash off | flash on |
+| capability | verified at | reachable from `sdrs` |
 |---|---|---|
-| pair 1 (off first) | 245.2 s | 216.2 s |
-| pair 2 (on first) | 230.4 s | 228.7 s |
+| Flux (schnell, mini) | MMDiT 2.1e-6 rel | no |
+| SD 3.5 | MMDiT 5.5e-6 | no |
+| quantised-at-rest loading | Flux 13.3 GB, SD 3.5 10.1 GB | no |
+| GGUF checkpoints | f16 control row exact | no |
+| unCLIP / image variation | 9 components, all listed above | no |
+| IP-Adapter | image embeds 1.3e-6 | no |
+| GLIGEN | grounded boxes | no |
+| TAESD | — | no |
+| Canny preprocessing | — | no |
 
-The first pair looks like an 11.8% win and **is not one** — the spread between
-two runs of the *same* configuration (245.2 against 230.4) is larger than the
-difference between configurations, and reversing the order collapses the gap
-to 0.7%. Quoting pair 1 alone would have put a fabricated 12% in this
-document. Images differ by at most 1/255, on 1.0% of pixels for SD 1.5 and
-0.6% for SD 3.5.
+**The headline result of the whole project — a 12B Flux running quantised on a
+36 GB laptop — has no command line.** It is exercised by a test. That is the
+single highest-value item in this file, and it is plumbing rather than
+research: the pipelines exist and take the same `Txt2ImgConfig`.
 
-The shapes it wins are real but they are not where the time goes — attention
-at 4096 tokens is, and that is the one place this kernel loses. Beating gemm
-there needs a blocked CPU kernel that tiles over query rows as well as keys,
-which is a real kernel rather than a wiring change.
+## Against `stable-diffusion.cpp`
 
-Two things found on the way in, both recorded in the `sd-tensor` doc comments:
-candle dispatches `batch > 1` to a "varlen" kernel whose repacking costs up to
-4.1x more than simply looping the batch-1 kernel, so `flash_attention_cpu`
-loops; and unlike the Metal kernel it accepts `causal_mask`'s `[1, 1, s, s]`
-directly, because it indexes the mask flat.
+The reference implementation this project set out to be a Rust answer to.
+Checked against `leejet/stable-diffusion.cpp` at `master-805-e31a86c`
+(2026-07-30) by reading `include/stable-diffusion.h` and the `docs/` tree
+rather than the README's prose.
 
-### Candle capabilities we are not using
+### Where the two agree
 
-A survey after the fused-attention surprise, since the same mistake was
-clearly available twice:
+SD 1.x, SD 2.x, SDXL, SD 3.x, Flux (schnell/dev-class), ControlNet, LoRA,
+IP-Adapter, TAESD, ESRGAN, inpainting, img2img, textual inversion, two-pass
+hires, step caching, GGUF weights, quantised residency, VAE tiling, negative
+prompts, and a cancellable generation with progress.
 
-- ~~**`candle_nn::ops::rms_norm`**~~ — done, and the answer turned out to
-  depend on the backend. See [Fused norms are a backend
-  question](#fused-norms-are-a-backend-question) below.
-- ~~**`candle_nn::cpu_flash_attention::run_flash_attn_cpu`**~~ — done, and it
-  was **not** "the largest single win available" as this list guessed. See
-  [CPU flash attention](#cpu-flash-attention-a-short-sequence-win-not-a-general-one)
-  below for what it actually bought. Note the entry point named here is a
-  deprecated shim; the live API is `candle_nn::attention::flash_attn`.
-- **`candle_nn::rotary_emb::{rope, rope_i, rope_thd}`** — fused RoPE. Flux's
-  axis-wise 2x2 formulation may not map onto it directly, but that is worth
-  establishing rather than assuming.
-- ~~**`candle_nn::ops::layer_norm`**~~ — done, same answer as `rms_norm`
-  and for the same reason. **`pixel_shuffle`/`pixel_unshuffle`** are still
-  open: they are exactly patchify/unpatchify.
-- `candle-transformers` ships its own flux, t5, clip and stable_diffusion
-  models. We do not want those — implementing the models is the point of this
-  project — but they are a reference to check ambiguous conventions against.
+### Sampling: the widest gap, and the cheapest to close
 
-- Broadening the fused attention path to SD 1.5 by materialising the causal
-  mask to the shape the kernel wants, which is a reshape rather than a kernel.
+sd.cpp ships **20 samplers and 16 schedulers**; this project ships 3 and 1.
 
-## Fused norms are a backend question
+| | sd.cpp | here |
+|---|---|---|
+| samplers | Euler, Euler A, Heun, DPM2, DPM++ 2S a, DPM++ 2M, DPM++ 2M v2, DPM++ 2M SDE, DPM++ 2M SDE BT, iPNDM, iPNDM_v, LCM, DDIM trailing, TCD, RES multistep, RES 2S, ER-SDE, Euler CFG++, Euler A CFG++, Euler GE | Euler A, DPM++ 2M, LCM |
+| schedulers | discrete, Karras, exponential, AYS, GITS, SGM uniform, simple, smoothstep, KL-optimal, LCM, bong tangent, beta, and four model-specific | linear over the training sigmas |
 
-The seam hand-rolled `rms_norm` and `plain_layer_norm` as compositions —
-`mean_keepdim`, subtract, square, reduce, sqrt, divide — where candle ships
-fused kernels for both. Commit e5e372a measured the fused ones as 6 to 10x
-less accurate and kept the compositions. That measurement was correct and its
-conclusion was too broad: it was taken on CPU only.
+**Karras is the one that matters most.** It is what most published step counts
+and most community presets assume, so a 20-step comparison against any other
+implementation is currently comparing two different schedules. It is roughly
+fifteen lines and verifiable against `k_diffusion.sampling.get_sigmas_karras`
+directly — the same shape of golden test `sigmas.rs` already has.
 
-The two backends do not share a reduction. Relative error against an f64
-reference, from `cargo run -p sd-cli --example norm_accuracy`:
+After that, in value order: **Heun** and **DPM++ 2S a** (better images at low
+step counts), **DDIM** (the baseline every paper reports against), and
+**exponential**/**SGM uniform** scheduling.
 
-```text
-                       CPU                     Metal
-  [1,154,4096]  ours 1.3e-7  candle 8.8e-7    ours 1.4e-7  candle 9.0e-8
-  [1,1536,3072] ours 9.4e-8  candle 7.5e-7    ours 1.3e-7  candle 9.3e-8
-  [1,77,768]    ours 7.1e-8  candle 4.4e-7    ours 1.1e-7  candle 7.6e-8
-```
+### Guidance and conditioning
 
-candle's CPU kernel sums each row with a sequential `.sum::<f32>()`; error in
-a sequential sum grows with row length, and these rows are long. Its Metal
-kernel reduces across a threadgroup in a tree, which is at least as accurate
-as reducing in blocks — and 4.5x faster. So the seam now uses the fused
-kernels on Metal and the compositions on CPU, with half precision staying on
-the composition everywhere because it reduces in f32 whatever the input dtype,
-which `t5::RmsNorm` needs at d_model 4096.
+| | sd.cpp | here |
+|---|---|---|
+| CFG rescale / skip-layer guidance | `sd_slg_params_t`, per-layer, with a start/end window | no |
+| separate image and text CFG | `txt_cfg`, `img_cfg` | one scale |
+| distilled guidance | explicit | Flux only, implicit |
+| `--clip-skip` | yes | no |
+| `eta`, `flow_shift`, custom sigmas | yes | no |
 
-What this is worth, from per-call measurements at the shapes Flux-dev runs
-(`--example norm_flux_shapes`), weighted by counted call sites — 115 layer
-norms and 152 QK norms per forward, split across a 4096-token image stream, a
-512-token text stream, and 4608 concatenated:
+**`--clip-skip` is the notable omission.** The machinery is present —
+`clip::penultimate` exists and SDXL uses it — but it is hardwired per
+architecture rather than exposed, and a large fraction of community SD 1.5
+checkpoints are trained expecting `clip_skip = 2`. Without it those models are
+being run wrong, and the result is a worse picture with no error, which is this
+project's most-repeated failure shape.
 
-```text
-  layer norms   418 ms
-  QK norms      899 ms
-  total        1316 ms per step, at 1024x1024
-```
+**Skip-layer guidance** matters specifically for SD 3.5, which is where it was
+introduced and where its absence is visible in anatomy.
 
-That is an estimate, not a generation: no Flux checkpoint is present on the
-development machine, and instantiating dev at f32 would ask for about 48 GB.
+### Models it has and this does not
 
-Two things are worth carrying forward from this. The first is that "fused is
-better" and "fused is worse" are both wrong as general rules — the question is
-which reduction the kernel uses on the backend in front of you, and it has now
-come out differently on CPU and Metal for the same op. The second is that a
-comment recording the earlier measurement did not stop the swap being
-attempted a second time; `crates/sd-tensor/tests/norm_reduction.rs` now
-asserts the CPU bound directly, without needing a T5 checkpoint to catch it.
+Chroma, Qwen Image, Z-Image, FLUX.2, HiDream, Ideogram4, and a dozen more from
+2026; the video models (Wan 2.1/2.2, LTX-2, HunyuanVideo 1.5); and the edit
+models (FLUX.1-Kontext, Qwen Image Edit).
 
-CUDA is deliberately unmeasured. candle reduces in a tree there too and would
-very likely behave like Metal, but there is no CUDA machine here.
+**Kontext is the one worth taking first.** Instruction-driven image editing is
+the capability users most often want next after txt2img, it reuses the Flux
+transformer already verified here, and it replaces the InstructPix2Pix path
+that was lost — one port covering both.
 
-## Kernels we write ourselves
+### Features it has that are not about models
 
-`crates/sd-tensor/src/fused.rs` compiles Metal source this project wrote and
-dispatches it onto candle's own device. It forks nothing and adds nothing to
-the build graph: `candle-metal-kernels` and `objc2-metal` already compile in
-every `--features metal` build, and candle exposes exactly the seams needed —
-`CustomOp1::metal_fwd`, `Device::new_library_with_source` to compile at
-runtime, and `MetalDevice::command_encoder` to encode onto the command stream
-candle is already filling.
+- **Generation parameters embedded in the PNG**, as an A1111-compatible text
+  chunk. Small, and it makes every output self-describing — which suits a
+  project that cares about reproducibility more than most.
+- **Preview callbacks during sampling** (`PREVIEW_TAE`), decoding the running
+  latent every *n* steps. `Progress` already carries `denoised` for exactly
+  this; nothing consumes it.
+- **Batch generation from one load.** `sdrs` reloads the model per invocation,
+  so generating four seeds costs four loads — about 3 s each for SD 1.5.
+- **imatrix-guided quantisation.**
+- **RPC / multi-device**, which MLX also exposes (`distributed.h`) and which
+  neither this project nor most users need.
 
-This matters because the earlier reading of the constraint was wrong. Writing
-GPU kernels was assumed to require `metal-rs` or `cudarc` as a new dependency
-and was costed at months in "Deliberately not doing". It requires neither.
+### Where this project is ahead
 
-### Which compositions are worth replacing
+Worth stating plainly, because a gap list reads as a deficit report:
 
-Every candidate is several ops in a row on a large tensor, each reading its
-input from memory and writing its output back. The arithmetic between those
-trips is trivial, so the cost *is* the trips. Measured with
-`--example fusion_survey`:
+- **Every component is checked against `diffusers` or `transformers` with a
+  recorded tolerance**, and the references are regenerated from the file that
+  is actually loaded. sd.cpp has no comparable numeric gate.
+- **The backend is confined behind one crate**, enforced by a CI lint.
+- **Memory safety**, and no C or C++ compiles into this build at all — also CI
+  enforced.
+- The failure modes this file documents — the reversed decoder block order, the
+  asymmetric encoder padding, the patchify/unpatchify asymmetry, the pooled
+  embedding read from the wrong position — are recorded with the measurement
+  that found each one.
+- **A tokenizer cannot be missing.** CLIP's vocabulary is vendored, so a
+  directory holding nothing but `unet/`, `vae/` and `text_encoder/` renders.
+  sd.cpp reads the tokenizer out of the checkpoint and fails without one.
 
-```text
-  adaLN, norm -> modulate      472.6 ms per Flux-dev step   (estimated)
-  GEGLU                         25.0 ms per SD 1.5 forward
-  GroupNorm -> SiLU              1.1 ms per SD 1.5 forward
-```
+### A note on running the suite here
 
-GroupNorm -> SiLU is **not worth a kernel** and that is a result, not a gap:
-SiLU costs about 0.02 ms against the norm's 3.6 ms at the largest shape, so it
-is already hidden. Measuring it first cost less than writing it would have.
+The pipeline tests each load a full SD 1.5 into unified memory, and cargo's
+default parallelism is the core count. On a 36 GB machine that is an OOM kill —
+`signal: 9, SIGKILL`, with no failing assertion, which reads exactly like a
+crash in the code under test and is not one. `--test-threads=3` is the working
+setting. Worth knowing before spending an afternoon on it, and worth
+remembering that this failure mode has twice been misdiagnosed here in the
+other direction: a real assertion failure blamed on the OOM killer.
 
-### GEGLU: done
+## Using MLX properly
 
-`hidden * gelu(gate)` was four ops — two narrows, a gelu and a multiply — on
-the largest tensor in a transformer block, since the projection is eight times
-the model width. Five trips over the data where two would do.
+MLX is now the only backend. What is bound in `sd-tensor/src/mlx.rs` is 62 of
+its entry points, and what that leaves unused is worth being specific about.
+
+### Measured, and the answer was no
+
+**A per-step `eval` in the sampling loop.** The loop never forces evaluation,
+so the natural worry is that twenty steps accumulate as one lazy graph and
+nothing is retired until the decode. Measured at 768x768, 20 steps, alternating
+to control for machine state:
 
 ```text
-  seq 4096 dim  320   composed 5.639 ms   ours 1.452 ms   3.88x
-  seq 1024 dim  640   composed 2.563 ms   ours 0.738 ms   3.47x
-  seq  256 dim 1280   composed 1.280 ms   ours 0.433 ms   2.96x
-  seq   64 dim 1280   composed 0.411 ms   ours 0.196 ms   2.10x
+  without per-step eval   3.95 GB peak RSS   20.8 s
+  with    per-step eval   3.99 GB peak RSS   21.7 s
+  without                 4.11 GB            21.7 s
+  with                    3.99 GB            21.4 s
 ```
 
-3.65x on the op, 53.5 ms -> 14.6 ms per SD 1.5 forward. **End to end that is
-3.2%**: 15.810 s against 15.323 s for 20 steps at 512, interleaved three times
-each with a spread under 0.04 s within a condition. Worth writing down that
-the microbenchmark predicted 38.8 ms per step and the real saving was 24.4 —
-an elementwise fusion looks better in isolation than in a model whose time
-goes to matmul and convolution.
+**No effect on either.** MLX's scheduler already retires the graph
+incrementally; adding a synchronisation point buys nothing and costs the
+overlap. Recorded so it is not proposed again.
 
-The kernel is one thread per `float4` of output on a two-dimensional grid, so
-a row and a column arrive as `thread_position_in_grid` without an integer
-divide. `inner` is the model width times four and so always a multiple of
-four, which is what makes the vector loads legal.
+### Measured, and worth a flag rather than a default
 
-### The GELU tail, which candle rounds away
+**f16 weights for the UNet.** The stock SD 1.5 checkpoint is F32 for all 686
+tensors, so every matmul runs at f32 today. Casting the UNet at load, same
+alternating protocol:
 
-Metal has no `erf`, so it has to be approximated. Both implementations use
-Abramowitz and Stegun 7.1.26; they differ in arrangement. candle computes
-`erf(a) = 1 - poly(t) * exp(-a*a)` and GELU then forms `1 + erf(u)`. For
-negative `u` that is `1 - (1 - erfc)`, and once `erfc` drops below f32's
-epsilon the inner subtraction rounds to exactly 1 and the outer one to exactly
-0 — so **every input below about -6 returns precisely zero**.
+| | peak RSS | wall |
+|---|---|---|
+| f32 | 4.03 GB | 23.8 s |
+| f16 | 2.85 GB | 21.9 s |
 
-But `poly(t) * exp(-a*a)` *is* `erfc(a)`, before any subtraction. Reading it
-off directly costs the same operations and has no tail to lose. Against an f64
-reference (`--example gelu_tail`):
+**1.10x faster and 1.15 GB smaller.** The speed matches what the candle path
+measured for the same change, which is reassuring rather than surprising — a
+diffusion step at this size is bandwidth-bound before it is FLOP-bound.
 
-```text
-       x        f64 truth        candle           ours
-   -6.00   -5.93687799e-9   -0.0000000e0    -5.9407439e-9
-   -7.00   -8.97731889e-12  -0.0000000e0    -9.0168940e-12
-   -8.00   -4.88498131e-15  -0.0000000e0    -5.0277868e-15
+The image is not the same image: mean byte difference 1.08 of 255, PSNR
+36.8 dB, 58.5% of bytes identical. That is a different sample of comparable
+quality, not a degraded one — but it means f16 belongs behind a flag with that
+number attached, not silently on. For SDXL, Flux and SD 3.5, where memory is
+the binding constraint, the 1.4x residency saving is the interesting half.
+
+**bf16 is not bound at all** (`MLX_FLOAT16` is, `MLX_BFLOAT16` is not), and it
+is the better choice for the large models: T5's activations pass 190,000 and
+f16 stops at 65,504, which is why T5's weights are held quantised today. bf16
+has f32's exponent range, so it would make that a dtype choice rather than a
+workaround.
+
+### Not measured yet, in rough order of expected value
+
+- **`mlx_compile`.** MLX's graph compiler fuses elementwise chains into single
+  kernels — the same win the candle-era hand-written adaLN and GEGLU kernels
+  bought at 5.26x, except MLX generates them. Nothing here calls it. The
+  natural first target is the sampler step and the modulation chains, which
+  are exactly the "norm always followed by a modulation" shape that a general
+  tensor library cannot fuse but a compiler given the whole trace can.
+- **`mlx_fast_rope`.** Flux's rotary embedding is built by hand in
+  `flux.rs` — a `matmul` against a frequency table, then an interleaved pair
+  rotation. MLX ships a fused kernel for exactly this.
+- **`mlx_get_peak_memory` / `mlx_set_wired_limit` / `mlx_set_cache_limit`.**
+  Cheap, and the right instrument for every measurement above: peak RSS was
+  used here because MLX's own accounting is not bound, and `sdrs info` reports
+  free system memory rather than what a run would actually need. On a 36 GB
+  machine the wired limit is the difference between a large model running and
+  the machine swapping.
+- **`mlx_fast_metal_kernel`.** Custom Metal kernels from a source string at
+  runtime, with no build step and no `.metal` file in the repository. The
+  roadmap's old position — "our own GPU kernels, for now, no" — was priced
+  against writing and shipping ~60 kernels per backend. This is a much lower
+  price for the handful that profiling names.
+- **`mlx_async_eval`**, for overlapping the decode with the next generation in
+  a batch.
+- **`mlx_export_function`**, which serialises a traced graph. Speculative here.
+- **`distributed.h`**, multi-device. Real, and not what one laptop needs.
+
+## The library surface
+
+The pipeline API grew by accretion and now has an entry point that is hard to
+call correctly:
+
+```rust
+pipe.txt2img_with(&cfg, hint, ip_tokens, &objs, &regions,
+                  cache_threshold, cancel, &mut progress)?
 ```
 
-Ours is closer at every tail point from -8 to -3. This is a real difference in
-an activation, not a curiosity — though whether it changes an image is
-untested, and the honest expectation is that it does not, since the values
-involved are far below the noise floor of a diffusion step.
+Eight positional parameters, five of which are `None` or empty in almost every
+call, and two adjacent `Option<&Array>` that the compiler cannot tell apart.
+There is already an `Extras` struct doing this job internally; the fix is to
+make it the public surface, or to give `MlxPipeline` a builder so that the
+common call stays short and the rare one names its arguments.
 
-**The CPU path does not get this.** `fused::geglu` falls back to the
-composition off Metal, so CPU callers still get the collapsing tail. Closing
-that means replacing a vectorised candle kernel with a scalar Rust loop, which
-is not obviously a win and has not been measured.
+Three smaller things in the same spirit:
 
-### adaLN: done
+- **`Txt2ImgConfig` has no `clip_skip`, no batch count, and no scheduler
+  choice** — see the sd.cpp comparison above for why the first matters most.
+- **`ModelPaths` describes exactly one layout**, the `diffusers` directory
+  tree. The community norm is a single `.safetensors` file, and `sd_loader`
+  already knows how to translate LDM names — the mapping exists, nothing calls
+  it from the safetensors path.
+- **`load` and `load_on` are duplicated per pipeline** — four times, plus
+  `load_unclip` and `load_unclip_on`. A `Device` on the paths struct, or a
+  `with_device` builder, removes the pairing.
 
-`norm(x) * (1 + scale) + shift`, the conditioning mechanism of every diffusion
-transformer, was four ops: a norm, an add of 1, a broadcast multiply and a
-broadcast add. Seven trips over an activation that is 50 MB at Flux's
-1024x1024.
+## Deliberately not doing
 
-The kernel is one threadgroup per row, holding the row in threadgroup memory
-across both reductions and the write — **two device trips instead of seven**.
-The reduction is `simd_sum` per simdgroup and a short serial pass over the
-per-simdgroup totals, which is blocked rather than sequential, for the reason
-recorded in [Fused norms are a backend
-question](#fused-norms-are-a-backend-question).
-
-```text
-  b1 4096 tokens  composed  7.235 ms   ours 1.405 ms   5.15x
-  b1  512 tokens  composed  0.988 ms   ours 0.275 ms   3.60x
-  b1 4608 tokens  composed  7.573 ms   ours 1.329 ms   5.70x
-  b2 4096 tokens  composed 16.181 ms   ours 2.861 ms   5.66x   [strided cond]
-```
-
-**607.8 ms -> 115.7 ms per Flux-dev forward, 5.26x, saving 492 ms a step** —
-above the 472 ms the survey predicted, and twenty times what GEGLU returned.
-Agreement with the composition is 2.9e-6 absolute.
-
-There is no end-to-end figure and there will not be one on this machine: no
-Flux or SD 3 checkpoint is present, and Flux-dev at f32 would ask for about
-48 GB. What is verified is that the kernel agrees with the arithmetic it
-replaced, at every shape both models run, on both the contiguous and strided
-conditioning paths. The 492 ms is per-call measurement times counted call
-sites — the same method that predicted 38.8 ms for GEGLU where the real
-end-to-end saving was 24.4, so treat it as an upper bound.
-
-Both DiTs now call it. SD 3 normalises `x` twice per dual block where it
-previously normalised once and modulated twice, because two fused calls at two
-trips each still beat one norm plus two modulations at eleven.
-
-### group_norm: done, and the largest of the three
-
-`step_profile` — which extracts every conv2d, linear, group norm and layer norm
-from the real SD 1.5 checkpoint and times each at its own shape — put a step at
-roughly 48% convolution, 26% matmul, 24% group norm and 2% layer norm.
-
-candle's `GroupNorm` is not a kernel. It is about ten ops: two reductions and
-five full passes over the tensor, measuring **1.7 to 6.8 GB/s** where the adaLN
-kernel reaches 71.6 on the same machine.
-
-Ours is one threadgroup per (batch, group), in two device passes: one to
-reduce, one to write. A group row runs to 40,960 elements, far past the 32 KB
-of threadgroup memory adaLN relies on, so the row is read twice rather than
-cached. The accumulators are shifted by the row's first element — summing `x`
-and `x*x` and forming `E[x2] - E[x]2` cancels badly when the mean is large next
-to the spread, which is what a post-convolution activation looks like.
-
-```text
-  [2, 320,64,64] x13   candle 3.522 ms (6.0 GB/s)   ours 0.541 ms (38.7 GB/s)   6.51x
-  [2, 960,64,64] x1    candle 9.191 ms (6.8 GB/s)   ours 0.990 ms (63.6 GB/s)   9.29x
-  [2,1280, 8, 8] x12   candle 0.438 ms (3.0 GB/s)   ours 0.157 ms ( 8.4 GB/s)   2.80x
-```
-
-**126.0 ms -> 20.7 ms per forward, 6.09x.** End to end, interleaved three times
-each: **SD 1.5 at 512 over 20 steps goes 15.734 s -> 13.390 s, 17.5% faster**,
-with under 0.03 s of spread within a condition. That includes the GEGLU
-kernel's 3.2%, so group norm alone is worth about 11.7%.
-
-### The backend decides, again
-
-The same implementation was measured on CPU against the same composition, and
-**lost by 3x** — 122.9 ms against 41.6 for a forward, at every one of the
-fourteen shapes:
-
-```text
-  [2,320,64,64]   candle 1.210 ms   ours 3.544 ms   0.34x
-  [2,640,64,64]   candle 2.502 ms   ours 7.562 ms   0.33x
-```
-
-candle's CPU primitives are vectorised and threaded, so ten fast passes beat
-one scalar serial pass. The CPU path stays on candle, and
-`fused::GroupNormOp::cpu_fwd` exists only as the f64 reference the kernel is
-tested against.
-
-This is [Fused norms are a backend
-question](#fused-norms-are-a-backend-question) from the opposite direction, and
-it is the third time the answer has come out this way. The rule worth carrying:
-**a composition and a kernel trade places depending on the backend**, because a
-composition on a GPU pays per dispatch while on a CPU it is vectorised for
-free. Neither "fused is better" nor "fused is worse" survives a measurement.
-
-One number for perspective: candle's *Metal* group norm (126.0 ms a forward)
-was slower than its own *CPU* group norm (41.6 ms). Ours, at 20.7, is the only
-one of the three that beats running it on the processor.
-
-### What this means for owning more of the backend
-
-The three kernels here are Metal-only, which widens rather than narrows the gap
-between backends. That is deliberate and measured — the CPU attempt lost — but
-it is worth being plain that **only CPU and Metal are verified in this project
-at all**. CUDA is a feature flag with no measurements behind it and no CI
-runner; the box above is still unticked.
-
-It also bounds the ambition. A step is roughly three quarters convolution and
-matmul, and candle's matmul and attention kernels are **Apple's MLX code**,
-extracted with the copyright header intact — `mlx_gemm.metal` names its source
-in the first line. So the hardest quarter of candle's Metal surface is already
-the best available implementation, and rewriting it would mean competing with
-Apple on their own hardware. The quarter that is *not* gemm is where all three
-of this session's wins came from, and it is now largely taken.
-
-### Next
-
-The two kernels here share a shape: candle **cannot** fuse either of them,
-because a general tensor library has to expose `layer_norm` and `mul` and
-`add` as separate ops. Knowing that a norm is always followed by a modulation
-is model knowledge, and it is worth 5.26x. That is the seam where this project
-can beat its own backend, and it is not the seam where gemm lives.
-
-Still open, in rough order of value per line written:
-- **Fused attention plus its projections** for the DiTs, the same trick one
-  level up.
-- **GroupNorm -> SiLU**: measured at 1.1 ms and rejected. Recorded so it is
-  not measured a third time.
-- **f16 and bf16** for both kernels. Today they fall back, so half precision
-  gets none of this.
-- **The CPU path**, which gets none of it either.
-
-`SD_FUSED_KERNELS=0` returns every kernel in this file to its composition, so
-the A/B can be run in one session rather than against a number recorded
-earlier on a machine in a different state.
-
-## Upstream contributions worth making
-
-- **candle: the Metal quantised matmul ignores `start_offset`.** This is a
-  silent wrong-answer bug, not a performance note: any quantised model that
-  feeds a `narrow`ed activation to a linear layer gets the product of the
-  wrong rows, with correct shapes and no error. It cost this project three
-  sessions of a corrupted Flux. We work around it in `QLinear::forward`
-  (`without_storage_offset`), but the fix belongs in candle's Metal backend —
-  add the layout offset when binding the activation buffer, as the CPU backend
-  already does. A reproducer is four lines: quantise any weight, `narrow` an
-  activation off dim 0, and compare against `force_contiguous()` of the same
-  view. `--example metal_check` contains it.
-- **candle: the Metal convolution silently corrupts past `i32::MAX` im2col
-  elements.** A 3x3 convolution over `out_h * out_w` positions at 64 channels
-  builds an im2col matrix of `out_h * out_w * 64 * 9` elements; past
-  `i32::MAX` the kernel returns a dark, horizontally banded image with no
-  error and no failed command buffer. The boundary is measured, not inferred:
-  correct at 1928 px output (2,141,097,984 elements), corrupt at 1936
-  (2,158,903,296), and `sqrt(i32::MAX / (64*9)) = 1930`. CPU renders the same
-  input correctly, which is what identifies it. Likely a 32-bit index in the
-  im2col kernel; the reproducer is one large `conv2d` on Metal compared
-  against the same call on CPU. Worked around here by tiling
-  (`upscale_tiled`), which bounds the allocation anyway.
-- **candle: implement f16 matmul in the Accelerate CPU backend.** Today it
-  bails outright (`cpu_backend/mod.rs:1497`), which means `--features
-  accelerate` — worth 1.7-1.9x on CPU — cannot be used with any f16 model.
-  `Linear` and `Conv2d` reach the same path, so it is not a niche gap: an SDXL
-  run dies on its first convolution. The fix is to convert per gemm tile to
-  f32 and call `cblas_sgemm`; converting whole tensors instead defeats the
-  point, which is why this cannot be worked around downstream. Reproducer:
-  `matmul` two f16 CPU tensors with the feature enabled.
-- **candle: drop the `onig` C dependency.** One-line feature swap, verified to
-  build and pass every test. See [native-deps.md](native-deps.md). Better
-  still: make `tokenizers` optional in `candle-core` and feature-gate
-  `quantized::tokenizer`, which most candle users do not need.
+- **Training.** Inference only.
+- **A GUI.** A good library first; someone else can build the UI.
+- **CUDA.** MLX 0.6 exposes `cuda.h` and `mlx-c` builds against it, so the
+  seam no longer forbids it — but there is no device here to verify against,
+  and an unverified backend is worth less than no backend.
 
 ## Good first issues
 
-- **Load the CLIP tokenizer from vocab.json + merges.txt**, so a stock SD 1.5
-  download works with no manual file copying. Needs a golden test against the
-  existing tokenizer.json path — the two must agree id for id on
-  `xtask/golden`'s prompt set.
-- Additional samplers (DDIM, Heun, LMS) against reference trajectories
-- GGUF header parsing (metadata only, before dequantization)
-- ~~A repeatable benchmark harness for `backend_bench`~~ — **done**: five
-  repeats, reported as a median plus spread, with `SD_BENCH_REPEATS` to
-  override. A minimum would flatter a machine that was briefly idle; the
-  median plus the spread answers "what does this cost, and do I believe it".
+- **Karras sigmas**, verified against `k_diffusion.sampling.get_sigmas_karras`.
+  The highest value-per-line item in this file.
+- **`--clip-skip`**, plumbed through `Txt2ImgConfig` to `clip::penultimate`.
+- **`sdrs flux` and `sdrs sd3`**, wrapping pipelines that already exist.
+- **A1111-compatible PNG metadata** on every write.
+- **`mlx_get_peak_memory`** bound and reported by `sdrs info`.
+- Additional samplers (DDIM, Heun, DPM++ 2S a) against reference trajectories.
+- GGUF header parsing (metadata only, before dequantisation).
+- ~~Load the CLIP tokenizer from vocab.json + merges.txt~~ — **done, and then
+  made unnecessary.** Neither `stable-diffusion-v1-5` nor
+  `stabilityai/stable-diffusion-xl-base-1.0` publishes `tokenizer.json`, so
+  this was not a papercut affecting some downloads but the path every download
+  takes. `ClipTokenizer::open` reads either form and falls back to a
+  vocabulary vendored in `sd-models`, so **a tokenizer can no longer be
+  missing**: a directory holding nothing but `unet/`, `vae/` and
+  `text_encoder/` renders, byte-identically to the full checkpoint.
+
+  One vocabulary suffices because it is a constant of the architecture rather
+  than a property of the weights, which was checked rather than assumed: SDXL's
+  `tokenizer_2` — the OpenCLIP bigG tower, trained by a different organisation
+  — ships `vocab.json` and `merges.txt` byte for byte identical to
+  `openai/clip-vit-large-patch14`. What differs between towers is the padding
+  token. Verified id-for-id over ten prompts covering case, whitespace,
+  contractions, digits, punctuation, NFC accents, emoji, empty, and
+  truncation.

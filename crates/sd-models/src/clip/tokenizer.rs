@@ -48,38 +48,102 @@ impl ClipTokenizer {
         Err(TokenizeError::NotFound(fast))
     }
 
-    /// Load a tokenizer from a path that may name either form.
+    /// Load a tokenizer for a model directory. **This cannot fail for want of
+    /// a file.**
     ///
-    /// `path` may be a `tokenizer.json`, or the directory holding one.
-    /// **A path naming a `tokenizer.json` that is not there still succeeds**
-    /// when `vocab.json` + `merges.txt` sit beside it — which is not a
-    /// tolerant-parsing flourish but the common case: neither
+    /// `path` may name a `tokenizer.json` or the directory holding one, and
+    /// three sources are tried in order:
+    ///
+    /// 1. `tokenizer.json` — the fast form, if the checkpoint ships it.
+    /// 2. `vocab.json` + `merges.txt` beside it — the slow form, which is what
+    ///    a checkpoint usually ships.
+    /// 3. [The vendored copy](Self::embedded), when it ships neither.
+    ///
+    /// The fallback is not a convenience over a rare edge case. Neither
     /// `stable-diffusion-v1-5` nor `stabilityai/stable-diffusion-xl-base-1.0`
-    /// publishes the fast form at all. Insisting on it meant telling every
-    /// user to go and copy a file out of a third repository.
+    /// publishes the fast form at all, and plenty of community checkpoints are
+    /// a single `.safetensors` with no tokenizer of any kind. The vocabulary is
+    /// a constant of the architecture rather than a property of the weights —
+    /// see [`embedded`](Self::embedded) — so there is nothing to be gained by
+    /// refusing to run without a copy of it.
     ///
-    /// This is the loader pipelines should call. [`from_file`](Self::from_file)
-    /// stays for the case where one exact file is meant and its absence is an
-    /// error worth reporting.
+    /// The checkpoint's own files still win when present, so a model that
+    /// genuinely carries a different vocabulary is unaffected.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, TokenizeError> {
         let path = path.as_ref();
-        if path.is_dir() {
-            return Self::from_dir(path);
-        }
-        if path.is_file() {
+        let dir = if path.is_dir() {
+            Some(path)
+        } else if path.is_file() {
             return Self::from_file(path);
+        } else {
+            path.parent().filter(|d| d.is_dir())
+        };
+
+        if let Some(dir) = dir {
+            let fast = dir.join("tokenizer.json");
+            if fast.is_file() {
+                return Self::from_file(fast);
+            }
+            let (vocab, merges) = (dir.join("vocab.json"), dir.join("merges.txt"));
+            if vocab.is_file() && merges.is_file() {
+                return Self::from_vocab_and_merges(vocab, merges);
+            }
         }
-        match path.parent() {
-            Some(dir) if dir.is_dir() => Self::from_dir(dir),
-            _ => Err(TokenizeError::NotFound(path.to_path_buf())),
-        }
+        Self::embedded()
     }
 
-    /// Whether [`open`](Self::open) would find a tokenizer at `path`.
+    /// CLIP's tokenizer, from the vocabulary vendored in this crate.
     ///
-    /// For the existence checks a pipeline runs before loading anything, so
-    /// that a stock download is not rejected for lacking a file it was never
-    /// going to have.
+    /// **One vocabulary serves every model here**, which is checked rather than
+    /// assumed: SDXL's `tokenizer_2` — the OpenCLIP bigG tower, a different
+    /// encoder trained by a different organisation — ships `vocab.json` and
+    /// `merges.txt` byte for byte identical to `openai/clip-vit-large-patch14`,
+    /// all 49,408 entries and all 524,619 bytes of merges. SD 1.x, SD 2.x,
+    /// SDXL's two towers, SD 3.x and Flux's CLIP tower share it.
+    ///
+    /// What differs between those towers is the *padding token*, not the
+    /// vocabulary, and that is [`with_pad_token`](Self::with_pad_token).
+    ///
+    /// See `assets/clip/README.md` for provenance and licence.
+    pub fn embedded() -> Result<Self, TokenizeError> {
+        use tokenizers::models::bpe::BPE;
+
+        const VOCAB: &str = include_str!("../../assets/clip/vocab.json");
+        const MERGES: &str = include_str!("../../assets/clip/merges.txt");
+
+        let vocab: tokenizers::models::bpe::Vocab = serde_json::from_str(VOCAB)
+            .map_err(|e| TokenizeError::Load(format!("embedded vocab.json: {e}")))?;
+
+        // The first line is a `#version:` header, not a merge. Skipping by
+        // index would also drop a real merge from a file that has no header,
+        // so the comment is what is filtered.
+        let merges: tokenizers::models::bpe::Merges = MERGES
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with("#version"))
+            .map(|l| match l.split_once(' ') {
+                Some((a, b)) => Ok((a.to_string(), b.to_string())),
+                None => Err(TokenizeError::Load(format!(
+                    "embedded merges.txt: {l:?} is not a pair"
+                ))),
+            })
+            .collect::<Result<_, _>>()?;
+
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .unk_token(EOS_TOKEN.to_string())
+            .end_of_word_suffix("</w>".to_string())
+            .build()
+            .map_err(|e| TokenizeError::Load(e.to_string()))?;
+        Self::clip_around(bpe)
+    }
+
+    /// Whether a checkpoint at `path` carries its own tokenizer.
+    ///
+    /// **Not whether [`open`](Self::open) will succeed** — it always will.
+    /// This answers the narrower question of whether the model directory
+    /// supplies one, which is what a diagnostic like `sdrs info` wants to
+    /// report and what a caller insisting on the checkpoint's own vocabulary
+    /// would check.
     pub fn present<P: AsRef<Path>>(path: P) -> bool {
         let path = path.as_ref();
         let dir = if path.is_dir() {
@@ -92,8 +156,8 @@ impl ClipTokenizer {
                 None => return false,
             }
         };
-        dir.join("tokenizer.json").exists()
-            || (dir.join("vocab.json").exists() && dir.join("merges.txt").exists())
+        dir.join("tokenizer.json").is_file()
+            || (dir.join("vocab.json").is_file() && dir.join("merges.txt").is_file())
     }
 
     /// Build CLIP's tokenizer from the slow form, `vocab.json` + `merges.txt`.
@@ -107,16 +171,7 @@ impl ClipTokenizer {
         vocab: P,
         merges: Q,
     ) -> Result<Self, TokenizeError> {
-        use tokenizers::{
-            decoders::byte_level::ByteLevel as ByteLevelDecoder,
-            models::bpe::BPE,
-            normalizers::{Lowercase, Replace, Sequence as NormSequence, NFC},
-            pre_tokenizers::{
-                byte_level::ByteLevel, sequence::Sequence as PreSequence, split::Split,
-            },
-            processors::roberta::RobertaProcessing,
-            NormalizerWrapper, PreTokenizerWrapper, SplitDelimiterBehavior,
-        };
+        use tokenizers::models::bpe::BPE;
 
         let (vocab, merges) = (vocab.as_ref(), merges.as_ref());
         for p in [vocab, merges] {
@@ -132,6 +187,26 @@ impl ClipTokenizer {
             .end_of_word_suffix("</w>".to_string())
             .build()
             .map_err(|e| TokenizeError::Load(e.to_string()))?;
+        Self::clip_around(bpe)
+    }
+
+    /// Wrap a CLIP BPE in the normalizer, pre-tokenizer and post-processor a
+    /// real CLIP `tokenizer.json` declares.
+    ///
+    /// Shared by every path that builds from a raw vocabulary, because two
+    /// copies of this is precisely how the embedded tokenizer and the
+    /// reconstructed one would come to disagree — and disagreeing produces
+    /// nearly-right ids, a different picture, and no error anywhere.
+    fn clip_around(bpe: tokenizers::models::bpe::BPE) -> Result<Self, TokenizeError> {
+        use tokenizers::{
+            decoders::byte_level::ByteLevel as ByteLevelDecoder,
+            normalizers::{Lowercase, Replace, Sequence as NormSequence, NFC},
+            pre_tokenizers::{
+                byte_level::ByteLevel, sequence::Sequence as PreSequence, split::Split,
+            },
+            processors::roberta::RobertaProcessing,
+            NormalizerWrapper, PreTokenizerWrapper, SplitDelimiterBehavior,
+        };
 
         let mut inner = tokenizers::Tokenizer::new(bpe);
 

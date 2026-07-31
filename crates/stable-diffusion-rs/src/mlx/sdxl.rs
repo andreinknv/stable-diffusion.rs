@@ -63,19 +63,6 @@ fn require(path: PathBuf) -> Result<PathBuf, PipelineError> {
     }
 }
 
-/// A tokenizer directory, in **either** form.
-///
-/// Not `require`, because the thing that has to be there is a tokenizer and
-/// not one particular spelling of one — and the spelling a stock SDXL
-/// download ships is the one `require` would have rejected.
-fn require_tokenizer(dir: PathBuf) -> Result<PathBuf, PipelineError> {
-    if ClipTokenizer::present(&dir) {
-        Ok(dir)
-    } else {
-        Err(PipelineError::MissingFile(dir.join("tokenizer.json")))
-    }
-}
-
 impl SdxlPipeline {
     /// Load SDXL from a `diffusers` model directory, on the GPU.
     pub fn load(root: &Path) -> Result<Self, PipelineError> {
@@ -84,8 +71,12 @@ impl SdxlPipeline {
 
     /// [`Self::load`] on a named device.
     pub fn load_on(root: &Path, device: Device) -> Result<Self, PipelineError> {
-        let tok = require_tokenizer(root.join("tokenizer"))?;
-        let tok2 = require_tokenizer(root.join("tokenizer_2"))?;
+        // Not `require`: a tokenizer directory that is empty, or absent, is
+        // handled by `ClipTokenizer::open` falling back to the vendored
+        // vocabulary. Both towers use the same one — SDXL's `tokenizer_2`
+        // ships it byte for byte identical — and differ only in padding.
+        let tok = root.join("tokenizer");
+        let tok2 = root.join("tokenizer_2");
         let te = require(root.join("text_encoder/model.safetensors"))?;
         let te2 = require(root.join("text_encoder_2/model.safetensors"))?;
         let unet_p = require(root.join("unet/diffusion_pytorch_model.safetensors"))?;

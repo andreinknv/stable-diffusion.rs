@@ -112,7 +112,11 @@ files that use tensors.
 
 ## Use
 
-Point `--model` at a directory in the standard `diffusers` layout.
+Point `--model` at a directory in the standard `diffusers` layout. An
+unmodified HuggingFace snapshot works as it downloads — **including its
+tokenizer, whichever form it ships or if it ships none.** CLIP's vocabulary is
+vendored in the library, and it is the same 49,408 entries for every model
+here; a checkpoint's own copy is preferred when present.
 
 ```bash
 # The basics

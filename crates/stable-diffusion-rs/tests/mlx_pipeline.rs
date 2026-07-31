@@ -749,9 +749,12 @@ fn flux_paths_read_the_directory_rather_than_guessing_a_shard_count() {
         .vae
         .ends_with("vae/diffusion_pytorch_model.safetensors"));
     assert!(paths.clip.ends_with("text_encoder/model.safetensors"));
-    // T5's tokenizer is sentencepiece, CLIP's is a tokenizer.json.
+    // T5's tokenizer is one named sentencepiece file, so it is named. CLIP's
+    // is a *directory*, because a checkpoint may ship the fast form, the slow
+    // form, or neither — `ClipTokenizer::open` decides, and falls back to the
+    // vocabulary vendored in `sd-models` when it ships none.
     assert!(paths.t5_tokenizer.ends_with("tokenizer_2/spiece.model"));
-    assert!(paths.clip_tokenizer.ends_with("tokenizer/tokenizer.json"));
+    assert!(paths.clip_tokenizer.ends_with("tokenizer"));
 }
 
 /// A missing checkpoint is refused rather than half-loaded.

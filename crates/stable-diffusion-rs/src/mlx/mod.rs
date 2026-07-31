@@ -115,9 +115,11 @@ impl ModelPaths {
     /// Every path, for an existence check that names what is missing rather
     /// than failing at whichever one is loaded first.
     pub fn missing(&self) -> Vec<&Path> {
-        // The tokenizer is asked about differently: it is a directory that has
-        // to hold *a* tokenizer, in either the fast form or the slow one, and
-        // a stock download ships only the slow one.
+        // **The tokenizer is not on this list.** It cannot be missing:
+        // `ClipTokenizer::open` reads whichever form the checkpoint ships and
+        // falls back to the vocabulary vendored in `sd-models` when it ships
+        // none. Listing it here would refuse to load a model over a file that
+        // is not needed.
         [
             self.unet.as_path(),
             self.vae.as_path(),
@@ -125,7 +127,6 @@ impl ModelPaths {
         ]
         .into_iter()
         .filter(|p| !p.exists())
-        .chain((!ClipTokenizer::present(&self.tokenizer)).then_some(self.tokenizer.as_path()))
         .collect()
     }
 }

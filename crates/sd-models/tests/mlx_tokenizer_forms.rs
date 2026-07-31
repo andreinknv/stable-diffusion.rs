@@ -131,7 +131,8 @@ fn from_dir_reads_whichever_form_is_present() {
         "from_dir must give the same tokenizer whichever form it found"
     );
 
-    // A directory with neither names what it wanted.
+    // `from_dir` is the strict spelling and still refuses, naming what it
+    // looked for. Only `open` falls back to the vendored copy.
     let empty = std::env::temp_dir().join("sdrs-no-tokenizer");
     std::fs::create_dir_all(&empty).expect("mkdir");
     let err = ClipTokenizer::from_dir(&empty).expect_err("neither form present");
@@ -139,6 +140,70 @@ fn from_dir_reads_whichever_form_is_present() {
         format!("{err}").contains("tokenizer.json"),
         "the error should name what it looked for, got {err}"
     );
+}
+
+/// **The vendored vocabulary must be the same tokenizer.**
+///
+/// This is the one that makes `open`'s last resort safe. The embedded copy is
+/// built through a different code path from the on-disk one — a parsed JSON
+/// object and a split merges file, rather than `BPE::from_file` — so "it is the
+/// same bytes" is an argument, not a check. Compared id-for-id against a real
+/// `tokenizer.json` over the same prompt set.
+#[test]
+fn the_embedded_vocabulary_is_the_same_tokenizer() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let fast_path = dir.join("tokenizer/tokenizer.json");
+    if !fast_path.exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no tokenizer.json to compare against.");
+        return;
+    }
+
+    let fast = ClipTokenizer::from_file(&fast_path).expect("fast");
+    let embedded = ClipTokenizer::embedded().expect("the vendored vocabulary must load");
+
+    for prompt in PROMPTS {
+        assert_eq!(
+            fast.encode(prompt).expect("fast"),
+            embedded.encode(prompt).expect("embedded"),
+            "the embedded vocabulary disagrees on {prompt:?}"
+        );
+    }
+
+    // The padding token is the one thing that differs between towers, and it
+    // is applied on top rather than baked in.
+    let bang = embedded
+        .with_pad_token("!")
+        .expect("SDXL's second tokenizer");
+    assert_eq!(bang.pad_token_id(), 0);
+    eprintln!(
+        "{} prompts agree with the vendored vocabulary",
+        PROMPTS.len()
+    );
+}
+
+/// **`open` never fails for want of a file.**
+///
+/// A directory with no tokenizer at all — a single-file checkpoint, which is
+/// the community norm — still yields a working tokenizer.
+#[test]
+fn open_falls_back_to_the_vendored_vocabulary() {
+    let empty = std::env::temp_dir().join("sdrs-no-tokenizer-at-all");
+    let _ = std::fs::remove_dir_all(&empty);
+    std::fs::create_dir_all(&empty).expect("mkdir");
+
+    assert!(
+        !ClipTokenizer::present(empty.join("tokenizer.json")),
+        "present() reports what the checkpoint carries, which is nothing"
+    );
+    let tok = ClipTokenizer::open(empty.join("tokenizer.json"))
+        .expect("open must not fail for want of a file");
+    let ids = tok.encode("a rusty crab on a beach").expect("encode");
+    assert_eq!(ids.len(), 77);
+    assert_eq!(ids[0], tok.bos_token_id());
+    assert_eq!(*ids.last().expect("77 ids"), tok.eos_token_id());
 }
 
 /// **Neither stock repository ships `tokenizer.json`.**
@@ -183,9 +248,9 @@ fn open_succeeds_on_a_named_fast_form_that_does_not_exist() {
             .unwrap()
     );
 
-    // And a directory with neither form is still an error that names itself.
-    let empty = std::env::temp_dir().join("sdrs-empty-tokenizer");
-    std::fs::create_dir_all(&empty).expect("mkdir");
-    assert!(!ClipTokenizer::present(empty.join("tokenizer.json")));
-    assert!(ClipTokenizer::open(empty.join("tokenizer.json")).is_err());
+    // The slow form beside it is what was used, not the vendored copy — which
+    // is the point of preferring the checkpoint's own files. Checked by
+    // removing them and seeing `present` change its answer.
+    std::fs::remove_file(stock.join("vocab.json")).expect("rm");
+    assert!(!ClipTokenizer::present(&named));
 }

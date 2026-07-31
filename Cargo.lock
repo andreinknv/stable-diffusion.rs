@@ -755,6 +755,7 @@ version = "0.0.1"
 dependencies = [
  "sd-loader",
  "sd-tensor",
+ "serde_json",
  "thiserror",
  "tokenizers",
  "tracing",
