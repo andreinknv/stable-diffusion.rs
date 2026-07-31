@@ -1,0 +1,17 @@
+# The Python here is the *test oracle*, not the product.
+#
+# `xtask/golden/` runs diffusers/transformers to dump reference tensors, and
+# measures the reference's own f32 noise floor so a tolerance can be derived
+# rather than guessed. Nothing ships with it and `cargo build` never invokes
+# it — but it is the reason this project can say "verified against diffusers"
+# instead of "looks right".
+#
+# Excluded from the language statistics because it is tooling. Deleting 38k
+# lines of Rust when candle went tripled Python's apparent share of a
+# repository whose Python did not change at all, which is exactly the kind of
+# number that misleads at a glance.
+xtask/golden/*.py linguist-detectable=false
+
+# Generated fixtures and reference images are data, not source.
+tests/golden/** linguist-generated=true
+assets/*.png binary
