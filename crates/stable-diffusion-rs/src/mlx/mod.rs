@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use sd_models::clip::ClipTokenizer;
 use sd_models::mlx::{
-    clip, clip_vision, controlnet, gligen, ip, lora::Lora, normalise_legacy_attention, sample,
-    unet_forward_adapters, vae, Adapters, UNetConfig, Weights,
+    clip, clip_vision, controlnet, gligen, ip, lora::Lora, motion, normalise_legacy_attention,
+    sample, unclip, unet_forward_adapters, vae, Adapters, Motion, UNetConfig, Weights,
 };
 use sd_sample::{sigmas_for_steps, Schedule};
 use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
@@ -197,6 +197,11 @@ pub struct MlxPipeline {
     /// Spatial conditioning, in attachment order. Empty is the common case.
     controlnets: Vec<Control>,
     ip: Option<IpAdapter>,
+    /// An AnimateDiff motion adapter, and the clip length it will run at.
+    ///
+    /// The adapter is a separate checkpoint from the UNet, so it is held apart
+    /// rather than merged in — and a run with no adapter pays nothing.
+    motion: Option<(Weights, usize)>,
 }
 
 impl MlxPipeline {
@@ -237,7 +242,39 @@ impl MlxPipeline {
             stream,
             controlnets: Vec::new(),
             ip: None,
+            motion: None,
         })
+    }
+
+    /// Attach an AnimateDiff motion adapter and fix the clip length.
+    ///
+    /// **Frames ride on the batch axis**, so a clip of `f` frames makes every
+    /// activation `[f, h, w, c]` and every step `f` times the work. The count
+    /// is fixed at attach time rather than per call because the modules are
+    /// installed into the UNet's blocks and every one of them has to agree
+    /// about it.
+    ///
+    /// The adapter is refused if it carries no motion modules, rather than
+    /// installing nothing and rendering `f` unrelated images.
+    pub fn attach_motion(&mut self, path: &Path, frames: usize) -> Result<(), PipelineError> {
+        if frames == 0 {
+            return Err(msg("mlx: a clip of zero frames".into()));
+        }
+        let weights = load_safetensors(path)?;
+        if !motion::present(&weights, "down_blocks.0.motion_modules.0") {
+            return Err(msg(format!(
+                "mlx: {} carries no motion modules; an AnimateDiff adapter names them \
+                 `down_blocks.0.motion_modules.0` and so on",
+                path.display()
+            )));
+        }
+        self.motion = Some((weights, frames));
+        Ok(())
+    }
+
+    /// How many frames a run will produce. 1 with no adapter attached.
+    pub fn frames(&self) -> usize {
+        self.motion.as_ref().map_or(1, |(_, f)| *f)
     }
 
     /// Attach an IP-Adapter.
@@ -467,26 +504,59 @@ impl MlxPipeline {
         rng: &mut SeededRng,
     ) -> Result<Array, PipelineError> {
         let s = &self.stream;
-        let [_, lh, lw, lc] = latent.shape()[..] else {
+        let [nframes, lh, lw, lc] = latent.shape()[..] else {
             return Err(msg(format!(
                 "mlx: a latent should be [n, h, w, c], got {:?}",
                 latent.shape()
             )));
         };
+        // **One draw per frame.** A `[1, h, w, c]` noise tensor broadcasts
+        // against a clip and gives every frame the *same* ancestral noise,
+        // which the motion modules then cannot move apart.
+        let mut draw_all = |rng: &mut SeededRng| -> Result<Array, PipelineError> {
+            let mut rows = Vec::with_capacity(nframes);
+            for _ in 0..nframes {
+                rows.push(draw_noise(rng, lc, lh, lw)?);
+            }
+            let refs: Vec<&Array> = rows.iter().collect();
+            Ok(concat(&refs, 0, s)?)
+        };
         let mut dpm = sample::DpmSolverPlusPlus2M::new();
+
+        // **The context is repeated per frame, in the batch's own order.**
+        // `scale_model_input` doubles a `[f, ...]` latent to `[2f, ...]` with
+        // the unconditional clip first, so the context has to be the
+        // unconditional row f times then the conditional row f times. Repeating
+        // the *pair* f times instead has the right shape and pairs every other
+        // frame with the wrong prompt.
+        let context = if nframes == 1 {
+            context.contiguous(s)?
+        } else {
+            let mut rows: Vec<Array> = Vec::with_capacity(2 * nframes);
+            for half in 0..2 {
+                let row = context.narrow(0, half, 1, s)?;
+                for _ in 0..nframes {
+                    rows.push(row.contiguous(s)?);
+                }
+            }
+            let refs: Vec<&Array> = rows.iter().collect();
+            concat(&refs, 0, s)?
+        };
 
         for i in 0..sigmas.len().saturating_sub(1) {
             let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
 
             let latent_in = sample::scale_model_input(&latent, sigma, s)?;
             let t = self.timestep_for(sigma);
-            let timestep = Array::from_slice_f32(&[t, t], &[2])?;
+            // One entry per row of the doubled batch, not one per guidance
+            // half.
+            let timestep = Array::from_slice_f32(&vec![t; 2 * nframes], &[2 * nframes])?;
 
             // Several ControlNets sum. Running them here rather than once
             // outside the loop is not an optimisation missed: each is
             // conditioned on the current latent and timestep, so its
             // corrections differ every step.
-            let control = self.control_for(&latent_in, &timestep, context, extras.hint)?;
+            let control = self.control_for(&latent_in, &timestep, &context, extras.hint)?;
             // The adapter walks its layers in visit order, so its counter has
             // to start from zero on every step rather than continue across a
             // run. `unet_forward_adapters` rewinds it.
@@ -497,14 +567,21 @@ impl MlxPipeline {
                     self.ip.as_ref().expect("adapter").scale,
                 )
             });
+            let m = self.motion.as_ref().map(|(w, frames)| Motion {
+                weights: w,
+                // The guidance batch doubles the rows, so the UNet sees
+                // `2 * f` and each half is one clip. Passing `f` here is what
+                // makes the regrouping split them correctly.
+                frames: *frames,
+            });
             let ad = Adapters {
                 control: control.as_ref(),
                 ip: ip.as_ref(),
                 objs: extras.objs,
-                ..Default::default()
+                motion: m.as_ref(),
             };
             let out = unet_forward_adapters(
-                &latent_in, &timestep, context, None, None, &ad, &self.cfg, &self.unet, s,
+                &latent_in, &timestep, &context, None, None, &ad, &self.cfg, &self.unet, s,
             )?;
             let noise_pred = sample::guidance(&out, cfg_scale, s)?;
             let denoised = sample::denoise_epsilon(&latent, &noise_pred, sigma, s)?;
@@ -513,7 +590,7 @@ impl MlxPipeline {
                 // Ancestral: a fresh draw every step, which is why step
                 // caching is refused with it on the candle side too.
                 SamplerKind::EulerAncestral | SamplerKind::Lcm => {
-                    let noise = self.draw(rng, lc, lh, lw)?;
+                    let noise = draw_all(rng)?;
                     sample::euler_ancestral_step(&latent, &denoised, sigma, sigma_next, &noise, s)?
                 }
                 SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next, s)?,
@@ -522,7 +599,7 @@ impl MlxPipeline {
             // Inpainting: restore outside the mask at every step, so the model
             // sees the true surroundings and what it paints joins up with them.
             if let Some((mask, init)) = keep {
-                let noise = self.draw(rng, lc, lh, lw)?;
+                let noise = draw_all(rng)?;
                 latent = sample::restore_outside_mask(&latent, init, mask, &noise, sigma_next, s)?;
             }
         }
@@ -594,26 +671,45 @@ impl MlxPipeline {
     }
 
     /// A latent to `[h, w, 3]` bytes.
+    /// A latent to RGB bytes, `frames * h * w * 3` of them.
+    ///
+    /// **One frame at a time.** A clip is a batch and the VAE has no
+    /// cross-frame interaction, so decoding `n` together simply multiplies the
+    /// largest single allocation by `n` — which is how a three-frame 512
+    /// decode reaches 6.8 GiB on the candle side. Looping gives identical
+    /// output at one frame's peak.
     fn decode(&self, latent: &Array) -> Result<(usize, usize, Vec<u8>), PipelineError> {
         let s = &self.stream;
-        let unscaled = self.vae_cfg.unscale(latent, s)?;
-        let image = vae::decode_with(&unscaled, &self.vae_cfg, &self.vae, s)?;
-        let [_, h, w, _] = image.shape()[..] else {
-            return Err(msg(format!(
-                "mlx: the decoder returned {:?}",
-                image.shape()
-            )));
-        };
-        // The VAE emits roughly [-1, 1]; the caller wants bytes.
-        let bytes = image
-            .to_vec_f32(s)?
-            .iter()
-            .map(|&v| (((v + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8)
-            .collect();
-        Ok((w, h, bytes))
+        let n = latent.shape()[0];
+        let mut out: Vec<u8> = Vec::new();
+        let (mut width, mut height) = (0usize, 0usize);
+
+        for i in 0..n {
+            let frame = latent.narrow(0, i, 1, s)?.contiguous(s)?;
+            let unscaled = self.vae_cfg.unscale(&frame, s)?;
+            let image = vae::decode_with(&unscaled, &self.vae_cfg, &self.vae, s)?;
+            let [_, h, w, _] = image.shape()[..] else {
+                return Err(msg(format!(
+                    "mlx: the decoder returned {:?}",
+                    image.shape()
+                )));
+            };
+            (width, height) = (w, h);
+            // The VAE emits roughly [-1, 1]; the caller wants bytes.
+            out.extend(
+                image
+                    .to_vec_f32(s)?
+                    .iter()
+                    .map(|&v| (((v + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8),
+            );
+        }
+        Ok((width, height, out))
     }
 
     /// Prompt to pixels. Returns `(width, height, RGB bytes)`.
+    ///
+    /// With a motion adapter attached the bytes are **`frames()` images back to
+    /// back**, each `width * height * 3`.
     pub fn txt2img(&self, cfg: &Txt2ImgConfig) -> Result<(usize, usize, Vec<u8>), PipelineError> {
         self.txt2img_controlled(cfg, None)
     }
@@ -664,10 +760,16 @@ impl MlxPipeline {
         };
 
         let mut rng = SeededRng::new(cfg.seed);
-        // Sampling starts at maximum noise, so the latent is scaled by the
-        // first sigma rather than used raw.
-        let latent = self
-            .draw(&mut rng, 4, lh, lw)?
+        // **One draw per frame, in order.** A clip is a batch, so the latent is
+        // `[f, h, w, 4]`; drawing one and repeating it would give f identical
+        // frames that the motion modules then fail to move apart.
+        let frames = self.frames();
+        let mut rows = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            rows.push(self.draw(&mut rng, 4, lh, lw)?);
+        }
+        let refs: Vec<&Array> = rows.iter().collect();
+        let latent = concat(&refs, 0, &self.stream)?
             .mul(&Array::scalar_f32(sigmas[0] as f32)?, &self.stream)?;
 
         let latent = self.denoise(

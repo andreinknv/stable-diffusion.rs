@@ -59,10 +59,23 @@ pub fn euler_ancestral_step(
     }
 }
 
-/// Classifier-free guidance over a `[2, ...]` batch, unconditional row first.
+/// Classifier-free guidance over a doubled batch, unconditional half first.
+///
+/// **Splits in half rather than taking rows 0 and 1.** For a single image the
+/// two are the same thing; for an AnimateDiff clip the batch is `2 * frames`
+/// and taking two rows would guide the first frame and discard the rest —
+/// which returns a tensor of the wrong shape only if the caller checks, and
+/// silently drops the clip if it does not.
 pub fn guidance(batched: &Array, cfg_scale: f64, s: &Stream) -> Result<Array> {
-    let uncond = batched.narrow(0, 0, 1, s)?;
-    let cond = batched.narrow(0, 1, 1, s)?;
+    let n = batched.shape()[0];
+    if n % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "mlx: a guidance batch should be even, got {n}"
+        )));
+    }
+    let half = n / 2;
+    let uncond = batched.narrow(0, 0, half, s)?;
+    let cond = batched.narrow(0, half, half, s)?;
     cond.sub(&uncond, s)?
         .mul(&Array::scalar_f32(cfg_scale as f32)?, s)?
         .add(&uncond, s)

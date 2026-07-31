@@ -765,3 +765,106 @@ fn the_flux_and_sd3_flow_configs_are_not_the_same() {
         "the two flow configurations gave the same ladder; one is being ignored"
     );
 }
+
+// -- AnimateDiff ------------------------------------------------------------
+
+fn motion_adapter() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/motion/motion_adapter.safetensors")
+}
+
+/// **A clip is frames, not one image repeated.**
+///
+/// The motion modules attend across the frame axis, so a run with an adapter
+/// must produce `frames()` distinct images — and a run without one must
+/// produce exactly the same single image it did before, because attaching
+/// nothing must cost nothing.
+#[test]
+fn a_motion_adapter_produces_a_clip_of_distinct_frames() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    if !motion_adapter().exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no motion adapter fixture.");
+        return;
+    }
+    let cfg = config();
+    let mut pipe = MlxPipeline::load(&dir).expect("pipeline");
+    assert_eq!(pipe.frames(), 1, "no adapter means one frame");
+
+    const FRAMES: usize = 3;
+    pipe.attach_motion(&motion_adapter(), FRAMES)
+        .expect("attach");
+    assert_eq!(pipe.frames(), FRAMES);
+
+    let (w, h, bytes) = pipe.txt2img(&cfg).expect("animated txt2img");
+    let per = w * h * 3;
+    assert_eq!(
+        bytes.len(),
+        per * FRAMES,
+        "a clip is {FRAMES} images back to back"
+    );
+
+    // Every frame must be an image, and no two may be identical.
+    for f in 0..FRAMES {
+        let frame = &bytes[f * per..(f + 1) * per];
+        let (mean, sd, step) = looks_like_an_image(w, h, frame);
+        eprintln!("frame {f}: mean {mean:.1}  sd {sd:.1}  neighbour step {step:.1}");
+        assert!((5.0..250.0).contains(&mean), "frame {f}: mean {mean:.1}");
+        assert!(step < 40.0, "frame {f}: neighbour step {step:.1} is noise");
+    }
+    for f in 1..FRAMES {
+        assert_ne!(
+            &bytes[..per],
+            &bytes[f * per..(f + 1) * per],
+            "frame {f} is identical to frame 0; the clip is one image repeated"
+        );
+    }
+
+    // And consecutive frames must be *more* alike than a frame is to an
+    // unrelated image — that is what the motion modules are for.
+    let mean_abs = |a: &[u8], b: &[u8]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (*x as f64 - *y as f64).abs())
+            .sum::<f64>()
+            / a.len() as f64
+    };
+    let neighbouring = mean_abs(&bytes[..per], &bytes[per..2 * per]);
+    let unrelated = {
+        let plain = MlxPipeline::load(&dir).expect("plain");
+        let (_, _, other) = plain
+            .txt2img(&Txt2ImgConfig {
+                seed: 99,
+                ..cfg.clone()
+            })
+            .expect("unrelated");
+        mean_abs(&bytes[..per], &other)
+    };
+    eprintln!("consecutive frames {neighbouring:.2}/255, unrelated image {unrelated:.2}/255");
+    assert!(
+        neighbouring < unrelated,
+        "consecutive frames differ by {neighbouring:.2} and an unrelated image by \
+         {unrelated:.2}; the frames are not a clip"
+    );
+}
+
+/// A checkpoint with no motion modules is refused, rather than installing
+/// nothing and rendering unrelated images.
+#[test]
+fn an_adapter_without_motion_modules_is_refused() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let mut pipe = MlxPipeline::load(&dir).expect("pipeline");
+    // The VAE is a real checkpoint and carries no motion modules.
+    let not_an_adapter = dir.join("vae/diffusion_pytorch_model.safetensors");
+    assert!(
+        pipe.attach_motion(&not_an_adapter, 4).is_err(),
+        "a checkpoint with no motion modules must be refused"
+    );
+    // And a clip of zero frames is a caller error, not a mode.
+    assert!(pipe.attach_motion(&motion_adapter(), 0).is_err());
+}
