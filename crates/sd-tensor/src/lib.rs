@@ -21,8 +21,8 @@
 //! candle does not provide — not an abstraction layer with its own opinions.
 
 pub use candle_core::{
-    safetensors, CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Device, Error, IndexOp, Layout, Module,
-    Result, Shape, Tensor, D,
+    safetensors, CpuStorage, CustomOp1, CustomOp2, CustomOp3, DType, Device, Error, IndexOp,
+    Layout, Module, Result, Shape, Tensor, D,
 };
 pub use candle_nn::VarBuilder;
 

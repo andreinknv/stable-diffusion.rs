@@ -23,7 +23,9 @@ fn main() -> Result<()> {
     let (mut ours_t, mut theirs_t) = (0.0, 0.0);
     for line in include_str!("sd15_inventory.txt").lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
-        if f.first() != Some(&"gnorm") { continue; }
+        if f.first() != Some(&"gnorm") {
+            continue;
+        }
         let (ch, s, c): (usize, usize, f64) =
             (f[1].parse()?, f[2].parse()?, f[3].parse::<usize>()? as f64);
         let groups = 32.min(ch);
@@ -37,12 +39,22 @@ fn main() -> Result<()> {
         let got = xs.apply_op3_no_bwd(&w, &b, &op)?;
         let excess = sd_tensor::testing::allclose_excess(&got, &want, 1e-4)?;
 
-        let a = bench(|| { theirs.forward(&xs)?; Ok(()) })?;
-        let bb = bench(|| { xs.apply_op3_no_bwd(&w, &b, &op)?; Ok(()) })?;
+        let a = bench(|| {
+            theirs.forward(&xs)?;
+            Ok(())
+        })?;
+        let bb = bench(|| {
+            xs.apply_op3_no_bwd(&w, &b, &op)?;
+            Ok(())
+        })?;
         println!("[2,{ch:>4},{s:>2},{s:>2}] x{c:<3.0} candle {a:>7.3} ms  ours {bb:>7.3} ms  {:>5.2}x  excess {excess:.2e}", a / bb);
-        theirs_t += a * c; ours_t += bb * c;
+        theirs_t += a * c;
+        ours_t += bb * c;
     }
-    println!("\nCPU, per SD 1.5 forward: candle {theirs_t:.1} ms, ours {ours_t:.1} ms  ({:.2}x)", theirs_t / ours_t);
+    println!(
+        "\nCPU, per SD 1.5 forward: candle {theirs_t:.1} ms, ours {ours_t:.1} ms  ({:.2}x)",
+        theirs_t / ours_t
+    );
     let _ = Tensor::zeros(1usize, sd_tensor::DType::F32, &dev)?;
     Ok(())
 }

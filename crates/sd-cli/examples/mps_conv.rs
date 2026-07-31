@@ -51,14 +51,21 @@ fn main() -> Result<()> {
             ci,
             co,
             3,
-            nn::Conv2dConfig { padding: 1, ..Default::default() },
+            nn::Conv2dConfig {
+                padding: 1,
+                ..Default::default()
+            },
             vb,
         )?;
 
         let want = conv.forward(&xs)?;
         let got = mps::conv2d(&xs, &k, 1)?;
         if got.dims() != want.dims() {
-            println!("[2,{ci},{s},{s}] -> {co}: SHAPE {:?} vs {:?}", got.dims(), want.dims());
+            println!(
+                "[2,{ci},{s},{s}] -> {co}: SHAPE {:?} vs {:?}",
+                got.dims(),
+                want.dims()
+            );
             continue;
         }
         let excess = sd_tensor::testing::allclose_excess(&got, &want, 1e-3)?;

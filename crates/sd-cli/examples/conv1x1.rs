@@ -58,7 +58,13 @@ fn main() -> Result<()> {
             f[5].parse::<usize>()? as f64,
         );
         let xs = rng.randn((2, ci, s, s), &dev)?;
-        let conv = nn::conv2d(ci, co, 1, Default::default(), vb.pp(format!("k{co}_{ci}_{s}")))?;
+        let conv = nn::conv2d(
+            ci,
+            co,
+            1,
+            Default::default(),
+            vb.pp(format!("k{co}_{ci}_{s}")),
+        )?;
         let k = rng.randn((co, ci, 1, 1), &dev)?;
 
         // Agreement, against candle's own conv with the same weights.

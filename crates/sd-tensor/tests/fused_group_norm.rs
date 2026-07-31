@@ -82,7 +82,11 @@ fn each_group_is_normalised_independently() {
     );
 
     // Every group must come out with unit-ish spread despite the input scales.
-    let flat = got.flatten_all().expect("flat").to_vec1::<f32>().expect("vec");
+    let flat = got
+        .flatten_all()
+        .expect("flat")
+        .to_vec1::<f32>()
+        .expect("vec");
     let per = cpg * s * s;
     for g in 0..groups {
         let slice = &flat[g * per..(g + 1) * per];
@@ -158,8 +162,15 @@ fn groups_that_do_not_divide_the_channels_are_refused() {
     let w = Tensor::ones((30usize,), DType::F32, &dev).expect("weight");
     let b = Tensor::zeros((30usize,), DType::F32, &dev).expect("bias");
     assert!(
-        xs.apply_op3_no_bwd(&w, &b, &fused::GroupNormOp { groups: 32, eps: 1e-5 })
-            .is_err(),
+        xs.apply_op3_no_bwd(
+            &w,
+            &b,
+            &fused::GroupNormOp {
+                groups: 32,
+                eps: 1e-5
+            }
+        )
+        .is_err(),
         "32 groups do not divide 30 channels and must be refused"
     );
 }

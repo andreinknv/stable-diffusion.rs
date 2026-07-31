@@ -35,21 +35,31 @@ fn main() -> Result<()> {
     let vb = VarBuilder::zeros(DType::F32, &dev);
     let (mut t_conv, mut t_gemm) = (0.0, 0.0);
 
-    println!("{:<26}{:>9}{:>9}{:>9}{:>10}", "3x3 conv", "total", "gemm", "im2col", "im2col%");
+    println!(
+        "{:<26}{:>9}{:>9}{:>9}{:>10}",
+        "3x3 conv", "total", "gemm", "im2col", "im2col%"
+    );
     for line in include_str!("sd15_inventory.txt").lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.first() != Some(&"conv") || f[3] != "3" {
             continue;
         }
-        let (co, ci, s, c): (usize, usize, usize, f64) =
-            (f[1].parse()?, f[2].parse()?, f[4].parse()?, f[5].parse::<usize>()? as f64);
+        let (co, ci, s, c): (usize, usize, usize, f64) = (
+            f[1].parse()?,
+            f[2].parse()?,
+            f[4].parse()?,
+            f[5].parse::<usize>()? as f64,
+        );
 
         let xs = rng.randn((2, ci, s, s), &dev)?;
         let conv = nn::conv2d(
             ci,
             co,
             3,
-            nn::Conv2dConfig { padding: 1, ..Default::default() },
+            nn::Conv2dConfig {
+                padding: 1,
+                ..Default::default()
+            },
             vb.pp(format!("k{co}_{ci}_{s}")),
         )?;
         // The gemm candle ends up doing: one row per output position, one
@@ -58,8 +68,14 @@ fn main() -> Result<()> {
         let col = rng.randn((2, s * s, k), &dev)?;
         let ker = rng.randn((k, co), &dev)?;
 
-        let total = bench(&dev, || { conv.forward(&xs)?; Ok(()) })?;
-        let gemm = bench(&dev, || { col.broadcast_matmul(&ker)?; Ok(()) })?;
+        let total = bench(&dev, || {
+            conv.forward(&xs)?;
+            Ok(())
+        })?;
+        let gemm = bench(&dev, || {
+            col.broadcast_matmul(&ker)?;
+            Ok(())
+        })?;
         let im2col = (total - gemm).max(0.0);
         println!(
             "[2,{ci:>4},{s:>2},{s:>2}] -> {co:<5} x{c:<3.0}{total:>9.3}{gemm:>9.3}{im2col:>9.3}{:>9.0}%",
