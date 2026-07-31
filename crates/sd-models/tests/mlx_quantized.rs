@@ -379,11 +379,10 @@ fn the_flux_transformer_agrees_with_itself_quantised() {
 /// schnell's dense footprint is 47.6 GB and does not fit; this loads the same
 /// checkpoint quantised and pushes a real activation through all 57 blocks.
 ///
-/// The conditioning is synthetic rather than a real prompt, because **no T5
-/// tokenizer is on this machine** — `tests/golden/flux/` ships CLIP's but not
-/// sentencepiece. That is a fixture gap and not a code one: the transformer
-/// cannot tell where its 4096-wide context came from. A genuine
-/// prompt-to-pixels Flux run wants that one small file.
+/// The conditioning is synthetic rather than a real prompt, deliberately: this
+/// isolates the transformer, so a failure here is the quantised weights and not
+/// the tokeniser or the text encoder. `mlx_flux_end_to_end` runs the real
+/// thing.
 #[test]
 fn schnell_runs_quantised_at_full_size() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

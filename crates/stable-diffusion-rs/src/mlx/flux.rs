@@ -239,6 +239,7 @@ impl FluxPipeline {
     /// `transformer_gguf` is in Flux's own naming, which is what the model
     /// asks for. `t5_gguf` is in llama.cpp's, so it is translated through
     /// `sd_loader::t5_key` on the way in.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_gguf(
         transformer_gguf: &Path,
         t5_gguf: &Path,
@@ -263,7 +264,7 @@ impl FluxPipeline {
         }
         let stream = Stream::gpu();
         let transformer = quantized::from_gguf(transformer_gguf, bits, &stream)?;
-        let t5w = quantized::from_gguf_renamed(t5_gguf, bits, |k| sd_loader::t5_key(k), &stream)?;
+        let t5w = quantized::from_gguf_renamed(t5_gguf, bits, sd_loader::t5_key, &stream)?;
 
         let mut vae_w = load_safetensors(vae)?;
         normalise_legacy_attention(&mut vae_w);

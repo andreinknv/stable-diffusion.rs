@@ -116,10 +116,39 @@ pub fn sensitive(name: &str) -> bool {
         || name.starts_with("final_layer")
 }
 
-/// The default policy: [`sensitive`] layers at 8 bits, everything else at
-/// `bits`.
+/// Tensors that are **indexed rather than multiplied**, and so cannot be
+/// quantised at all.
+///
+/// A quantised weight only exists as packed bits until a matmul kernel
+/// reconstructs it. `take` reads rows directly, so an embedding table or a
+/// relative-attention bias has to be a real array — there is no kernel to fuse
+/// the dequantisation into.
+///
+/// **This is a hard constraint, not a quality trade-off.** Getting it wrong is
+/// caught loudly by `WeightSource::dense`, which refuses to reach past
+/// `linear` into a quantised tensor; it was found exactly that way, by running
+/// T5 with `shared.weight` and `relative_attention_bias` on the wrong side.
+pub fn indexed(name: &str) -> bool {
+    name == "shared.weight"
+        || name.contains("relative_attention_bias")
+        || name.contains("_embedding.weight")
+        || name.ends_with("pos_embed")
+        || name.contains("prd_embedding")
+        || name.contains("positional_embedding")
+}
+
+/// The default policy: [`indexed`] tensors dense, [`sensitive`] layers at 8
+/// bits, everything else at `bits`.
 pub fn mixed(bits: usize) -> impl Fn(&str) -> usize {
-    move |name: &str| if sensitive(name) { 8 } else { bits }
+    move |name: &str| {
+        if indexed(name) {
+            0
+        } else if sensitive(name) {
+            8
+        } else {
+            bits
+        }
+    }
 }
 
 /// Is this tensor worth quantising?
@@ -148,8 +177,8 @@ pub fn from_gguf(path: &Path, bits: usize, s: &Stream) -> Result<QuantizedWeight
         let array = Array::from_slice_f32(&values, &info.shape)?;
         drop(values);
 
-        let want = if sensitive(&info.name) { 8 } else { bits };
-        if quantizable(&info.shape) {
+        let want = mixed(bits)(&info.name);
+        if want >= 2 && quantizable(&info.shape) {
             let q = QuantizedArray::quantize(&array, GROUP_SIZE, want, s)?;
             // **Evaluate before dropping the dense source.** MLX is lazy, so
             // without this the quantisation is a graph node holding a
@@ -196,7 +225,7 @@ pub fn from_gguf_renamed(
         let array = Array::from_slice_f32(&values, &info.shape)?;
         drop(values);
 
-        let want = if sensitive(&name) { 8 } else { bits };
+        let want = mixed(bits)(&name);
         if want >= 2 && quantizable(&info.shape) {
             let q = QuantizedArray::quantize(&array, GROUP_SIZE, want, s)?;
             sd_tensor::mlx::eval(&[&q.weight, &q.scales, &q.biases])?;
