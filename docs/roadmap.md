@@ -647,9 +647,30 @@ In rough order of cost, cheapest first:
   "fixing" either end breaks a transformer verified to 2.2e-6. There is a test
   saying so.
 
-  **What remains for video is the 3D VAE**, which is genuinely new machinery
-  rather than another transformer — a temporal axis through the encoder and
-  decoder, and memory characteristics this machine has not been asked for.
+  **The 3D convolution the VAE needs is bound and verified** — plain, causal
+  and strided, all under 1e-5 against PyTorch. MLX 0.32 has `mlx_conv3d`, so
+  the primitive that looked like the blocker for every video VAE is not one.
+
+  Two findings worth carrying:
+
+  **MLX has no grouped 3D convolution, and it *aborts the process* rather than
+  returning a status** — `[conv] Can only handle groups != 1 in 1D or 2D
+  convolutions`, raised fatally. `Array::conv3d` refuses `groups != 1` before
+  the call so a caller gets an ordinary error instead of a dead process. A
+  depthwise k^3 convolution is expressible as 27 shifted multiply-adds if one
+  is ever needed.
+
+  **The convolution is causal in time.** Wan's VAE pads `2 * pad_t` at the
+  *front* of the temporal axis and nothing at the back, so no frame sees its
+  successors. Symmetric padding gives the same shape from a model trained not
+  to look forward, which is why `causal_conv3d_nchw` is a separate function
+  with a test that checks it differs from the symmetric one.
+
+  What remains for video is the VAE itself: `WanRMS_norm` (an L2 normalise
+  times `sqrt(dim)`, which is RMSNorm over the channel axis), temporal
+  resampling via a `time_conv` that doubles channels and interleaves, and a
+  streaming feature cache for chunked inference that a short clip does not
+  need.
 
 **Kontext is done, structurally.** It was the one worth taking first for the
 reason given — it reuses the Flux transformer unmodified — and that turned out

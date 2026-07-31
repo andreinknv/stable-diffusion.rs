@@ -286,6 +286,23 @@ unsafe extern "C" {
         s: mlx_stream,
     ) -> i32;
 
+    fn mlx_conv3d(
+        res: *mut mlx_array,
+        input: mlx_array,
+        weight: mlx_array,
+        stride_0: i32,
+        stride_1: i32,
+        stride_2: i32,
+        padding_0: i32,
+        padding_1: i32,
+        padding_2: i32,
+        dilation_0: i32,
+        dilation_1: i32,
+        dilation_2: i32,
+        groups: i32,
+        s: mlx_stream,
+    ) -> i32;
+
     // weight loading
     fn mlx_load_safetensors(
         res_0: *mut mlx_map_string_to_array,
@@ -814,6 +831,60 @@ impl Array {
                 )
             },
             "conv2d",
+        )?;
+        Self::wrap(out)
+    }
+
+    /// A 3D convolution over `[n, t, h, w, c]`, weights `[out, kt, kh, kw, in]`.
+    ///
+    /// **NTHWC, and the kernel is channel-last**, exactly as `conv2d` is here:
+    /// MLX puts channels last and `diffusers` stores `(out, in, kt, kh, kw)`,
+    /// so a caller transposes at the point of use rather than at load. The
+    /// video VAEs are the only thing that needs this.
+    pub fn conv3d(
+        &self,
+        weight: &Self,
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        dilation: (usize, usize, usize),
+        groups: usize,
+        stream: &Stream,
+    ) -> Result<Self> {
+        // **MLX 0.32 aborts the process** on a grouped 3D convolution rather
+        // than returning a status — `[conv] Can only handle groups != 1 in 1D
+        // or 2D convolutions`, raised as a fatal error. Refused here so a
+        // caller gets an ordinary `Err` instead of a dead process. A k^3
+        // depthwise convolution is expressible as 27 shifted multiply-adds if
+        // one is ever needed.
+        if groups != 1 {
+            return Err(Error::Msg(format!(
+                "mlx: conv3d supports only groups = 1, got {groups}; MLX has no \
+                 grouped 3D convolution and aborts rather than failing"
+            )));
+        }
+        let mut out = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        check(
+            unsafe {
+                mlx_conv3d(
+                    &mut out,
+                    self.raw,
+                    weight.raw,
+                    stride.0 as i32,
+                    stride.1 as i32,
+                    stride.2 as i32,
+                    padding.0 as i32,
+                    padding.1 as i32,
+                    padding.2 as i32,
+                    dilation.0 as i32,
+                    dilation.1 as i32,
+                    dilation.2 as i32,
+                    groups as i32,
+                    stream.0,
+                )
+            },
+            "conv3d",
         )?;
         Self::wrap(out)
     }

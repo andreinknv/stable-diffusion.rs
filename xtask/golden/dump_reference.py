@@ -318,6 +318,54 @@ def dump_llm(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out}/reference.safetensors ({len(tensors)} tensors) and llm.safetensors")
 
 
+def dump_conv3d(output: pathlib.Path, model_id: str) -> None:
+    """3D convolution, plain and causal, against PyTorch.
+
+    The primitive every video VAE needs and no image model does. Verified on
+    its own before anything is built on it, because a convolution that is
+    subtly wrong — an axis order, a padding side — produces output of exactly
+    the right shape.
+
+    **Causal padding is the part worth pinning.** Wan's VAE pads `2 * pad_t`
+    at the *front* of the temporal axis and nothing at the back, so a frame
+    never sees its successors. Symmetric padding gives the same shape from a
+    model that was trained not to look forward.
+    """
+    torch = _require("torch")
+    import torch.nn.functional as F
+    from safetensors.torch import save_file
+
+    out = output / "conv3d"
+    out.mkdir(parents=True, exist_ok=True)
+
+    gen = torch.Generator().manual_seed(SEED)
+    # [n, c, t, h, w] and [out, in, kt, kh, kw], as `diffusers` stores them.
+    x = torch.randn(1, 3, 5, 6, 7, generator=gen)
+    w = torch.randn(4, 3, 3, 3, 3, generator=gen)
+    b = torch.randn(4, generator=gen)
+
+    with torch.no_grad():
+        # Symmetric padding of 1 on every axis.
+        plain = F.conv3d(x, w, b, stride=1, padding=1)
+        # Causal: (w_lo, w_hi, h_lo, h_hi, t_lo, t_hi) — 2 at the front of
+        # time, none at the back.
+        padded = F.pad(x, (1, 1, 1, 1, 2, 0))
+        causal = F.conv3d(padded, w, b, stride=1, padding=0)
+        # And a strided case, since the VAE downsamples.
+        strided = F.conv3d(x, w, b, stride=(1, 2, 2), padding=1)
+
+    tensors = {
+        "input": x.contiguous(),
+        "weight": w.contiguous(),
+        "bias": b.contiguous(),
+        "plain": plain.contiguous(),
+        "causal": causal.contiguous(),
+        "strided": strided.contiguous(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    print(f"wrote {out}/reference.safetensors ({len(tensors)} tensors)")
+
+
 def dump_wan(output: pathlib.Path, model_id: str) -> None:
     """Wan's video transformer, at a size that fits in a fixture.
 
@@ -2775,6 +2823,10 @@ def main() -> None:
     llm.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
     llm.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    c3d = sub.add_parser("conv3d", help="dump 3D convolution references")
+    c3d.add_argument("--model-id", default="(none)")
+    c3d.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     wan = sub.add_parser("wan", help="dump Wan video transformer references")
     wan.add_argument("--model-id", default="(random init)")
     wan.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -2948,6 +3000,8 @@ def main() -> None:
         dump_t5(args.output, args.model_id)
     elif args.component == "llm":
         dump_llm(args.output, args.model_id)
+    elif args.component == "conv3d":
+        dump_conv3d(args.output, args.model_id)
     elif args.component == "wan":
         dump_wan(args.output, args.model_id)
     elif args.component == "qwen_image":

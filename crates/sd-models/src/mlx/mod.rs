@@ -1192,3 +1192,51 @@ pub fn unet_forward_adapters(
 pub mod qwen_image;
 pub mod wan;
 pub mod z_image;
+
+/// A 3D convolution taking `diffusers`' layout and returning it.
+///
+/// **Input and weights arrive NCTHW / `(out, in, kt, kh, kw)`** — the layout
+/// every published checkpoint uses — and MLX wants NTHWC with a channel-last
+/// kernel. Transposing here rather than at load keeps the loaders converting
+/// *names* and not layouts, exactly as `conv_strided` does for 2D.
+pub fn conv3d_nchw(
+    x: &Array,
+    w: &Array,
+    b: Option<&Array>,
+    stride: (usize, usize, usize),
+    padding: (usize, usize, usize),
+    s: &Stream,
+) -> Result<Array> {
+    // [n, c, t, h, w] -> [n, t, h, w, c]
+    let x = x.transpose(&[0, 2, 3, 4, 1], s)?.contiguous(s)?;
+    // [out, in, kt, kh, kw] -> [out, kt, kh, kw, in]
+    let k = w.transpose(&[0, 2, 3, 4, 1], s)?.contiguous(s)?;
+    let y = x.conv3d(&k, stride, padding, (1, 1, 1), 1, s)?;
+    let y = match b {
+        Some(b) => y.add(b, s)?,
+        None => y,
+    };
+    // Back to NCTHW.
+    y.transpose(&[0, 4, 1, 2, 3], s)?.contiguous(s)
+}
+
+/// A **causal** 3D convolution: the temporal axis is padded only at the front.
+///
+/// Wan's VAE pads `2 * pad_t` before the first frame and nothing after the
+/// last, so no frame ever sees its successors. Symmetric padding produces the
+/// same shape from a model trained not to look forward — the failure is a
+/// video that is subtly wrong in time and perfectly well formed.
+pub fn causal_conv3d_nchw(
+    x: &Array,
+    w: &Array,
+    b: Option<&Array>,
+    stride: (usize, usize, usize),
+    padding: (usize, usize, usize),
+    s: &Stream,
+) -> Result<Array> {
+    let (pt, ph, pw) = padding;
+    // Pad time at the front only; height and width symmetrically. Then the
+    // convolution itself pads nothing.
+    let padded = x.pad(&[2, 3, 4], &[2 * pt, ph, pw], &[0, ph, pw], s)?;
+    conv3d_nchw(&padded, w, b, stride, (0, 0, 0), s)
+}
