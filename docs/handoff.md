@@ -80,12 +80,15 @@ findings still bind.
    - SD 3.5, Flux and unCLIP pipelines (the models are ported; the pipelines
      around them are not). **SDXL is done** — `SdxlPipeline`, txt2img and
      img2img, verified at its native 1024 in 24 s
-   - IP-Adapter, GLIGEN and AnimateDiff *attachment* — each model is gated,
-     none is wired into `MlxPipeline`. **ControlNet and LoRA are wired**:
-     `attach_controlnet` (several stack, corrections sum, scale 0 is exactly
-     zero) and `attach_lora` (which errors rather than half-applying)
+   - AnimateDiff frame batching. **ControlNet, LoRA, IP-Adapter and GLIGEN
+     are wired**: `attach_controlnet` (several stack, corrections sum, scale 0
+     is exactly zero), `attach_lora` (errors rather than half-applying),
+     `attach_ip_adapter` (scale 0 exactly zero), and `generate(..., boxes)`
+     for GLIGEN — which refuses boxes on a UNet with no fuser layers rather
+     than dropping them
    - step caching, region/area prompts, two-pass hires, model placement,
      progress reporting and cancellation
+   - textual inversion, area prompts, per-step conditioning, upscaling
    - AnimateDiff frame batching
 
    So the shape has changed since the last entry: this is no longer "the

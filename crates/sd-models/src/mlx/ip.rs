@@ -27,7 +27,7 @@
 use std::cell::Cell;
 
 use sd_tensor::mlx::{Array, Stream};
-use sd_tensor::Result;
+use sd_tensor::{Error, Result};
 
 use super::Weights;
 
@@ -133,4 +133,45 @@ pub fn image_attention(
     )?;
     let _ = seq_q;
     Ok(Some(out.mul(&Array::scalar_f32(ip.scale)?, s)?))
+}
+
+/// The IP-Adapter's own token count. Four, not the text tower's 77.
+pub const NUM_TOKENS: usize = 4;
+/// LayerNorm epsilon in the projection. PyTorch's default.
+const PROJ_EPS: f32 = 1e-5;
+
+/// `image_proj`: a CLIP image embedding to the tokens the UNet attends over.
+///
+/// `[b, embed_dim]` -> `[b, NUM_TOKENS, cross_dim]`. **One Linear producing
+/// every token at once**, then reshaped — which is why its output width is
+/// `tokens * cross_dim` rather than `cross_dim`, and why splitting it into
+/// four projections would load nothing.
+///
+/// The input is the vision tower's **projected** embedding — 1024 for ViT-H,
+/// not the pooled 1280. `clip_vision::image_embeds` is the one that gives it.
+pub fn image_proj(
+    image_embeds: &Array,
+    cross_dim: usize,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
+    let [b, _] = image_embeds.shape()[..] else {
+        return Err(Error::Msg(format!(
+            "mlx: image embeds should be [b, dim], got {:?}",
+            image_embeds.shape()
+        )));
+    };
+    let projected = super::linear(
+        image_embeds,
+        super::get(w, "image_proj.proj.weight")?,
+        w.get("image_proj.proj.bias"),
+        s,
+    )?
+    .reshape(&[b, NUM_TOKENS, cross_dim], s)?;
+    projected.layer_norm(
+        Some(super::get(w, "image_proj.norm.weight")?),
+        Some(super::get(w, "image_proj.norm.bias")?),
+        PROJ_EPS,
+        s,
+    )
 }

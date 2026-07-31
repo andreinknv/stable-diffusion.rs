@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use stable_diffusion_rs::mlx::{MlxPipeline, SdxlPipeline};
+use stable_diffusion_rs::mlx::{GroundedBox, MlxPipeline, SdxlPipeline};
 use stable_diffusion_rs::pipeline::{SamplerKind, Strength, Txt2ImgConfig};
 use stable_diffusion_rs::tensor::mlx::Array;
 
@@ -514,5 +514,124 @@ fn a_lora_merges_completely_and_changes_the_image() {
     assert_eq!(
         none, before,
         "a LoRA at multiplier 0 changed the image; it must be an exact no-op"
+    );
+}
+
+/// **GLIGEN puts things where the boxes say.**
+///
+/// Two runs from the same seed, differing only in where the box is. If the
+/// grounding reaches the UNet, the two images differ most in the two box
+/// regions and least elsewhere; if it does not, they are identical.
+#[test]
+fn gligen_boxes_move_the_content() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/gligen");
+    if !dir.is_dir() {
+        sd_tensor::skip_missing_fixture!("SKIP: no GLIGEN checkpoint at models/gligen.");
+        return;
+    }
+    let pipe = MlxPipeline::load(&dir).expect("loading GLIGEN");
+    let cfg = config();
+
+    let left = pipe
+        .generate(
+            &cfg,
+            None,
+            None,
+            &[GroundedBox {
+                bbox: [0.05, 0.4, 0.45, 0.95],
+                phrase: "a red apple".into(),
+            }],
+        )
+        .expect("left");
+    let right = pipe
+        .generate(
+            &cfg,
+            None,
+            None,
+            &[GroundedBox {
+                bbox: [0.55, 0.4, 0.95, 0.95],
+                phrase: "a red apple".into(),
+            }],
+        )
+        .expect("right");
+
+    assert_ne!(left.2, right.2, "moving the box changed nothing");
+
+    // And an ungrounded run differs from both.
+    let plain = pipe.txt2img(&cfg).expect("plain");
+    assert_ne!(plain.2, left.2, "grounding changed nothing");
+}
+
+/// An ordinary SD 1.5 UNet has no fuser layers, so boxes are refused rather
+/// than dropped.
+#[test]
+fn grounded_boxes_are_refused_by_a_plain_unet() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("pipeline");
+    let err = pipe.generate(
+        &config(),
+        None,
+        None,
+        &[GroundedBox {
+            bbox: [0.1, 0.1, 0.5, 0.5],
+            phrase: "a cat".into(),
+        }],
+    );
+    assert!(err.is_err(), "a plain UNet must refuse grounded boxes");
+}
+
+/// **The IP-Adapter conditions on a picture**, and scale 0 does not.
+#[test]
+fn an_ip_adapter_conditions_on_the_reference_image() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let adapter = root.join("tests/golden/ip_adapter/ip-adapter_sd15.safetensors");
+    let vision = root.join("tests/golden/clip_vision/image_encoder.safetensors");
+    if !adapter.exists() || !vision.exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no IP-Adapter or image encoder.");
+        return;
+    }
+    let cfg = config();
+
+    // A reference image in CLIP's [0, 1] — a simple colour field is enough to
+    // move the output measurably.
+    let mut px = vec![0.0f32; 224 * 224 * 3];
+    for y in 0..224 {
+        for x in 0..224 {
+            px[(y * 224 + x) * 3] = 0.9;
+            px[(y * 224 + x) * 3 + 1] = 0.2;
+            px[(y * 224 + x) * 3 + 2] = 0.1;
+        }
+    }
+    let reference = Array::from_slice_f32(&px, &[1, 224, 224, 3]).unwrap();
+
+    let plain = MlxPipeline::load(&dir).expect("plain");
+    let (_, _, without) = plain.txt2img(&cfg).expect("txt2img");
+
+    let mut adapted = MlxPipeline::load(&dir).expect("adapted");
+    adapted
+        .attach_ip_adapter(&adapter, &vision, 1.0)
+        .expect("attach");
+    let (_, _, with) = adapted
+        .generate(&cfg, None, Some(&reference), &[])
+        .expect("adapted run");
+    assert_ne!(without, with, "the IP-Adapter changed nothing");
+
+    // Scale 0 must be exactly the unadapted run.
+    let mut off = MlxPipeline::load(&dir).expect("off");
+    off.attach_ip_adapter(&adapter, &vision, 0.0)
+        .expect("attach");
+    let (_, _, zero) = off
+        .generate(&cfg, None, Some(&reference), &[])
+        .expect("scale 0");
+    assert_eq!(
+        zero, without,
+        "an IP-Adapter at scale 0 changed the image; it must contribute exactly nothing"
     );
 }

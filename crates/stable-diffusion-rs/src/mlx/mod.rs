@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use sd_models::clip::ClipTokenizer;
 use sd_models::mlx::{
-    clip, controlnet, lora::Lora, normalise_legacy_attention, sample, unet_forward_adapters, vae,
-    Adapters, UNetConfig, Weights,
+    clip, clip_vision, controlnet, gligen, ip, lora::Lora, normalise_legacy_attention, sample,
+    unet_forward_adapters, vae, Adapters, UNetConfig, Weights,
 };
 use sd_sample::{sigmas_for_steps, Schedule};
 use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
@@ -143,6 +143,43 @@ pub struct Control {
     pub scale: f64,
 }
 
+/// An attached IP-Adapter: its own weights, the image tower's, and the scale.
+///
+/// The adapter's attention weights live in the same map as `image_proj` — it
+/// ships as one file — but the **vision tower is a separate checkpoint**, and a
+/// large one. Held apart so a run that never conditions on an image does not
+/// pay for it.
+pub struct IpAdapter {
+    weights: Weights,
+    vision: Weights,
+    scale: f32,
+}
+
+/// One grounded box for GLIGEN: where, and what.
+///
+/// Coordinates are `[x0, y0, x1, y1]` in `[0, 1]`, **not pixels** — the model
+/// was trained on normalised boxes and pixel values put every box off the
+/// canvas without an error.
+pub struct GroundedBox {
+    pub bbox: [f32; 4],
+    pub phrase: String,
+}
+
+/// The per-run conditioning that is not the prompt.
+///
+/// Bundled because the sampling loop needs all of it and none of it belongs to
+/// [`Txt2ImgConfig`], which is shared with the candle pipeline and holds no
+/// tensors.
+#[derive(Default)]
+struct Extras<'a> {
+    /// A ControlNet's control map, `[1, h, w, 3]` in `[-1, 1]`.
+    hint: Option<&'a Array>,
+    /// The IP-Adapter's four tokens, already doubled for the guidance batch.
+    ip_tokens: Option<Array>,
+    /// GLIGEN's grounding tokens, likewise doubled.
+    objs: Option<&'a Array>,
+}
+
 /// A loaded SD 1.5-family pipeline on MLX.
 pub struct MlxPipeline {
     tokenizer: ClipTokenizer,
@@ -155,6 +192,7 @@ pub struct MlxPipeline {
     stream: Stream,
     /// Spatial conditioning, in attachment order. Empty is the common case.
     controlnets: Vec<Control>,
+    ip: Option<IpAdapter>,
 }
 
 impl MlxPipeline {
@@ -194,7 +232,56 @@ impl MlxPipeline {
             schedule: Schedule::sd15(),
             stream,
             controlnets: Vec::new(),
+            ip: None,
         })
+    }
+
+    /// Attach an IP-Adapter.
+    ///
+    /// `adapter` carries `image_proj` and the per-layer `to_k_ip`/`to_v_ip`
+    /// weights; `image_encoder` is the CLIP vision tower, which is a separate
+    /// and much larger checkpoint.
+    ///
+    /// **Scale 0 contributes exactly nothing**, so it is a usable off switch
+    /// rather than an approximation of one.
+    pub fn attach_ip_adapter(
+        &mut self,
+        adapter: &Path,
+        image_encoder: &Path,
+        scale: f64,
+    ) -> Result<(), PipelineError> {
+        self.ip = Some(IpAdapter {
+            weights: load_safetensors(adapter)?,
+            vision: load_safetensors(image_encoder)?,
+            scale: scale as f32,
+        });
+        Ok(())
+    }
+
+    /// The adapter's four tokens for a reference image.
+    ///
+    /// `image` is `[1, 224, 224, 3]` in **`[0, 1]`** — CLIP's own range, not
+    /// the `[-1, 1]` a VAE uses. The wrong range is accepted and describes the
+    /// wrong picture.
+    fn ip_tokens(&self, image: &Array) -> Result<Option<Array>, PipelineError> {
+        let Some(adapter) = &self.ip else {
+            return Ok(None);
+        };
+        let s = &self.stream;
+        let pixels = clip_vision::preprocess(image, s)?;
+        // The **projected** embedding, 1024 wide for ViT-H — not the pooled
+        // 1280, which is a different vector of a different width.
+        let embeds = clip_vision::image_embeds(
+            &pixels,
+            &clip_vision::VisionConfig::vit_h_14(),
+            &adapter.vision,
+            s,
+        )?;
+        let tokens = ip::image_proj(&embeds, clip::HIDDEN, &adapter.weights, s)?;
+        // Doubled to match the guidance batch, unconditional row first. The
+        // unconditional row gets the *same* tokens: dropping the image there
+        // would make guidance push away from it.
+        Ok(Some(concat(&[&tokens, &tokens], 0, s)?))
     }
 
     /// Merge a LoRA into the UNet, in place.
@@ -238,19 +325,75 @@ impl MlxPipeline {
         self.controlnets.len()
     }
 
+    /// GLIGEN's grounding tokens for a set of boxes.
+    ///
+    /// Requires a checkpoint whose UNet carries `fuser` layers; an ordinary SD
+    /// 1.5 UNet has nowhere to put them, so this errors rather than dropping
+    /// the boxes silently.
+    fn grounding(&self, boxes: &[GroundedBox]) -> Result<Option<Array>, PipelineError> {
+        if boxes.is_empty() {
+            return Ok(None);
+        }
+        if !gligen::present(
+            &self.unet,
+            "down_blocks.0.attentions.0.transformer_blocks.0",
+        ) {
+            return Err(msg(
+                "mlx: grounded boxes were supplied but this UNet has no GLIGEN fuser layers".into(),
+            ));
+        }
+        let s = &self.stream;
+        let n = boxes.len();
+        let mut rows = Vec::with_capacity(n);
+        let mut coords = Vec::with_capacity(n * 4);
+        for b in boxes {
+            // **The phrase's pooled hidden state**, which is the EOS position
+            // and not position 0. `clip::pool` takes the *first* highest token
+            // id, which matters here because CLIP-L pads with EOS itself — the
+            // last one is 60-odd positions past the end of the phrase.
+            let ids = self.token_ids(&b.phrase)?;
+            let hidden = clip::text_encoder(&ids, &self.text_encoder, s)?;
+            rows.push(clip::pool(&hidden, &ids, s)?);
+            coords.extend_from_slice(&b.bbox);
+        }
+        let refs: Vec<&Array> = rows.iter().collect();
+        let phrases = concat(&refs, 0, s)?.reshape(&[1, n, clip::HIDDEN], s)?;
+        let boxes_arr = Array::from_slice_f32(&coords, &[1, n, 4])?;
+        // Every slot is real here, so every mask is 1. The learned nulls exist
+        // for callers batching a fixed number of slots.
+        let masks = Array::from_slice_f32(&vec![1.0; n], &[1, n])?;
+
+        let objs = gligen::position_net(&boxes_arr, &masks, &phrases, &self.unet, s)?;
+        // Doubled for the guidance batch, like every other conditioning here.
+        Ok(Some(concat(&[&objs, &objs], 0, s)?))
+    }
+
     /// Encode one prompt to `[1, 77, 768]`.
     ///
     /// An empty prompt is *not* an empty sequence: it is BOS followed by 76
     /// EOS, which is what the tokenizer produces and what the model was trained
     /// against. Feeding a zero tensor instead is a different unconditional.
     fn encode(&self, prompt: &str) -> Result<Array, PipelineError> {
-        let ids = if prompt.is_empty() {
+        let ids = self.token_ids(prompt)?;
+        Ok(clip::text_encoder(&ids, &self.text_encoder, &self.stream)?)
+    }
+
+    /// A prompt's 77 token ids.
+    ///
+    /// An empty prompt is *not* an empty sequence: it is BOS followed by 76
+    /// EOS, which is what the tokenizer produces and what the model was trained
+    /// against. A zero tensor instead is a different unconditional.
+    fn token_ids(&self, prompt: &str) -> Result<Array, PipelineError> {
+        let ids: Vec<i32> = if prompt.is_empty() {
             let mut v = vec![EOS; clip::MAX_POSITION];
             v[0] = BOS;
             v
         } else {
-            let encoded = self.tokenizer.encode(prompt)?;
-            encoded.iter().map(|&x| x as i32).collect()
+            self.tokenizer
+                .encode(prompt)?
+                .iter()
+                .map(|&x| x as i32)
+                .collect()
         };
         if ids.len() != clip::MAX_POSITION {
             return Err(msg(format!(
@@ -259,8 +402,7 @@ impl MlxPipeline {
                 clip::MAX_POSITION
             )));
         }
-        let ids = Array::from_slice_i32(&ids, &[1, clip::MAX_POSITION])?;
-        Ok(clip::text_encoder(&ids, &self.text_encoder, &self.stream)?)
+        Ok(Array::from_slice_i32(&ids, &[1, clip::MAX_POSITION])?)
     }
 
     /// The guidance batch: unconditional row **first**.
@@ -317,7 +459,7 @@ impl MlxPipeline {
         cfg_scale: f64,
         sampler: SamplerKind,
         keep: Option<(&Array, &Array)>,
-        hint: Option<&Array>,
+        extras: &Extras<'_>,
         rng: &mut SeededRng,
     ) -> Result<Array, PipelineError> {
         let s = &self.stream;
@@ -340,9 +482,21 @@ impl MlxPipeline {
             // outside the loop is not an optimisation missed: each is
             // conditioned on the current latent and timestep, so its
             // corrections differ every step.
-            let control = self.control_for(&latent_in, &timestep, context, hint)?;
+            let control = self.control_for(&latent_in, &timestep, context, extras.hint)?;
+            // The adapter walks its layers in visit order, so its counter has
+            // to start from zero on every step rather than continue across a
+            // run. `unet_forward_adapters` rewinds it.
+            let ip = extras.ip_tokens.as_ref().map(|tokens| {
+                ip::IpAdapter::new(
+                    &self.ip.as_ref().expect("tokens imply an adapter").weights,
+                    tokens.contiguous(s).expect("tokens"),
+                    self.ip.as_ref().expect("adapter").scale,
+                )
+            });
             let ad = Adapters {
                 control: control.as_ref(),
+                ip: ip.as_ref(),
+                objs: extras.objs,
                 ..Default::default()
             };
             let out = unet_forward_adapters(
@@ -469,6 +623,21 @@ impl MlxPipeline {
         cfg: &Txt2ImgConfig,
         hint: Option<&Array>,
     ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        self.generate(cfg, hint, None, &[])
+    }
+
+    /// Everything at once: a control map, an IP-Adapter reference image, and
+    /// GLIGEN boxes.
+    ///
+    /// `reference` is `[1, 224, 224, 3]` in **`[0, 1]`** — CLIP's range, not
+    /// the `[-1, 1]` a VAE uses.
+    pub fn generate(
+        &self,
+        cfg: &Txt2ImgConfig,
+        hint: Option<&Array>,
+        reference: Option<&Array>,
+        boxes: &[GroundedBox],
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
         if cfg.width % 8 != 0 || cfg.height % 8 != 0 {
             return Err(msg(format!(
                 "mlx: {}x{} does not divide into 8-pixel latent cells",
@@ -478,6 +647,17 @@ impl MlxPipeline {
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
         let context = self.conditioning(cfg)?;
         let sigmas = self.sigmas(cfg.sampler, cfg.steps);
+
+        let ip_tokens = match reference {
+            Some(image) => self.ip_tokens(image)?,
+            None => None,
+        };
+        let objs = self.grounding(boxes)?;
+        let extras = Extras {
+            hint,
+            ip_tokens,
+            objs: objs.as_ref(),
+        };
 
         let mut rng = SeededRng::new(cfg.seed);
         // Sampling starts at maximum noise, so the latent is scaled by the
@@ -493,7 +673,7 @@ impl MlxPipeline {
             cfg.cfg_scale,
             cfg.sampler,
             None,
-            hint,
+            &extras,
             &mut rng,
         )?;
         self.decode(&latent)
@@ -561,7 +741,7 @@ impl MlxPipeline {
             cfg.cfg_scale,
             cfg.sampler,
             mask.as_ref().map(|m| (m, &init)),
-            None,
+            &Extras::default(),
             &mut rng,
         )?;
         self.decode(&latent)
