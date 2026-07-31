@@ -27,6 +27,8 @@ pub mod controlnet;
 pub mod esrgan;
 /// Flux's MMDiT transformer.
 pub mod flux;
+/// GLIGEN's grounded generation: boxes and phrases into the blocks.
+pub mod gligen;
 /// IP-Adapter's decoupled cross-attention.
 pub mod ip;
 /// LoRA adapters, merged into a weight map before any model is built.
@@ -367,6 +369,7 @@ fn transformer_block(
     context: &Array,
     heads: usize,
     ip: Option<&ip::IpAdapter<'_>>,
+    objs: Option<&Array>,
     w: &Weights,
     prefix: &str,
     s: &Stream,
@@ -379,7 +382,16 @@ fn transformer_block(
         BLOCK_EPS,
         s,
     )?;
-    let x = x.add(&attention(&y, None, heads, None, w, &p("attn1"), s)?, s)?;
+    let mut x = x.add(&attention(&y, None, heads, None, w, &p("attn1"), s)?, s)?;
+
+    // GLIGEN's gated self-attention sits **between** the two attentions:
+    // grounding conditions the image tokens before they meet the text, not
+    // after. A checkpoint without grounding has no `fuser` tensors at all.
+    if let Some(objs) = objs {
+        if gligen::present(w, prefix) {
+            x = gligen::fuse(&x, objs, heads, w, prefix, s)?;
+        }
+    }
 
     let y = x.layer_norm(
         Some(get(w, &p("norm2.weight"))?),
@@ -413,6 +425,7 @@ pub fn transformer_2d(
     layers: usize,
     linear_projection: bool,
     ip: Option<&ip::IpAdapter<'_>>,
+    objs: Option<&Array>,
     w: &Weights,
     prefix: &str,
     s: &Stream,
@@ -461,6 +474,7 @@ pub fn transformer_2d(
             context,
             heads,
             ip,
+            objs,
             w,
             &p(&format!("transformer_blocks.{i}")),
             s,
@@ -573,6 +587,7 @@ pub fn down_block(
     transformer_layers: usize,
     linear_projection: bool,
     ip: Option<&ip::IpAdapter<'_>>,
+    objs: Option<&Array>,
     has_downsample: bool,
     s: &Stream,
 ) -> Result<(Array, Vec<Array>)> {
@@ -589,6 +604,7 @@ pub fn down_block(
                 transformer_layers,
                 linear_projection,
                 ip,
+                objs,
                 w,
                 &format!("{prefix}.attentions.{i}"),
                 s,
@@ -610,12 +626,14 @@ pub fn down_block(
 /// the stack `skip_stack_has_twelve_entries` describes — one for `conv_in`,
 /// then per block two resnets plus a downsampler, except the deepest block
 /// which has neither attention nor a downsampler.
+#[allow(clippy::too_many_arguments)]
 pub fn down_pass(
     sample_nhwc: &Array,
     temb: &Array,
     context: &Array,
     cfg: &UNetConfig,
     ip: Option<&ip::IpAdapter<'_>>,
+    objs: Option<&Array>,
     w: &Weights,
     s: &Stream,
 ) -> Result<(Array, Vec<Array>)> {
@@ -643,6 +661,7 @@ pub fn down_pass(
             cfg.transformer_layers[i],
             cfg.use_linear_projection,
             ip,
+            objs,
             i + 1 < blocks,
             s,
         )?;
@@ -678,12 +697,14 @@ fn upsample(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
 }
 
 /// The mid block: resnet, transformer, resnet.
+#[allow(clippy::too_many_arguments)]
 pub fn mid_block(
     x: &Array,
     temb: &Array,
     context: &Array,
     cfg: &UNetConfig,
     ip: Option<&ip::IpAdapter<'_>>,
+    objs: Option<&Array>,
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
@@ -698,6 +719,7 @@ pub fn mid_block(
         layers,
         cfg.use_linear_projection,
         ip,
+        objs,
         w,
         "mid_block.attentions.0",
         s,
@@ -720,6 +742,7 @@ pub fn up_block(
     transformer_layers: usize,
     linear_projection: bool,
     ip: Option<&ip::IpAdapter<'_>>,
+    objs: Option<&Array>,
     has_upsample: bool,
     s: &Stream,
 ) -> Result<Array> {
@@ -739,6 +762,7 @@ pub fn up_block(
                 transformer_layers,
                 linear_projection,
                 ip,
+                objs,
                 w,
                 &format!("{prefix}.attentions.{i}"),
                 s,
@@ -763,7 +787,18 @@ pub fn unet_forward(
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
-    unet_forward_with(sample_nhwc, timestep, context, None, None, None, cfg, w, s)
+    unet_forward_with(
+        sample_nhwc,
+        timestep,
+        context,
+        None,
+        None,
+        None,
+        None,
+        cfg,
+        w,
+        s,
+    )
 }
 
 /// `unet_forward` plus SDXL's micro-conditioning: the pooled text embedding
@@ -780,6 +815,7 @@ pub fn unet_forward_with(
     added: Option<(&Array, &Array)>,
     class_embeds: Option<&Array>,
     ip: Option<&ip::IpAdapter<'_>>,
+    objs: Option<&Array>,
     cfg: &UNetConfig,
     w: &Weights,
     s: &Stream,
@@ -863,8 +899,8 @@ pub fn unet_forward_with(
         }
         (false, None) => temb,
     };
-    let (h, mut skips) = down_pass(sample_nhwc, &temb, context, cfg, ip, w, s)?;
-    let mut h = mid_block(&h, &temb, context, cfg, ip, w, s)?;
+    let (h, mut skips) = down_pass(sample_nhwc, &temb, context, cfg, ip, objs, w, s)?;
+    let mut h = mid_block(&h, &temb, context, cfg, ip, objs, w, s)?;
 
     // UpBlock2D first, then three CrossAttnUpBlock2D — the reverse of the down
     // pass, and the deepest block is the one without attention. Three resnets
@@ -888,6 +924,7 @@ pub fn unet_forward_with(
             cfg.transformer_layers[mirrored],
             cfg.use_linear_projection,
             ip,
+            objs,
             i + 1 < blocks,
             s,
         )?;

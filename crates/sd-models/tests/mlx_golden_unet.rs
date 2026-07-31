@@ -127,6 +127,7 @@ fn down_block_0_matches_diffusers() {
         1,
         false,
         None,
+        None,
         &w,
         "down_blocks.0.attentions.0",
         &s,
@@ -158,7 +159,7 @@ fn the_whole_down_pass_matches_diffusers() {
     let temb = timestep_embedding(refs.get("timestep").expect("timestep"), 320, &w, &s).unwrap();
 
     let x = sample.transpose(&[0, 2, 3, 1], &s).unwrap();
-    let (_deepest, skips) = down_pass(&x, &temb, context, &cfg, None, &w, &s).unwrap();
+    let (_deepest, skips) = down_pass(&x, &temb, context, &cfg, None, None, &w, &s).unwrap();
 
     assert_eq!(skips.len(), 12, "skip stack must have 12 entries");
 
@@ -235,13 +236,23 @@ fn the_mid_block_matches_diffusers() {
         .transpose(&[0, 2, 3, 1], &s)
         .unwrap();
     let temb = timestep_embedding(refs.get("timestep").unwrap(), 320, &w, &s).unwrap();
-    let (deepest, _skips) =
-        down_pass(&x, &temb, refs.get("context").unwrap(), &cfg, None, &w, &s).unwrap();
+    let (deepest, _skips) = down_pass(
+        &x,
+        &temb,
+        refs.get("context").unwrap(),
+        &cfg,
+        None,
+        None,
+        &w,
+        &s,
+    )
+    .unwrap();
     let mid = sd_models::mlx::mid_block(
         &deepest,
         &temb,
         refs.get("context").unwrap(),
         &cfg,
+        None,
         None,
         &w,
         &s,
@@ -351,6 +362,7 @@ fn the_sdxl_unet_matches_diffusers() {
         Some((pooled, time_ids)),
         None,
         None,
+        None,
         &cfg,
         &w,
         &s,
@@ -387,6 +399,7 @@ fn micro_conditioning_is_required_when_the_config_declares_it() {
             None,
             None,
             None,
+            None,
             &UNetConfig::sdxl(),
             &w,
             &s
@@ -401,6 +414,7 @@ fn micro_conditioning_is_required_when_the_config_declares_it() {
             t,
             ctx,
             Some((ctx, ctx)),
+            None,
             None,
             None,
             &UNetConfig::sd15(),
@@ -457,6 +471,7 @@ fn the_unclip_unet_matches_diffusers() {
         None,
         Some(refs.get("noised_250").expect("noised_250")),
         None,
+        None,
         &cfg,
         &w,
         &s,
@@ -474,9 +489,19 @@ fn the_unclip_unet_matches_diffusers() {
     // half. `noised_0` is the image embedding at noise level 0, which is a
     // different tensor entirely and produces a different image.
     let zeros = Array::from_slice_f32(&vec![0.0; 2048], &[1, 2048]).unwrap();
-    let zeroed =
-        sd_models::mlx::unet_forward_with(&x, t, text, None, Some(&zeros), None, &cfg, &w, &s)
-            .unwrap();
+    let zeroed = sd_models::mlx::unet_forward_with(
+        &x,
+        t,
+        text,
+        None,
+        Some(&zeros),
+        None,
+        None,
+        &cfg,
+        &w,
+        &s,
+    )
+    .unwrap();
     let worst_zero = excess(
         &zeroed,
         refs.get("unet_out_zero").unwrap(),

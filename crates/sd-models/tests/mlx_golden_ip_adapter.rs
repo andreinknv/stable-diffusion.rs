@@ -74,7 +74,8 @@ fn the_adapter_matches_diffusers() {
         .expect("[b, tokens, dim]");
 
     let ip = IpAdapter::new(&adapter_w, tokens, 1.0);
-    let got = unet_forward_with(&x, t, text, None, None, Some(&ip), &cfg, &unet_w, &s).unwrap();
+    let got =
+        unet_forward_with(&x, t, text, None, None, Some(&ip), None, &cfg, &unet_w, &s).unwrap();
     let worst = max_abs(&got, refs.get("output").unwrap(), &s, "ip output");
     assert!(
         worst <= ATOL,
@@ -108,12 +109,13 @@ fn a_zero_scale_reproduces_the_unadapted_run() {
         .unwrap();
 
     let ip = IpAdapter::new(&adapter_w, tokens, 0.0);
-    let got = unet_forward_with(&x, t, text, None, None, Some(&ip), &cfg, &unet_w, &s).unwrap();
+    let got =
+        unet_forward_with(&x, t, text, None, None, Some(&ip), None, &cfg, &unet_w, &s).unwrap();
     let worst = max_abs(&got, refs.get("output_scale0").unwrap(), &s, "ip scale 0");
     assert!(worst <= ATOL, "at scale 0 the adapter is {worst:.3e}");
 
     // And it must equal a run with no adapter at all, bit for bit.
-    let plain = unet_forward_with(&x, t, text, None, None, None, &cfg, &unet_w, &s).unwrap();
+    let plain = unet_forward_with(&x, t, text, None, None, None, None, &cfg, &unet_w, &s).unwrap();
     assert_eq!(
         got.to_vec_f32(&s).unwrap(),
         plain.to_vec_f32(&s).unwrap(),

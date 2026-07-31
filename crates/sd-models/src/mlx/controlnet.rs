@@ -115,7 +115,9 @@ pub fn forward(
             heads,
             cfg.transformer_layers[i],
             cfg.use_linear_projection,
-            // A ControlNet has no IP-Adapter of its own; the base UNet carries it.
+            // A ControlNet has no IP-Adapter or grounding of its own; the base
+            // UNet carries both.
+            None,
             None,
             i + 1 < blocks,
             s,
@@ -123,7 +125,7 @@ pub fn forward(
         h = out;
         skips.append(&mut block_skips);
     }
-    let mid = mid_block(&h, &temb, context, cfg, None, w, s)?;
+    let mid = mid_block(&h, &temb, context, cfg, None, None, w, s)?;
 
     let scale = Array::scalar_f32(scale as f32)?;
     let mut down = Vec::with_capacity(skips.len());
