@@ -64,30 +64,43 @@ findings still bind.
    and `sample::restore_outside_mask` runs the composite inside the loop. See
    [img2img and inpainting on MLX](#img2img-and-inpainting-on-mlx).
 
-6. **What is actually left, and it is one thing.**
+6. **What is actually left, and it is two things.** Both are real, and the
+   first is the larger.
 
-   **Quantised-at-rest inference does not exist on MLX**, and full-size Flux
-   and T5-XXL cannot leave candle until it does. The MLX GGUF loader
-   dequantises to f32; Flux schnell is 11.89B parameters, which is **47.6 GB**
-   dense and does not fit on this machine at all. The candle path keeps those
-   weights quantised and dequantises per operation —
-   `FluxTransformer::from_quantized`, `resident_bytes` — and MLX has its own
-   quantisation scheme with no equivalent built here.
+   **(a) The pipeline layer is entirely candle.** `crates/stable-diffusion-rs/`
+   is 4,921 lines across `pipeline/*.rs` with **zero** MLX in it, and that is
+   the library's public surface — `Txt2ImgPipeline`, `run_inpaint`, the CLI,
+   `api_contract`. `mlx_end_to_end` and `mlx_img2img` prove the *pieces*
+   compose by hand-assembling the loop; they do not go through
+   `Txt2ImgPipeline`, so nothing a caller actually invokes runs on MLX yet.
 
-   `mlx_gguf_large` pins the boundary as a test rather than a promise: the
-   geometry of both checkpoints is verified from the tensor directory, which
-   costs nothing, and the dense footprint is asserted to *not* fit. If that
-   assertion ever fails, the limitation is stale and the test says so.
+   This is easy to under-read after the model table above. Every model is
+   ported and gated against diffusers, and none of them is reachable through
+   the public API on MLX. The orchestration — model placement, step caching,
+   region prompts, two-pass hires, ControlNet stacking, progress reporting — is
+   the part that is left, and it is more code than any single model was.
 
-   What it would cost is already measured, under [Order of
+   **(b) Quantised-at-rest inference does not exist on MLX**, so full-size Flux
+   and T5-XXL cannot leave candle. The MLX GGUF loader dequantises to f32;
+   Flux schnell is 11.89B parameters, which is **47.6 GB** dense and does not
+   fit on this machine at all. The candle path keeps those weights quantised
+   and dequantises per operation — `FluxTransformer::from_quantized`,
+   `resident_bytes` — and MLX has its own scheme with no equivalent built here.
+
+   `mlx_gguf_large` pins (b) as a test rather than a promise: the geometry of
+   both checkpoints is verified from the tensor directory, which costs nothing,
+   and the dense footprint is asserted to *not* fit. If that assertion ever
+   fails, the limitation is stale and the test says so.
+
+   What (b) would cost is already measured, under [Order of
    work](#order-of-work): requantising into MLX's own 4-bit scheme at a cosine
    of ~0.995 against the GGUF values — and **quantise from the original f16
    checkpoint, not from the GGUF**, or the error sits on top of Q4_K's own.
    `flux_schnell_gguf`'s tolerance would then have to be re-derived from
    `xtask/golden/reference_precision.py`, not widened until it passed.
 
-   Everything else in the 405 is either ported, covered under a different name,
-   or dies with candle — see [Closing the MLX test
+   Everything else in the 405 is ported, covered under a different name, or
+   dies with candle — see [Closing the MLX test
    gap](#closing-the-mlx-test-gap-2026-07-31).
 
 7. **Run both backends in parallel** until every golden test passes on MLX.
@@ -895,6 +908,25 @@ Worth recording, because in each case the instinct was to suspect the port:
 **A fixture named for its role is not evidence of its contents.** Three of the
 four were fixed by reading `xtask/golden/dump_reference.py` rather than by
 changing any code.
+
+### The ledger, so the next reader does not have to rebuild it
+
+28 MLX test binaries against 43 candle ones. The gap is not 15 ports:
+
+| candle binary | status |
+|---|---|
+| `golden_{clip_encoder,clip_vision,controlnet,controlnet_sdxl,esrgan}` | ported |
+| `golden_{flux_transformer,flux_vae,gligen,ip_adapter,motion,prior}` | ported |
+| `golden_{sd3,sdxl_text_encoder,sdxl_unet,t5,taesd,unclip}` | ported |
+| `golden_{unet,unet_attention,unet_blocks,vae,vae_legacy,vae_tiled}` | ported |
+| `gguf_quant_sweep`, `lora_coverage` | ported |
+| `golden_clip_tokenizer`, `ldm_names`, `gguf_header`, `seam_invariants` | backend-free — nothing to port |
+| `golden_samplers`, `golden_flow`, `golden_flux_sampling` | `sd-sample` is scalar; shared already |
+| `fused_{adaln,geglu,group_norm}`, `metal_{parity,decoder_parity,smoke}`, `norm_reduction` | die with candle |
+| `flux_schnell_gguf`, `t5_xxl_gguf` | geometry ported; running them needs (b) above |
+| `pipeline_smoke`, `api_contract` | need (a) above — the pipeline layer |
+
+The last two rows are the whole remaining list.
 
 ### The workspace would not build under `--features mlx` at all
 
