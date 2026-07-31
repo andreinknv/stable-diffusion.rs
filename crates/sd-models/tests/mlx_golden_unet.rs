@@ -138,3 +138,64 @@ fn the_whole_down_pass_matches_diffusers() {
         );
     }
 }
+
+/// The whole UNet, against `full_unet_matches_diffusers`' bound.
+///
+/// `golden_unet.rs` holds the candle port to `DEFAULT_ATOL` here and measures
+/// 1.1e-5, noting the accumulated error stays in the deep 1280-channel blocks
+/// and `conv_out` projects back down to 4 channels. The same should hold on
+/// MLX, and this is where that is checked rather than assumed.
+#[test]
+fn the_whole_unet_matches_diffusers() {
+    let Some((refs, w)) = fixtures() else { return };
+    let s = Stream::gpu();
+
+    let x = refs
+        .get("sample")
+        .unwrap()
+        .transpose(&[0, 2, 3, 1], &s)
+        .unwrap();
+    let got = sd_models::mlx::unet_forward(
+        &x,
+        refs.get("timestep").unwrap(),
+        refs.get("context").unwrap(),
+        &w,
+        &s,
+    )
+    .unwrap();
+
+    let worst = max_abs(&got, refs.get("output").unwrap(), &s, "output");
+    assert!(
+        worst <= ATOL,
+        "the UNet is {worst:.3e} from diffusers, past atol {ATOL:.0e}; \
+         candle measures 1.1e-5 on this fixture"
+    );
+}
+
+/// The mid block, on the looser bound `golden_unet.rs` uses for intermediates.
+///
+/// Not 1e-4: `reference_precision.py` measured diffusers missing its *own* f64
+/// by 1.108e-4 on `mid_output`, so 1e-4 there would be testing float32 rather
+/// than this port. `UNET_ATOL` is 1e-3 for exactly this reason.
+#[test]
+fn the_mid_block_matches_diffusers() {
+    let Some((refs, w)) = fixtures() else { return };
+    let s = Stream::gpu();
+    const MID_ATOL: f32 = 1e-3;
+
+    let x = refs
+        .get("sample")
+        .unwrap()
+        .transpose(&[0, 2, 3, 1], &s)
+        .unwrap();
+    let temb = timestep_embedding(refs.get("timestep").unwrap(), 320, &w, &s).unwrap();
+    let (deepest, _skips) = down_pass(&x, &temb, refs.get("context").unwrap(), &w, &s).unwrap();
+    let mid =
+        sd_models::mlx::mid_block(&deepest, &temb, refs.get("context").unwrap(), &w, &s).unwrap();
+
+    let worst = max_abs(&mid, refs.get("mid_output").unwrap(), &s, "mid_output");
+    assert!(
+        worst <= MID_ATOL,
+        "mid_block is {worst:.3e}, past {MID_ATOL:.0e}"
+    );
+}

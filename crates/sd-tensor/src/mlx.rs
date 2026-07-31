@@ -144,6 +144,13 @@ unsafe extern "C" {
         s: mlx_stream,
     ) -> i32;
     fn mlx_vector_array_new_data(data: *const mlx_array, size: usize) -> mlx_vector_array;
+    fn mlx_broadcast_to(
+        res: *mut mlx_array,
+        a: mlx_array,
+        shape: *const i32,
+        shape_num: usize,
+        s: mlx_stream,
+    ) -> i32;
 
     fn mlx_tanh(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
     fn mlx_exp(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
@@ -846,6 +853,19 @@ impl Array {
                 )
             },
             "narrow",
+        )?;
+        Self::wrap(out)
+    }
+
+    /// Broadcast to `shape`, which must be compatible with the current one.
+    pub fn broadcast_to(&self, shape: &[usize], stream: &Stream) -> Result<Self> {
+        let dims: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
+        let mut out = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        check(
+            unsafe { mlx_broadcast_to(&mut out, self.raw, dims.as_ptr(), dims.len(), stream.0) },
+            "broadcast_to",
         )?;
         Self::wrap(out)
     }

@@ -389,6 +389,7 @@ fn downsample(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array>
 /// Returns the block output and the skip entries it contributes, in the order
 /// `golden_unet.rs` expects them — one per resnet(+attention) pair, then one
 /// for the downsampler.
+#[allow(clippy::too_many_arguments)]
 pub fn down_block(
     x: &Array,
     temb: &Array,
@@ -474,4 +475,148 @@ pub fn down_pass(
         skips.append(&mut block_skips);
     }
     Ok((h, skips))
+}
+
+/// Nearest-neighbour 2x upsample over NHWC, then diffusers' 3x3 convolution.
+///
+/// MLX has no upsample op, so the doubling is `broadcast_to` between two
+/// reshapes: `[n,h,w,c]` -> `[n,h,1,w,1,c]` -> `[n,h,2,w,2,c]` -> `[n,2h,2w,c]`.
+/// That is nearest by construction — each source pixel is copied into a 2x2
+/// block — rather than by asking for an interpolation mode and hoping it is the
+/// one diffusers used.
+fn upsample(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
+    let [n, h, wd, c] = x.shape()[..] else {
+        return Err(Error::Msg(format!("mlx: upsample got {:?}", x.shape())));
+    };
+    let doubled = x
+        .reshape(&[n, h, 1, wd, 1, c], s)?
+        .broadcast_to(&[n, h, 2, wd, 2, c], s)?
+        .contiguous(s)?
+        .reshape(&[n, h * 2, wd * 2, c], s)?;
+    conv(
+        &doubled,
+        get(w, &format!("{prefix}.conv.weight"))?,
+        Some(get(w, &format!("{prefix}.conv.bias"))?),
+        1,
+        s,
+    )
+}
+
+/// The mid block: resnet, transformer, resnet.
+pub fn mid_block(
+    x: &Array,
+    temb: &Array,
+    context: &Array,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
+    let h = resnet_block(x, temb, w, "mid_block.resnets.0", s)?;
+    let h = transformer_2d(&h, context, 8, 1, w, "mid_block.attentions.0", s)?;
+    resnet_block(&h, temb, w, "mid_block.resnets.1", s)
+}
+
+/// One up block: `layers` resnets, each fed the concatenation of the running
+/// activation with a skip popped from the stack, then an optional upsampler.
+#[allow(clippy::too_many_arguments)]
+pub fn up_block(
+    x: &Array,
+    temb: &Array,
+    context: &Array,
+    skips: &mut Vec<Array>,
+    w: &Weights,
+    prefix: &str,
+    layers: usize,
+    heads: Option<usize>,
+    has_upsample: bool,
+    s: &Stream,
+) -> Result<Array> {
+    let mut h = x.contiguous(s)?;
+    for i in 0..layers {
+        let skip = skips.pop().ok_or_else(|| {
+            Error::Msg("mlx: the up pass ran out of skips; the stack is the wrong depth".into())
+        })?;
+        // Channels last, so the join is on the last axis rather than dim 1.
+        h = sd_tensor::mlx::concat(&[&h, &skip], 3, s)?;
+        h = resnet_block(&h, temb, w, &format!("{prefix}.resnets.{i}"), s)?;
+        if let Some(heads) = heads {
+            h = transformer_2d(
+                &h,
+                context,
+                heads,
+                1,
+                w,
+                &format!("{prefix}.attentions.{i}"),
+                s,
+            )?;
+        }
+    }
+    if has_upsample {
+        h = upsample(&h, w, &format!("{prefix}.upsamplers.0"), s)?;
+    }
+    Ok(h)
+}
+
+/// SD 1.5's UNet, end to end, in NHWC.
+///
+/// `sample_nhwc` is `[n, h, w, 4]` and the result is `[n, h, w, 4]`. Callers
+/// holding diffusers' NCHW transpose on the way in and out.
+pub fn unet_forward(
+    sample_nhwc: &Array,
+    timestep: &Array,
+    context: &Array,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
+    let temb = timestep_embedding(timestep, 320, w, s)?;
+    let (h, mut skips) = down_pass(sample_nhwc, &temb, context, w, s)?;
+    let mut h = mid_block(&h, &temb, context, w, s)?;
+
+    // UpBlock2D first, then three CrossAttnUpBlock2D — the reverse of the down
+    // pass, and the deepest block is the one without attention. Three resnets
+    // each, one more than the down side, because the extra one consumes
+    // conv_in's skip at the end.
+    for (i, (heads, has_up)) in [
+        (None, true),
+        (Some(8), true),
+        (Some(8), true),
+        (Some(8), false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        h = up_block(
+            &h,
+            &temb,
+            context,
+            &mut skips,
+            w,
+            &format!("up_blocks.{i}"),
+            3,
+            heads,
+            has_up,
+            s,
+        )?;
+    }
+    if !skips.is_empty() {
+        return Err(Error::Msg(format!(
+            "mlx: the up pass left {} skips unconsumed",
+            skips.len()
+        )));
+    }
+
+    let h = h.group_norm(
+        NORM_GROUPS,
+        RESNET_EPS,
+        Some(get(w, "conv_norm_out.weight")?),
+        Some(get(w, "conv_norm_out.bias")?),
+        s,
+    )?;
+    let h = h.silu(s)?;
+    conv(
+        &h,
+        get(w, "conv_out.weight")?,
+        Some(get(w, "conv_out.bias")?),
+        1,
+        s,
+    )
 }
