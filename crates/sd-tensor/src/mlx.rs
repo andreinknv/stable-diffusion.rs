@@ -59,8 +59,12 @@ const MLX_FLOAT32: i32 = 10;
 #[link(name = "mlxc")]
 unsafe extern "C" {
     // lifecycle and inspection
-    fn mlx_array_new_data(data: *const c_void, shape: *const i32, dim: i32, dtype: i32)
-        -> mlx_array;
+    fn mlx_array_new_data(
+        data: *const c_void,
+        shape: *const i32,
+        dim: i32,
+        dtype: i32,
+    ) -> mlx_array;
     fn mlx_array_new_float32(val: f32) -> mlx_array;
     fn mlx_array_free(arr: mlx_array) -> i32;
     fn mlx_array_size(arr: mlx_array) -> usize;
@@ -101,6 +105,53 @@ unsafe extern "C" {
         s: mlx_stream,
     ) -> i32;
     fn _mlx_array_is_contiguous(res: *mut bool, arr: mlx_array) -> i32;
+    fn mlx_concatenate_axis(
+        res: *mut mlx_array,
+        arrays: mlx_vector_array,
+        axis: i32,
+        s: mlx_stream,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn mlx_slice(
+        res: *mut mlx_array,
+        a: mlx_array,
+        start: *const i32,
+        start_num: usize,
+        stop: *const i32,
+        stop_num: usize,
+        strides: *const i32,
+        strides_num: usize,
+        s: mlx_stream,
+    ) -> i32;
+    fn mlx_vector_array_new_data(data: *const mlx_array, size: usize) -> mlx_vector_array;
+
+    fn mlx_tanh(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
+    fn mlx_exp(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
+    fn mlx_cos(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
+    fn mlx_sin(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
+    fn mlx_log(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
+    fn mlx_rsqrt(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
+
+    fn mlx_fast_layer_norm(
+        res: *mut mlx_array,
+        x: mlx_array,
+        weight: mlx_array,
+        bias: mlx_array,
+        eps: f32,
+        s: mlx_stream,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn mlx_fast_scaled_dot_product_attention(
+        res: *mut mlx_array,
+        queries: mlx_array,
+        keys: mlx_array,
+        values: mlx_array,
+        scale: f32,
+        mask_mode: *const c_char,
+        mask_arr: mlx_array,
+        sinks: mlx_array,
+        s: mlx_stream,
+    ) -> i32;
 
     // linear algebra and reductions
     fn mlx_matmul(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> i32;
@@ -177,7 +228,9 @@ unsafe extern "C" fn error_handler(msg: *const c_char, _data: *mut c_void) {
     let text = if msg.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(msg) }
+            .to_string_lossy()
+            .into_owned()
     };
     LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(text));
 }
@@ -394,15 +447,30 @@ impl Array {
         keepdims: bool,
         stream: &Stream,
         what: &str,
-        f: unsafe extern "C" fn(*mut mlx_array, mlx_array, *const i32, usize, bool, mlx_stream)
-            -> i32,
+        f: unsafe extern "C" fn(
+            *mut mlx_array,
+            mlx_array,
+            *const i32,
+            usize,
+            bool,
+            mlx_stream,
+        ) -> i32,
     ) -> Result<Self> {
         let ax: Vec<i32> = axes.iter().map(|&d| d as i32).collect();
         let mut out = mlx_array {
             ctx: std::ptr::null_mut(),
         };
         check(
-            unsafe { f(&mut out, self.raw, ax.as_ptr(), ax.len(), keepdims, stream.0) },
+            unsafe {
+                f(
+                    &mut out,
+                    self.raw,
+                    ax.as_ptr(),
+                    ax.len(),
+                    keepdims,
+                    stream.0,
+                )
+            },
             what,
         )?;
         Self::wrap(out)
@@ -532,10 +600,10 @@ impl Array {
         let mean = grouped.mean(&[1, 3], true, stream)?;
         let centred = grouped.sub(&mean, stream)?;
         let var = centred.mul(&centred, stream)?.mean(&[1, 3], true, stream)?;
-        let denom = var
-            .add(&Self::scalar_f32(eps)?, stream)?
-            .sqrt(stream)?;
-        let normed = centred.div(&denom, stream)?.reshape(&[n, h, w, c], stream)?;
+        let denom = var.add(&Self::scalar_f32(eps)?, stream)?.sqrt(stream)?;
+        let normed = centred
+            .div(&denom, stream)?
+            .reshape(&[n, h, w, c], stream)?;
 
         let scaled = match weight {
             Some(g) => normed.mul(g, stream)?,
@@ -567,6 +635,164 @@ impl Array {
         check(
             unsafe { mlx_astype(&mut out, self.raw, MLX_FLOAT32, stream.0) },
             "astype f32",
+        )?;
+        Self::wrap(out)
+    }
+
+    pub fn tanh(&self, stream: &Stream) -> Result<Self> {
+        self.unary(stream, "tanh", mlx_tanh)
+    }
+
+    pub fn exp(&self, stream: &Stream) -> Result<Self> {
+        self.unary(stream, "exp", mlx_exp)
+    }
+
+    pub fn cos(&self, stream: &Stream) -> Result<Self> {
+        self.unary(stream, "cos", mlx_cos)
+    }
+
+    pub fn sin(&self, stream: &Stream) -> Result<Self> {
+        self.unary(stream, "sin", mlx_sin)
+    }
+
+    pub fn log(&self, stream: &Stream) -> Result<Self> {
+        self.unary(stream, "log", mlx_log)
+    }
+
+    pub fn rsqrt(&self, stream: &Stream) -> Result<Self> {
+        self.unary(stream, "rsqrt", mlx_rsqrt)
+    }
+
+    /// Exact GELU, `0.5 * x * (1 + erf(x / sqrt(2)))`.
+    ///
+    /// The erf form, not the tanh approximation, because diffusers' `GEGLU`
+    /// uses `F.gelu` and the golden tests are held to diffusers.
+    ///
+    /// **Watch the left tail.** `docs/handoff.md` records candle's `gelu_erf`
+    /// returning *exactly zero* below about -6, because forming `1 + erf(u)` by
+    /// subtraction rounds the tail away where the truth is -5.9e-9. This has
+    /// the same shape and the same exposure; `gelu_left_tail_is_not_flat`
+    /// measures it rather than assuming either way.
+    pub fn gelu(&self, stream: &Stream) -> Result<Self> {
+        let inv_sqrt2 = Self::scalar_f32(std::f32::consts::FRAC_1_SQRT_2)?;
+        let one = Self::scalar_f32(1.0)?;
+        let half = Self::scalar_f32(0.5)?;
+        let e = self.mul(&inv_sqrt2, stream)?.erf(stream)?;
+        self.mul(&half, stream)?.mul(&e.add(&one, stream)?, stream)
+    }
+
+    /// Layer normalisation over the last axis, via MLX's fused kernel.
+    ///
+    /// `weight` and `bias` are optional; `None` means no affine term.
+    pub fn layer_norm(
+        &self,
+        weight: Option<&Self>,
+        bias: Option<&Self>,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<Self> {
+        let null = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        let mut out = null;
+        check(
+            unsafe {
+                mlx_fast_layer_norm(
+                    &mut out,
+                    self.raw,
+                    weight.map_or(null, |w| w.raw),
+                    bias.map_or(null, |b| b.raw),
+                    eps,
+                    stream.0,
+                )
+            },
+            "layer_norm",
+        )?;
+        Self::wrap(out)
+    }
+
+    /// Scaled dot-product attention over `[batch, heads, seq, head_dim]`.
+    ///
+    /// `scale` is applied to the query before the product, as diffusers does.
+    /// Unmasked — the UNet's transformer attends over everything, which is the
+    /// same assumption `unet/attention.rs` makes on the candle path.
+    pub fn sdpa(&self, keys: &Self, values: &Self, scale: f32, stream: &Stream) -> Result<Self> {
+        let null = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        let mut out = null;
+        check(
+            unsafe {
+                mlx_fast_scaled_dot_product_attention(
+                    &mut out,
+                    self.raw,
+                    keys.raw,
+                    values.raw,
+                    scale,
+                    // Empty string is "unmasked". Not NULL — mlx-c reads this
+                    // pointer and a null one segfaults rather than meaning no
+                    // mask; and not "none", which it rejects: the accepted
+                    // values are 'causal', 'array' or ''.
+                    c"".as_ptr(),
+                    null,
+                    null,
+                    stream.0,
+                )
+            },
+            "sdpa",
+        )?;
+        Self::wrap(out)
+    }
+
+    /// Take `len` entries along `axis`, starting at `start` — candle's `narrow`.
+    pub fn narrow(&self, axis: usize, start: usize, len: usize, stream: &Stream) -> Result<Self> {
+        let shape = self.shape();
+        if axis >= shape.len() {
+            return Err(Error::Msg(format!(
+                "mlx: narrow axis {axis} out of range for {shape:?}"
+            )));
+        }
+        if start + len > shape[axis] {
+            return Err(Error::Msg(format!(
+                "mlx: narrow {start}..{} exceeds dim {axis} of {shape:?}",
+                start + len
+            )));
+        }
+        let starts: Vec<i32> = shape
+            .iter()
+            .enumerate()
+            .map(|(i, _)| if i == axis { start as i32 } else { 0 })
+            .collect();
+        let stops: Vec<i32> = shape
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| {
+                if i == axis {
+                    (start + len) as i32
+                } else {
+                    d as i32
+                }
+            })
+            .collect();
+        let strides: Vec<i32> = vec![1; shape.len()];
+        let mut out = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        check(
+            unsafe {
+                mlx_slice(
+                    &mut out,
+                    self.raw,
+                    starts.as_ptr(),
+                    starts.len(),
+                    stops.as_ptr(),
+                    stops.len(),
+                    strides.as_ptr(),
+                    strides.len(),
+                    stream.0,
+                )
+            },
+            "narrow",
         )?;
         Self::wrap(out)
     }
@@ -636,6 +862,24 @@ impl fmt::Debug for Array {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "mlx::Array{:?}", self.shape())
     }
+}
+
+/// Join `arrays` along `axis` — candle's `Tensor::cat`, and how the UNet's up
+/// pass rejoins its skip connections.
+pub fn concat(arrays: &[&Array], axis: usize, stream: &Stream) -> Result<Array> {
+    if arrays.is_empty() {
+        return Err(Error::Msg("mlx: concat needs at least one array".into()));
+    }
+    init();
+    let raws: Vec<mlx_array> = arrays.iter().map(|a| a.raw).collect();
+    let vec = unsafe { mlx_vector_array_new_data(raws.as_ptr(), raws.len()) };
+    let mut out = mlx_array {
+        ctx: std::ptr::null_mut(),
+    };
+    let status = unsafe { mlx_concatenate_axis(&mut out, vec, axis as i32, stream.0) };
+    unsafe { mlx_vector_array_free(vec) };
+    check(status, "concat")?;
+    Array::wrap(out)
 }
 
 /// Evaluate `arrays`, running everything their graphs depend on.

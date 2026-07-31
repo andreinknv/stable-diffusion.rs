@@ -376,3 +376,207 @@ fn index_op_is_still_candles() {
     let t = Tensor::from_vec(ramp(6, 1.0, 0.0), &[2, 3], &Device::Cpu).unwrap();
     assert_eq!(t.i(0).unwrap().dims(), &[3]);
 }
+
+// -- second op batch: what the UNet census said it needs -------------------
+
+#[test]
+fn unary_transcendentals_match_candle() {
+    let n = 48;
+    let a = ramp(n, 2.0, 0.05); // stays clear of log/sqrt domain edges
+    let s = Stream::gpu();
+    let m = Array::from_slice_f32(&a, &[n]).unwrap();
+    let c = Tensor::from_vec(a.clone(), &[n], &Device::Cpu).unwrap();
+
+    for (name, got, want) in [
+        ("tanh", m.tanh(&s).unwrap(), c.tanh().unwrap()),
+        ("exp", m.exp(&s).unwrap(), c.exp().unwrap()),
+        ("cos", m.cos(&s).unwrap(), c.cos().unwrap()),
+        ("sin", m.sin(&s).unwrap(), c.sin().unwrap()),
+    ] {
+        assert_close(&got.to_vec_f32(&s).unwrap(), &candle_vec(&want), TOL, name);
+    }
+
+    // log and rsqrt need strictly positive input.
+    let pos: Vec<f32> = (1..=n).map(|i| i as f32 * 0.25).collect();
+    let mp = Array::from_slice_f32(&pos, &[n]).unwrap();
+    let cp = Tensor::from_vec(pos, &[n], &Device::Cpu).unwrap();
+    assert_close(
+        &mp.log(&s).unwrap().to_vec_f32(&s).unwrap(),
+        &candle_vec(&cp.log().unwrap()),
+        TOL,
+        "log",
+    );
+    assert_close(
+        &mp.rsqrt(&s).unwrap().to_vec_f32(&s).unwrap(),
+        &candle_vec(&cp.powf(-0.5).unwrap()),
+        1e-4,
+        "rsqrt",
+    );
+}
+
+#[test]
+fn gelu_matches_candle() {
+    let n = 96;
+    let a = ramp(n, 5.0, 0.0);
+    let s = Stream::gpu();
+    let got = Array::from_slice_f32(&a, &[n])
+        .unwrap()
+        .gelu(&s)
+        .unwrap()
+        .to_vec_f32(&s)
+        .unwrap();
+    let c = Tensor::from_vec(a, &[n], &Device::Cpu).unwrap();
+    assert_close(&got, &candle_vec(&c.gelu_erf().unwrap()), 1e-5, "gelu");
+}
+
+/// **Measured, and it does inherit it.** `docs/handoff.md` records candle's
+/// `gelu_erf` returning *exactly zero* below about -6 where the truth is
+/// -5.9e-9, because `1 + erf(u)` rounds the tail away by subtraction. MLX's
+/// erf has the same formulation and the same collapse, so this is parity with
+/// candle rather than a regression — but it is also a gap against the fused
+/// kernel this project already wrote, which reads `erfc` off the same
+/// polynomial and keeps the tail.
+///
+/// `mlx-c` exposes no `erfc`, so closing it means a custom op. Until then this
+/// test pins the behaviour: it fails if either side changes, rather than
+/// leaving the question to be rediscovered.
+#[test]
+fn gelu_left_tail_collapses_exactly_as_candles_does() {
+    let xs: Vec<f32> = vec![-6.0, -7.0, -8.0, -9.0, -10.0];
+    let s = Stream::gpu();
+    let got = Array::from_slice_f32(&xs, &[xs.len()])
+        .unwrap()
+        .gelu(&s)
+        .unwrap()
+        .to_vec_f32(&s)
+        .unwrap();
+    let candle = candle_vec(
+        &Tensor::from_vec(xs.clone(), &[xs.len()], &Device::Cpu)
+            .unwrap()
+            .gelu_erf()
+            .unwrap(),
+    );
+    // Truth at -6 is about -5.9e-9 and shrinks from there; the failure mode is
+    // a hard zero, so that is what is asserted against.
+    for (i, x) in xs.iter().enumerate() {
+        eprintln!(
+            "x={x:>6}  mlx {:>12.4e}  candle {:>12.4e}",
+            got[i], candle[i]
+        );
+    }
+    for (i, x) in xs.iter().enumerate() {
+        assert_eq!(
+            got[i], candle[i],
+            "x={x}: MLX and candle must agree on the tail; they both collapse to zero"
+        );
+        assert_eq!(got[i], 0.0, "x={x}: the collapse is what is being pinned");
+    }
+}
+
+#[test]
+fn layer_norm_matches_candle() {
+    let (rows, cols) = (4usize, 32usize);
+    let a = ramp(rows * cols, 3.0, 1.0);
+    let g = ramp(cols, 0.5, 1.0);
+    let b = ramp(cols, 0.2, 0.0);
+    let s = Stream::gpu();
+    let dev = Device::Cpu;
+
+    let got = Array::from_slice_f32(&a, &[rows, cols])
+        .unwrap()
+        .layer_norm(
+            Some(&Array::from_slice_f32(&g, &[cols]).unwrap()),
+            Some(&Array::from_slice_f32(&b, &[cols]).unwrap()),
+            1e-5,
+            &s,
+        )
+        .unwrap();
+
+    // The arithmetic directly: candle's LayerNorm wants a VarBuilder for the
+    // affine params, and this is the expression golden_unet holds to diffusers.
+    let ca = Tensor::from_vec(a, &[rows, cols], &dev).unwrap();
+    let mean = ca.mean_keepdim(1).unwrap();
+    let d = ca.broadcast_sub(&mean).unwrap();
+    let var = (&d * &d).unwrap().mean_keepdim(1).unwrap();
+    let want = d
+        .broadcast_div(&(var + 1e-5).unwrap().sqrt().unwrap())
+        .unwrap()
+        .broadcast_mul(&Tensor::from_vec(g, &[cols], &dev).unwrap())
+        .unwrap()
+        .broadcast_add(&Tensor::from_vec(b, &[cols], &dev).unwrap())
+        .unwrap();
+
+    assert_close(
+        &got.to_vec_f32(&s).unwrap(),
+        &candle_vec(&want),
+        1e-4,
+        "layer_norm",
+    );
+}
+
+#[test]
+fn concat_and_narrow_match_candle() {
+    let s = Stream::gpu();
+    let dev = Device::Cpu;
+    let (a, b) = (ramp(12, 2.0, 0.0), ramp(8, 1.0, 2.0));
+
+    let ma = Array::from_slice_f32(&a, &[3, 4]).unwrap();
+    let mb = Array::from_slice_f32(&b, &[2, 4]).unwrap();
+    let joined = sd_tensor::mlx::concat(&[&ma, &mb], 0, &s).unwrap();
+    assert_eq!(joined.shape(), vec![5, 4]);
+
+    let ca = Tensor::from_vec(a, &[3, 4], &dev).unwrap();
+    let cb = Tensor::from_vec(b, &[2, 4], &dev).unwrap();
+    let want = Tensor::cat(&[&ca, &cb], 0).unwrap();
+    assert_close(
+        &joined.to_vec_f32(&s).unwrap(),
+        &candle_vec(&want),
+        0.0,
+        "concat",
+    );
+
+    let cut = joined.narrow(0, 1, 3, &s).unwrap();
+    assert_eq!(cut.shape(), vec![3, 4]);
+    assert_close(
+        &cut.to_vec_f32(&s).unwrap(),
+        &candle_vec(&want.narrow(0, 1, 3).unwrap()),
+        0.0,
+        "narrow",
+    );
+
+    assert!(joined.narrow(0, 4, 3, &s).is_err(), "past the end");
+    assert!(joined.narrow(9, 0, 1, &s).is_err(), "bad axis");
+}
+
+#[test]
+fn sdpa_matches_candles_attention() {
+    let (b, h, sq, hd) = (1usize, 2usize, 6usize, 8usize);
+    let n = b * h * sq * hd;
+    let (q, k, v) = (ramp(n, 1.0, 0.0), ramp(n, 0.8, 0.2), ramp(n, 1.2, -0.1));
+    let s = Stream::gpu();
+    let dev = Device::Cpu;
+    let shape = [b, h, sq, hd];
+
+    let got = Array::from_slice_f32(&q, &shape)
+        .unwrap()
+        .sdpa(
+            &Array::from_slice_f32(&k, &shape).unwrap(),
+            &Array::from_slice_f32(&v, &shape).unwrap(),
+            1.0 / (hd as f32).sqrt(),
+            &s,
+        )
+        .unwrap();
+    assert_eq!(got.shape(), shape.to_vec());
+
+    let cq = Tensor::from_vec(q, shape.as_slice(), &dev).unwrap();
+    let ck = Tensor::from_vec(k, shape.as_slice(), &dev).unwrap();
+    let cv = Tensor::from_vec(v, shape.as_slice(), &dev).unwrap();
+    let want = sd_tensor::ops::scaled_dot_product_attention(&cq, &ck, &cv).unwrap();
+
+    assert_close(
+        &got.to_vec_f32(&s).unwrap(),
+        &candle_vec(&want),
+        1e-5,
+        "sdpa",
+    );
+}
