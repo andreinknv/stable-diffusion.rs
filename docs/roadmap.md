@@ -589,8 +589,38 @@ In rough order of cost, cheapest first:
   which is far too small to look like a broken port and far too large to be
   right. Fixing that one swap took it to 2.936e-6.
 
-  What remains for a running pipeline: the FLUX.2 VAE (32 latent channels,
-  patch size 1 over 128 input channels) and the plumbing.
+  **It runs.** `sdrs flux2 --variant klein-4b`, 512x512 in 13.8 s at 6.67 GB
+  resident against 15.8 GB of bf16 weights — `assets/flux2-klein-crab.png`.
+
+  The VAE turned out to be our existing one: same block structure, same
+  `[128, 256, 512, 512]`, and only the latent channel count differs (32
+  against Flux.1's 16). What is new sits either side of it — **two different
+  2x2 operations**, since the VAE's `patch_size` folds 32 channels into the
+  128 the transformer takes while the transformer's own `patch_size` is 1 and
+  folds nothing, and a **BatchNorm** where every other model here has a scalar
+  `scaling_factor`.
+
+  **The golden tests passed while the pipeline produced coloured mush**, which
+  is the lesson worth keeping. The transformer was right to 2.9e-6 and the
+  latent patching exact; everything wrong lived in the glue:
+
+  - **Text position ids were all zero.** Image tokens use axes 1 and 2 of the
+    four; text tokens carry the token index in axis **3**. Zeroed, every word
+    shared one position — word order erased. The palette still followed the
+    prompt, so it read as a sampling problem rather than a positional one.
+  - **The prompt was not in a conversation.** The encoder is instruction tuned
+    and the checkpoint learned to read prompts inside FLUX.2's own system
+    message and Qwen's ChatML wrapper. Bare, it renders soft and painterly.
+  - **Padding repeated the last real token** rather than the pad token, so a
+    sixteen-word prompt ended with its final word four hundred times.
+
+  None of the three is an error at any layer, and no component test could have
+  caught them. `mlx_flux2_end_to_end` exists for that reason and says so.
+
+  One more thing the run found: `quantized::indexed` did not know an LLM's
+  vocabulary table. `model.embed_tokens.weight` is reached by `take`, one row
+  per token, not by a matmul — quantising it is both wrong and the largest
+  dequantisation in the model for no gain.
 - **The video models** are the largest by a wide margin: a temporal axis
   through every block, a 3D VAE, and memory characteristics this machine has
   not been asked for before.

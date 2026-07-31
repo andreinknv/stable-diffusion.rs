@@ -364,6 +364,39 @@ enum Command {
         output: String,
     },
 
+    /// Generate with FLUX.2 — klein or dev.
+    ///
+    /// **A different model from `flux`, not a variant.** Its text encoder is
+    /// Qwen3 rather than T5 and CLIP, its latents are 32 channels folded into
+    /// 128, and its conditioning is three of the encoder's hidden layers
+    /// concatenated.
+    Flux2 {
+        /// A `diffusers` FLUX.2 directory.
+        #[arg(long)]
+        model: String,
+        /// `klein-4b` or `dev`.
+        #[arg(long, default_value = "klein-4b")]
+        variant: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 1024)]
+        width: usize,
+        #[arg(long, default_value_t = 1024)]
+        height: usize,
+        #[arg(long, default_value_t = 4)]
+        steps: usize,
+        /// Distilled guidance. **dev only** — the klein releases are distilled
+        /// and refuse it.
+        #[arg(long, default_value_t = 4.0)]
+        guidance: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, default_value_t = 4)]
+        bits: usize,
+        #[arg(short, long, default_value = "out.png")]
+        output: String,
+    },
+
     /// Generate with SD 3.5.
     ///
     /// Quantised at rest, like `flux`: SD 3.5 medium plus T5-XXL is 10.1 GB
@@ -658,6 +691,26 @@ fn main() -> Result<()> {
                 output,
             };
             for path in mlx_cli::run_flux(&args, device)? {
+                println!("wrote {}", path.display());
+            }
+        }
+
+        Command::Flux2 {
+            model,
+            variant,
+            prompt,
+            width,
+            height,
+            steps,
+            guidance,
+            seed,
+            bits,
+            output,
+        } => {
+            for path in mlx_cli::run_flux2(
+                &model, &variant, prompt, width, height, steps, guidance, seed, bits, &output,
+                device,
+            )? {
                 println!("wrote {}", path.display());
             }
         }

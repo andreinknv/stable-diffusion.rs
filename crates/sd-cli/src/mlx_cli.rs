@@ -630,6 +630,51 @@ impl FluxRunDefaults {
     const GUIDANCE: f64 = 3.5;
 }
 
+/// Run FLUX.2.
+#[allow(clippy::too_many_arguments)]
+pub fn run_flux2(
+    model: &str,
+    variant: &str,
+    prompt: String,
+    width: usize,
+    height: usize,
+    steps: usize,
+    guidance: f64,
+    seed: u64,
+    bits: usize,
+    output: &str,
+    device: Device,
+) -> Result<Vec<PathBuf>> {
+    use stable_diffusion_rs::mlx::{Flux2Pipeline, Flux2RunConfig};
+    use stable_diffusion_rs::models::mlx::flux2::Flux2Config;
+
+    let cfg = match variant {
+        "klein-4b" | "klein" => Flux2Config::klein_4b(),
+        "dev" => Flux2Config::dev(),
+        other => bail!("unknown FLUX.2 variant {other:?}; try klein-4b or dev"),
+    };
+    // The klein releases are distilled and carry no guidance embedder, so a
+    // scale is refused rather than silently ignored.
+    if !cfg.guidance_embed && guidance != 4.0 {
+        bail!(
+            "--guidance {guidance} was given, but {variant} is distilled and has no guidance \
+             embedder. Drop the flag, or use --variant dev"
+        );
+    }
+    eprintln!("loading FLUX.2 {variant} at {bits} bits");
+    let pipe = Flux2Pipeline::load_quantized(Path::new(model), cfg, bits, device)?;
+    report_memory();
+    let (w, h, bytes) = pipe.txt2img(&Flux2RunConfig {
+        prompt,
+        width,
+        height,
+        steps,
+        guidance,
+        seed,
+    })?;
+    write_images(output, w, h, &bytes, None, None)
+}
+
 /// Everything the `sd3` command carries.
 pub struct Sd3Args {
     pub model: String,

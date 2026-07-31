@@ -16,6 +16,7 @@ sd-tensor.workspace = true
 sd-loader.workspace = true
 sd-models.workspace = true
 sd-sample.workspace = true
+tokenizers.workspace = true
 thiserror.workspace = true
 image.workspace = true
 

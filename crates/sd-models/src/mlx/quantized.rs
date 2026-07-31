@@ -141,6 +141,14 @@ pub fn indexed(name: &str) -> bool {
         // ships already flattened to 2-D, which is exactly the shape that
         // would otherwise be quantised.
         || name == "x_embedder.proj.weight"
+        // An LLM text encoder's vocabulary table — Qwen, Mistral, Llama. It is
+        // reached by `take`, one row per token, not by a matmul: 152,064 rows
+        // of which a prompt touches a few hundred. Quantising it would also
+        // make it the largest single dequantisation in the model for no gain.
+        || name == "model.embed_tokens.weight"
+        // ...and its output head, which these encoders never run. Left dense so
+        // that loading one does not spend time packing a tensor nothing reads.
+        || name == "lm_head.weight"
 }
 
 /// The default policy: [`indexed`] tensors dense, [`sensitive`] layers at 8

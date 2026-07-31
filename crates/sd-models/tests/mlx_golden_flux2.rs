@@ -160,3 +160,58 @@ fn the_rotary_embedding_takes_four_axes() {
     assert_eq!(&ids[..4], &[0.0, 0.0, 0.0, 0.0]);
     assert_eq!(&ids[4..8], &[0.0, 0.0, 1.0, 0.0], "second token is (0, 1)");
 }
+
+/// **The latent plumbing: two different 2x2 operations and a flatten.**
+///
+/// `patchify` folds the VAE's 32 channels into the 128 the transformer takes;
+/// `pack` flattens the grid into tokens and folds nothing, because FLUX.2's
+/// `patch_size` is 1. Doing the first twice, or the second as if it were the
+/// first, gives a latent of exactly the right shape and the wrong content.
+///
+/// Pinned against `diffusers` rather than against its own inverse: a
+/// round-trip test passes for a *pair* of wrong permutations, which is how
+/// SD 3.5's unpatchify got through here once already.
+#[test]
+fn the_latent_patching_matches_diffusers() {
+    let Some((refs, _)) = fixtures() else {
+        sd_tensor::skip_missing_fixture!("SKIP: no flux2 fixture.");
+        return;
+    };
+    let s = Stream::gpu();
+    let latent = refs.get("latent_nchw").expect("latent_nchw");
+    assert_eq!(latent.shape(), vec![1, 32, 8, 6]);
+
+    let patched = flux2::patchify_latents(latent, &s).expect("patchify");
+    let want = refs.get("latent_patchified").expect("latent_patchified");
+    assert_eq!(patched.shape(), want.shape(), "patchified shape");
+    assert_eq!(
+        flat(&patched, &s),
+        flat(want, &s),
+        "patchify disagrees with diffusers"
+    );
+
+    let packed = flux2::pack_latents(&patched, &s).expect("pack");
+    let want = refs.get("latent_packed").expect("latent_packed");
+    assert_eq!(packed.shape(), want.shape(), "packed shape");
+    assert_eq!(flat(&packed, &s), flat(want, &s), "pack disagrees");
+
+    let unpatched = flux2::unpatchify_latents(&patched, &s).expect("unpatchify");
+    let want = refs
+        .get("latent_unpatchified")
+        .expect("latent_unpatchified");
+    assert_eq!(unpatched.shape(), want.shape(), "unpatchified shape");
+    assert_eq!(flat(&unpatched, &s), flat(want, &s), "unpatchify disagrees");
+
+    // And the round trips do close, which the above does not by itself imply.
+    let back = flux2::unpack_latents(&packed, 4, 3, &s).expect("unpack");
+    assert_eq!(
+        flat(&back, &s),
+        flat(&patched, &s),
+        "pack/unpack round trip"
+    );
+    assert_eq!(
+        flat(&flux2::patchify_latents(&unpatched, &s).unwrap(), &s),
+        flat(&patched, &s),
+        "patchify/unpatchify round trip"
+    );
+}

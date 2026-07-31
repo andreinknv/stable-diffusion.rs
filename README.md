@@ -6,9 +6,9 @@ A ground-up Rust implementation: no cmake, no git submodules, no vendored
 inference engine. One system library — MLX, installed with `brew install
 mlx-c` — and then `cargo build`.
 
-> **Status: it renders.** Seven architectures — Stable Diffusion 1.5, 2.x,
-> SDXL, SD 3.5, Flux (schnell/dev), FLUX.1-Kontext, and unCLIP — on Apple GPU
-> via MLX, with
+> **Status: it renders.** Eight architectures — Stable Diffusion 1.5, 2.x,
+> SDXL, SD 3.5, Flux (schnell/dev), FLUX.1-Kontext, FLUX.2, and unCLIP — on
+> Apple GPU via MLX, with
 > img2img, inpainting, ControlNet, LoRA, IP-Adapter, GLIGEN, textual
 > inversion, AnimateDiff clips, region prompts, two-pass hires, step caching
 > and 4x upscaling. Every model component is verified tensor-by-tensor
@@ -30,6 +30,7 @@ anyway:
 | model | resident | dense f32 |
 |---|---|---|
 | Flux schnell + T5-XXL | **13.3 GB** | 66 GB |
+| FLUX.2 klein-4B + Qwen3 | **6.7 GB** | 15.8 GB (bf16) |
 | SD 3.5 medium + T5-XXL | **10.1 GB** | ~40 GB |
 | SDXL | 10.3 GB | 10.3 GB |
 
@@ -147,6 +148,10 @@ sdrs instruct --model models/instruct-pix2pix --init photo.png \
 sdrs flux --model models/flux --variant schnell \
   --transformer-gguf flux1-schnell-Q4_K_S.gguf --t5-gguf t5xxl-Q4_K_S.gguf \
   --prompt "a rusty crab on a beach at sunset" -o out.png
+
+# FLUX.2 — a Qwen3 text encoder, quantised at rest
+sdrs flux2 --model models/flux2-klein --variant klein-4b \
+  --prompt "a rusty crab on a beach at sunset" --steps 4 -o out.png
 
 # SD 3.5, with skip-layer guidance for anatomy
 sdrs sd3 --model models/sd35 --prompt "a lighthouse at dusk" \

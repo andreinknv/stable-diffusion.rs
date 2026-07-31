@@ -884,6 +884,7 @@ dependencies = [
  "sd-sample",
  "sd-tensor",
  "thiserror",
+ "tokenizers",
 ]
 
 [[package]]

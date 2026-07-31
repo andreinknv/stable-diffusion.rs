@@ -41,10 +41,12 @@ use crate::pipeline::{
 };
 
 pub mod flux;
+pub mod flux2;
 pub mod sd3;
 pub mod sdxl;
 
 pub use flux::{FluxPaths, FluxPipeline, FluxRunConfig};
+pub use flux2::{Flux2Paths, Flux2Pipeline, Flux2RunConfig};
 pub use sd3::{Sd3Paths, Sd3Pipeline, Sd3RunConfig, SkipLayerGuidance};
 pub use sdxl::SdxlPipeline;
 

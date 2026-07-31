@@ -40,7 +40,7 @@
 use sd_tensor::mlx::{Array, Stream};
 use sd_tensor::{Error, Result};
 
-use super::{get, linear, Weights};
+use super::quantized::WeightSource;
 
 /// Geometry of a decoder used as a text encoder.
 #[derive(Debug, Clone)]
@@ -209,7 +209,7 @@ fn expand_kv(x: &Array, group: usize, s: &Stream) -> Result<Array> {
 fn layer(
     x: &Array,
     cfg: &LlmConfig,
-    w: &Weights,
+    w: &impl WeightSource,
     prefix: &str,
     cos: &Array,
     sin: &Array,
@@ -220,14 +220,14 @@ fn layer(
         return Err(Error::Msg(format!("mlx: llm layer got {:?}", x.shape())));
     };
 
-    let h = x.rms_norm(Some(get(w, &p("input_layernorm.weight"))?), cfg.rms_eps, s)?;
+    let h = x.rms_norm(Some(w.dense(&p("input_layernorm.weight"))?), cfg.rms_eps, s)?;
 
     let project = |name: &str| -> Result<Array> {
-        linear(
+        w.linear(
             &h,
-            get(w, &p(&format!("self_attn.{name}.weight")))?,
+            &p(&format!("self_attn.{name}.weight")),
             cfg.qkv_bias
-                .then(|| w.get(&p(&format!("self_attn.{name}.bias"))))
+                .then(|| w.optional(&p(&format!("self_attn.{name}.bias"))))
                 .flatten(),
             s,
         )
@@ -246,8 +246,16 @@ fn layer(
     // `[head_dim]`, so applying them to the flat projection would broadcast a
     // 128-wide vector across 2048 — accepted, and wrong.
     if cfg.qk_norm {
-        q = q.rms_norm(Some(get(w, &p("self_attn.q_norm.weight"))?), cfg.rms_eps, s)?;
-        k = k.rms_norm(Some(get(w, &p("self_attn.k_norm.weight"))?), cfg.rms_eps, s)?;
+        q = q.rms_norm(
+            Some(w.dense(&p("self_attn.q_norm.weight"))?),
+            cfg.rms_eps,
+            s,
+        )?;
+        k = k.rms_norm(
+            Some(w.dense(&p("self_attn.k_norm.weight"))?),
+            cfg.rms_eps,
+            s,
+        )?;
     }
 
     let q = apply_rope(&q, cos, sin, s)?;
@@ -262,10 +270,10 @@ fn layer(
         .contiguous(s)?
         .reshape(&[b, n, cfg.heads * cfg.head_dim], s)?;
     let x = x.add(
-        &linear(
+        &w.linear(
             &merged,
-            get(w, &p("self_attn.o_proj.weight"))?,
-            w.get(&p("self_attn.o_proj.bias")),
+            &p("self_attn.o_proj.weight"),
+            w.optional(&p("self_attn.o_proj.bias")),
             s,
         )?,
         s,
@@ -274,18 +282,13 @@ fn layer(
     // SwiGLU: `down(silu(gate(x)) * up(x))`. The gate is `gate_proj`, not
     // `up_proj` — they are the same shape, and swapping them runs.
     let h = x.rms_norm(
-        Some(get(w, &p("post_attention_layernorm.weight"))?),
+        Some(w.dense(&p("post_attention_layernorm.weight"))?),
         cfg.rms_eps,
         s,
     )?;
-    let gate = linear(&h, get(w, &p("mlp.gate_proj.weight"))?, None, s)?.silu(s)?;
-    let up = linear(&h, get(w, &p("mlp.up_proj.weight"))?, None, s)?;
-    let ff = linear(
-        &gate.mul(&up, s)?,
-        get(w, &p("mlp.down_proj.weight"))?,
-        None,
-        s,
-    )?;
+    let gate = w.linear(&h, &p("mlp.gate_proj.weight"), None, s)?.silu(s)?;
+    let up = w.linear(&h, &p("mlp.up_proj.weight"), None, s)?;
+    let ff = w.linear(&gate.mul(&up, s)?, &p("mlp.down_proj.weight"), None, s)?;
     x.add(&ff, s)
 }
 
@@ -300,7 +303,7 @@ fn layer(
 pub fn hidden_states(
     token_ids: &Array,
     cfg: &LlmConfig,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<Vec<Array>> {
     let shape = token_ids.shape();
@@ -310,7 +313,10 @@ pub fn hidden_states(
         )));
     };
 
-    let mut h = get(w, "model.embed_tokens.weight")?.take(token_ids, 0, s)?;
+    // The embedding table is a lookup, not a matmul, so it is always dense.
+    let mut h = w
+        .dense("model.embed_tokens.weight")?
+        .take(token_ids, 0, s)?;
     let (cos, sin) = rope_tables(seq, cfg.head_dim, cfg.rope_theta, s)?;
 
     let mut out = Vec::with_capacity(cfg.layers + 1);
@@ -321,12 +327,17 @@ pub fn hidden_states(
     }
     // `transformers` norms only the last entry.
     let last = out.len() - 1;
-    out[last] = h.rms_norm(Some(get(w, "model.norm.weight")?), cfg.rms_eps, s)?;
+    out[last] = h.rms_norm(Some(w.dense("model.norm.weight")?), cfg.rms_eps, s)?;
     Ok(out)
 }
 
 /// The last hidden state, post-norm — what a diffusion model conditions on.
-pub fn encode(token_ids: &Array, cfg: &LlmConfig, w: &Weights, s: &Stream) -> Result<Array> {
+pub fn encode(
+    token_ids: &Array,
+    cfg: &LlmConfig,
+    w: &impl WeightSource,
+    s: &Stream,
+) -> Result<Array> {
     let states = hidden_states(token_ids, cfg, w, s)?;
     states
         .into_iter()
@@ -347,7 +358,7 @@ pub fn encode_at_depth(
     token_ids: &Array,
     cfg: &LlmConfig,
     depth: usize,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<Array> {
     let states = hidden_states(token_ids, cfg, w, s)?;

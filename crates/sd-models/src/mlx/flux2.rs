@@ -38,7 +38,8 @@
 use sd_tensor::mlx::{concat, Array, Stream};
 use sd_tensor::{Error, Result};
 
-use super::{get, linear, Weights};
+use super::quantized::WeightSource;
+use super::{get, Weights};
 
 /// FLUX.2 transformer geometry.
 #[derive(Debug, Clone)]
@@ -119,6 +120,28 @@ pub fn image_ids(h: usize, w: usize) -> Vec<f32> {
             v.push(col as f32);
             v.push(0.0);
         }
+    }
+    v
+}
+
+/// `(t, h, w, l)` coordinates for `len` text tokens, `[len, 4]`.
+///
+/// **The token index goes in the fourth axis**, with the first three zero —
+/// where an image token uses the middle two and leaves the fourth zero. The
+/// four axes are `(time, height, width, length)`, and text and image occupy
+/// disjoint ones.
+///
+/// Leaving these all zero, which is what Flux.1's all-zero text ids invite,
+/// gives every text token the same position. The result is not an error: the
+/// palette still follows the prompt because the *content* is there, and the
+/// image has no structure, because word order has been erased.
+pub fn text_ids(len: usize) -> Vec<f32> {
+    let mut v = Vec::with_capacity(len * 4);
+    for i in 0..len {
+        v.push(0.0);
+        v.push(0.0);
+        v.push(0.0);
+        v.push(i as f32);
     }
     v
 }
@@ -211,11 +234,11 @@ fn swiglu(x: &Array, s: &Stream) -> Result<Array> {
 }
 
 /// The gated feed-forward: `linear_out(swiglu(linear_in(x)))`.
-fn feed_forward(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
-    let inner = linear(x, get(w, &format!("{prefix}.linear_in.weight"))?, None, s)?;
-    linear(
+fn feed_forward(x: &Array, w: &impl WeightSource, prefix: &str, s: &Stream) -> Result<Array> {
+    let inner = w.linear(x, &format!("{prefix}.linear_in.weight"), None, s)?;
+    w.linear(
         &swiglu(&inner, s)?,
-        get(w, &format!("{prefix}.linear_out.weight"))?,
+        &format!("{prefix}.linear_out.weight"),
         None,
         s,
     )
@@ -233,17 +256,12 @@ fn modulation(
     temb: &Array,
     sets: usize,
     hidden: usize,
-    w: &Weights,
+    w: &impl WeightSource,
     prefix: &str,
     s: &Stream,
 ) -> Result<Vec<Array>> {
     // **SiLU before the projection**, as everywhere else in this family.
-    let out = linear(
-        &temb.silu(s)?,
-        get(w, &format!("{prefix}.linear.weight"))?,
-        None,
-        s,
-    )?;
+    let out = w.linear(&temb.silu(s)?, &format!("{prefix}.linear.weight"), None, s)?;
     let last = out.shape().len() - 1;
     let mut parts = Vec::with_capacity(3 * sets);
     for i in 0..3 * sets {
@@ -301,7 +319,7 @@ fn double_block(
     sin: &Array,
     index: usize,
     cfg: &Flux2Config,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<(Array, Array)> {
     let path = format!("transformer_blocks.{index}");
@@ -312,13 +330,13 @@ fn double_block(
     let txt_n = modulate(txt, &tm[0], &tm[1], cfg.eps, s)?;
 
     let proj = |x: &Array, name: &str| -> Result<Array> {
-        to_heads(&linear(x, get(w, &a(name))?, None, s)?, heads, hd, s)
+        to_heads(&w.linear(x, &a(name), None, s)?, heads, hd, s)
     };
     // **QK-norm before the concatenation**, per stream, with its own weights:
     // the image stream uses `norm_q`, the text stream `norm_added_q`. They are
     // the same shape.
     let qn = |x: &Array, name: &str| -> Result<Array> {
-        x.rms_norm(Some(get(w, &a(name))?), cfg.eps, s)
+        x.rms_norm(Some(w.dense(&a(name))?), cfg.eps, s)
     };
 
     let img_q = qn(&proj(&img_n, "to_q")?, "norm_q")?;
@@ -341,7 +359,8 @@ fn double_block(
 
     // Image stream: gated attention residual, then gated MLP.
     let img = img.add(
-        &linear(&img_attn, get(w, &a("to_out.0"))?, None, s)?.mul(&im[2], s)?,
+        &w.linear(&img_attn, &a("to_out.0"), None, s)?
+            .mul(&im[2], s)?,
         s,
     )?;
     let img = img.add(
@@ -356,7 +375,8 @@ fn double_block(
     )?;
 
     let txt = txt.add(
-        &linear(&txt_attn, get(w, &a("to_add_out"))?, None, s)?.mul(&tm[2], s)?,
+        &w.linear(&txt_attn, &a("to_add_out"), None, s)?
+            .mul(&tm[2], s)?,
         s,
     )?;
     let txt = txt.add(
@@ -381,7 +401,7 @@ fn single_block(
     sin: &Array,
     index: usize,
     cfg: &Flux2Config,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<Array> {
     let path = format!("single_transformer_blocks.{index}.attn");
@@ -390,12 +410,7 @@ fn single_block(
 
     // `to_qkv_mlp_proj` emits `3*hidden` of qkv followed by `2*mlp_hidden` of
     // gated MLP — one projection, split by width rather than chunked evenly.
-    let projected = linear(
-        &normed,
-        get(w, &format!("{path}.to_qkv_mlp_proj.weight"))?,
-        None,
-        s,
-    )?;
+    let projected = w.linear(&normed, &format!("{path}.to_qkv_mlp_proj.weight"), None, s)?;
     let qkv_width = 3 * heads * hd;
     let last = projected.shape().len() - 1;
     let qkv = projected.narrow(last, 0, qkv_width, s)?;
@@ -403,13 +418,13 @@ fn single_block(
 
     let (q, k, v) = split_qkv(&qkv, heads, hd, s)?;
     let q = apply_rope(
-        &q.rms_norm(Some(get(w, &format!("{path}.norm_q.weight"))?), cfg.eps, s)?,
+        &q.rms_norm(Some(w.dense(&format!("{path}.norm_q.weight"))?), cfg.eps, s)?,
         cos,
         sin,
         s,
     )?;
     let k = apply_rope(
-        &k.rms_norm(Some(get(w, &format!("{path}.norm_k.weight"))?), cfg.eps, s)?,
+        &k.rms_norm(Some(w.dense(&format!("{path}.norm_k.weight"))?), cfg.eps, s)?,
         cos,
         sin,
         s,
@@ -418,7 +433,7 @@ fn single_block(
     let attended = merge_heads(&q.sdpa(&k, &v, 1.0 / (hd as f32).sqrt(), s)?, s)?;
     // Attention output and gated MLP output side by side, then one projection.
     let joined = concat(&[&attended, &swiglu(&mlp, s)?], 2, s)?;
-    let out = linear(&joined, get(w, &format!("{path}.to_out.weight"))?, None, s)?;
+    let out = w.linear(&joined, &format!("{path}.to_out.weight"), None, s)?;
     x.add(&out.mul(&m[2], s)?, s)
 }
 
@@ -434,14 +449,9 @@ fn timestep_features(t: &Array, channels: usize, s: &Stream) -> Result<Array> {
 }
 
 /// A two-layer embedder: `linear_2(silu(linear_1(x)))`.
-fn embedder(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
-    let h = linear(x, get(w, &format!("{prefix}.linear_1.weight"))?, None, s)?;
-    linear(
-        &h.silu(s)?,
-        get(w, &format!("{prefix}.linear_2.weight"))?,
-        None,
-        s,
-    )
+fn embedder(x: &Array, w: &impl WeightSource, prefix: &str, s: &Stream) -> Result<Array> {
+    let h = w.linear(x, &format!("{prefix}.linear_1.weight"), None, s)?;
+    w.linear(&h.silu(s)?, &format!("{prefix}.linear_2.weight"), None, s)
 }
 
 /// The velocity FLUX.2 predicts.
@@ -458,7 +468,7 @@ pub fn forward(
     timestep: &Array,
     guidance: Option<&Array>,
     cfg: &Flux2Config,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<Array> {
     let hidden = cfg.hidden_size;
@@ -489,8 +499,8 @@ pub fn forward(
         (false, None) => {}
     }
 
-    let mut img = linear(img, get(w, "x_embedder.weight")?, None, s)?;
-    let mut txt = linear(txt, get(w, "context_embedder.weight")?, None, s)?;
+    let mut img = w.linear(img, "x_embedder.weight", None, s)?;
+    let mut txt = w.linear(txt, "context_embedder.weight", None, s)?;
 
     // **One modulation for the whole model**, not one per block.
     let mod_img = modulation(&temb, 2, hidden, w, "double_stream_modulation_img", s)?;
@@ -520,7 +530,7 @@ pub fn forward(
 
     // The output head modulates from `temb` with shift and scale only —
     // nothing to gate at the end.
-    let out_mod = linear(&temb.silu(s)?, get(w, "norm_out.linear.weight")?, None, s)?;
+    let out_mod = w.linear(&temb.silu(s)?, "norm_out.linear.weight", None, s)?;
     let last = out_mod.shape().len() - 1;
     // **Scale first, then shift** — `AdaLayerNormContinuous` chunks in that
     // order, which is the *reverse* of `Flux2Modulation`'s `(shift, scale,
@@ -533,5 +543,112 @@ pub fn forward(
         .narrow(last, hidden, hidden, s)?
         .reshape(&[out_mod.shape()[0], 1, hidden], s)?;
     let xs = modulate(&xs, &shift, &scale, cfg.eps, s)?;
-    linear(&xs, get(w, "proj_out.weight")?, None, s)
+    w.linear(&xs, "proj_out.weight", None, s)
+}
+
+// -- latents ----------------------------------------------------------------
+
+/// `[b, c, h, w]` to `[b, 4c, h/2, w/2]`, the 2x2 patchify the VAE's own
+/// `patch_size` implies.
+///
+/// **This is not the transformer's packing.** FLUX.2's `patch_size` is 1, so
+/// the transformer patches nothing; this happens between the VAE and the
+/// transformer, turning 32 latent channels into the 128 `x_embedder` takes.
+/// Two different 2x2 operations in one pipeline, and doing this one twice is
+/// the obvious way to get a latent of the right shape and the wrong content.
+///
+/// The permutation is `(0, 1, 3, 5, 2, 4)` — channel, then the two *sub*-pixel
+/// axes, then the spatial ones — so the four samples of a 2x2 cell land
+/// adjacent in the channel dimension.
+pub fn patchify_latents(x: &Array, s: &Stream) -> Result<Array> {
+    let [b, c, h, w] = x.shape()[..] else {
+        return Err(Error::Msg(format!("mlx: flux2 patchify {:?}", x.shape())));
+    };
+    if h % 2 != 0 || w % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "mlx: a {h}x{w} latent does not divide into 2x2 cells"
+        )));
+    }
+    x.reshape(&[b, c, h / 2, 2, w / 2, 2], s)?
+        .transpose(&[0, 1, 3, 5, 2, 4], s)?
+        .contiguous(s)?
+        .reshape(&[b, c * 4, h / 2, w / 2], s)
+}
+
+/// The inverse of [`patchify_latents`].
+///
+/// **Not the same permutation reversed by inspection.** `(0, 1, 4, 2, 5, 3)`
+/// interleaves the sub-pixel axes back between the spatial ones; the naive
+/// inverse produces an image of the right size with every 2x2 cell
+/// transposed — coherent colour, destroyed detail, no error. The same trap
+/// SD 3.5's patchify already cost this project once.
+pub fn unpatchify_latents(x: &Array, s: &Stream) -> Result<Array> {
+    let [b, c, h, w] = x.shape()[..] else {
+        return Err(Error::Msg(format!("mlx: flux2 unpatchify {:?}", x.shape())));
+    };
+    if c % 4 != 0 {
+        return Err(Error::Msg(format!(
+            "mlx: {c} channels does not unpatchify into 2x2 cells"
+        )));
+    }
+    x.reshape(&[b, c / 4, 2, 2, h, w], s)?
+        .transpose(&[0, 1, 4, 2, 5, 3], s)?
+        .contiguous(s)?
+        .reshape(&[b, c / 4, h * 2, w * 2], s)
+}
+
+/// `[b, c, h, w]` to `[b, h*w, c]` — the token sequence the transformer takes.
+///
+/// A flatten and a transpose, nothing more: FLUX.2's `patch_size` is 1, unlike
+/// Flux.1 where this step also folds 2x2 cells.
+pub fn pack_latents(x: &Array, s: &Stream) -> Result<Array> {
+    let [b, c, h, w] = x.shape()[..] else {
+        return Err(Error::Msg(format!("mlx: flux2 pack {:?}", x.shape())));
+    };
+    x.reshape(&[b, c, h * w], s)?.transpose(&[0, 2, 1], s)
+}
+
+/// The inverse of [`pack_latents`].
+pub fn unpack_latents(x: &Array, h: usize, w: usize, s: &Stream) -> Result<Array> {
+    let [b, n, c] = x.shape()[..] else {
+        return Err(Error::Msg(format!("mlx: flux2 unpack {:?}", x.shape())));
+    };
+    if n != h * w {
+        return Err(Error::Msg(format!("mlx: {n} tokens is not a {h}x{w} grid")));
+    }
+    x.transpose(&[0, 2, 1], s)?
+        .contiguous(s)?
+        .reshape(&[b, c, h, w], s)
+}
+
+/// FLUX.2 normalises its latents with a **BatchNorm's running statistics**,
+/// not a scalar scale and shift.
+///
+/// Every other model here multiplies by one number and subtracts another;
+/// FLUX.2's VAE carries `bn.running_mean` and `bn.running_var` over the 128
+/// patchified channels and normalises per channel. Substituting a scalar would
+/// run and would tilt the latent distribution channel by channel.
+///
+/// `forward` is encode-side (`(x - mean) / std`); the decode inverts it.
+pub fn normalize_latents(
+    x: &Array,
+    vae: &Weights,
+    eps: f32,
+    forward: bool,
+    s: &Stream,
+) -> Result<Array> {
+    let mean = get(vae, "bn.running_mean")?;
+    let var = get(vae, "bn.running_var")?;
+    let c = x.shape()[1];
+    // `[1, c, 1, 1]`, to broadcast across the spatial axes of an NCHW latent.
+    let mean = mean.reshape(&[1, c, 1, 1], s)?;
+    let std = var
+        .add(&Array::scalar_f32(eps)?, s)?
+        .sqrt(s)?
+        .reshape(&[1, c, 1, 1], s)?;
+    if forward {
+        x.sub(&mean, s)?.div(&std, s)
+    } else {
+        x.mul(&std, s)?.add(&mean, s)
+    }
 }

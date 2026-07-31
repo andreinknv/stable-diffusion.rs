@@ -390,7 +390,40 @@ def dump_flux2(output: pathlib.Path, model_id: str) -> None:
             return_dict=False,
         )[0]
 
+    # The latent plumbing, pinned separately from the transformer. These are
+    # two different 2x2 operations plus a flatten, and `dump_sd3` already
+    # records what a wrong unpatchify costs: an image of the right size with
+    # every cell transposed, no error anywhere.
+    # Transcribed from `Flux2Pipeline`'s static methods rather than imported:
+    # that module uses 3.10 union syntax and this tooling runs on 3.9. They are
+    # pure tensor ops, so a transcription is exact — and it is checked by the
+    # transformer comparison above sharing the same fixture.
+    def _patchify(x):
+        b, c, h, w = x.shape
+        x = x.view(b, c, h // 2, 2, w // 2, 2)
+        x = x.permute(0, 1, 3, 5, 2, 4)
+        return x.reshape(b, c * 4, h // 2, w // 2)
+
+    def _unpatchify(x):
+        b, c, h, w = x.shape
+        x = x.reshape(b, c // 4, 2, 2, h, w)
+        x = x.permute(0, 1, 4, 2, 5, 3)
+        return x.reshape(b, c // 4, h * 2, w * 2)
+
+    def _pack(x):
+        b, c, h, w = x.shape
+        return x.reshape(b, c, h * w).permute(0, 2, 1)
+
+    latent = torch.randn(1, 32, 8, 6, generator=gen)
+    patched = _patchify(latent)
+    packed = _pack(patched)
+    unpatched = _unpatchify(patched)
+
     tensors = {
+        "latent_nchw": latent.contiguous(),
+        "latent_patchified": patched.contiguous(),
+        "latent_packed": packed.contiguous(),
+        "latent_unpatchified": unpatched.contiguous(),
         "hidden_states": hidden_states.contiguous(),
         "encoder_hidden_states": encoder_hidden_states.contiguous(),
         "timestep": timestep.contiguous(),
