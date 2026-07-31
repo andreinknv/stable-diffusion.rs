@@ -64,59 +64,45 @@ findings still bind.
    and `sample::restore_outside_mask` runs the composite inside the loop. See
    [img2img and inpainting on MLX](#img2img-and-inpainting-on-mlx).
 
-6. **What is actually left, and it is two things.** Both are real, and the
-   first is the larger.
+6. **What is actually left.**
 
-   **(a) The pipeline layer.** `MlxPipeline` now exists —
-   `crates/stable-diffusion-rs/src/mlx/`, gated by `mlx_pipeline` — and does
-   **txt2img, img2img and inpaint on SD 1.5 through the public API**: load a
-   model directory, call `txt2img`, get bytes. Same seed gives the same image
-   byte for byte, the two samplers are distinguishable, and a size that does
-   not divide into latent cells is refused.
+   **Quantised-at-rest inference does not exist on MLX**, so full-size Flux and
+   T5-XXL cannot leave candle. The MLX GGUF loader dequantises to f32; Flux
+   schnell is 11.89B parameters, which is **47.6 GB** dense and does not fit on
+   this machine. The candle path keeps those weights quantised and dequantises
+   per operation — `FluxTransformer::from_quantized`, `resident_bytes` — and
+   MLX has its own scheme with no equivalent built here.
 
-   What it does *not* yet carry, all of which the candle `Txt2ImgPipeline` does
-   and all of which is orchestration rather than new model work:
+   `mlx_gguf_large` pins that as a test rather than a promise: the geometry of
+   both checkpoints is verified from the tensor directory, and the dense
+   footprint is asserted to *not* fit. If that assertion ever fails, the
+   limitation is stale and the test says so.
 
-   - SD 3.5, Flux and unCLIP pipelines (the models are ported; the pipelines
-     around them are not). **SDXL is done** — `SdxlPipeline`, txt2img and
-     img2img, verified at its native 1024 in 24 s
-   - AnimateDiff frame batching. **ControlNet, LoRA, IP-Adapter and GLIGEN
-     are wired**: `attach_controlnet` (several stack, corrections sum, scale 0
-     is exactly zero), `attach_lora` (errors rather than half-applying),
-     `attach_ip_adapter` (scale 0 exactly zero), and `generate(..., boxes)`
-     for GLIGEN — which refuses boxes on a UNet with no fuser layers rather
-     than dropping them
-   - step caching, region/area prompts, two-pass hires, model placement,
-     progress reporting and cancellation
-   - textual inversion, area prompts, per-step conditioning, upscaling
-   - AnimateDiff frame batching
+   What it would cost is measured, under [Order of work](#order-of-work):
+   requantising into MLX's own 4-bit scheme at a cosine of ~0.995 — and
+   **quantise from the original f16 checkpoint, not from the GGUF**, or the
+   error sits on top of Q4_K's own. `flux_schnell_gguf`'s tolerance would then
+   have to be re-derived from `xtask/golden/reference_precision.py`.
 
-   So the shape has changed since the last entry: this is no longer "the
-   pipeline layer is entirely candle", it is "one pipeline of five works, with
-   the conditioning features unwired".
+   **The pipeline layer is done**, `crates/stable-diffusion-rs/src/mlx/`:
 
-   **(b) Quantised-at-rest inference does not exist on MLX**, so full-size Flux
-   and T5-XXL cannot leave candle. The MLX GGUF loader dequantises to f32;
-   Flux schnell is 11.89B parameters, which is **47.6 GB** dense and does not
-   fit on this machine at all. The candle path keeps those weights quantised
-   and dequantises per operation — `FluxTransformer::from_quantized`,
-   `resident_bytes` — and MLX has its own scheme with no equivalent built here.
+   | pipeline | state |
+   |---|---|
+   | SD 1.5 / 2.x | txt2img, img2img, inpaint, verified end to end |
+   | SDXL | txt2img, img2img, verified at 1024 in 24 s |
+   | unCLIP | image variations, verified |
+   | SD 3.5 | written; **not** verified end to end — no T5-XXL safetensors here |
+   | Flux | written; **not** verified end to end — same reason |
 
-   `mlx_gguf_large` pins (b) as a test rather than a promise: the geometry of
-   both checkpoints is verified from the tensor directory, which costs nothing,
-   and the dense footprint is asserted to *not* fit. If that assertion ever
-   fails, the limitation is stale and the test says so.
+   Conditioning, all reachable and all verified: ControlNet (several stack,
+   scale 0 exactly zero), LoRA (errors rather than half-applying), IP-Adapter,
+   GLIGEN, AnimateDiff clips. SD 3.5 and Flux are in the same position their
+   candle counterparts are — neither has an end-to-end test on either side,
+   because both need weights this machine does not hold.
 
-   What (b) would cost is already measured, under [Order of
-   work](#order-of-work): requantising into MLX's own 4-bit scheme at a cosine
-   of ~0.995 against the GGUF values — and **quantise from the original f16
-   checkpoint, not from the GGUF**, or the error sits on top of Q4_K's own.
-   `flux_schnell_gguf`'s tolerance would then have to be re-derived from
-   `xtask/golden/reference_precision.py`, not widened until it passed.
-
-   Everything else in the 405 is ported, covered under a different name, or
-   dies with candle — see [Closing the MLX test
-   gap](#closing-the-mlx-test-gap-2026-07-31).
+   Still only on the candle path, and all orchestration rather than models:
+   step caching, region/area prompts, two-pass hires, model placement, progress
+   reporting and cancellation, textual inversion, upscaling.
 
 7. **Run both backends in parallel** until every golden test passes on MLX.
    Delete candle in one commit, not gradually.
