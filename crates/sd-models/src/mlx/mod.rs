@@ -37,6 +37,8 @@ pub mod ip;
 pub mod lora;
 /// AnimateDiff motion modules: attention over time.
 pub mod motion;
+/// unCLIP's prior: a diffusion model over a 768-vector.
+pub mod prior;
 /// The txt2img sampling loop.
 pub mod sample;
 /// SD 3 / SD 3.5's MMDiT transformer.

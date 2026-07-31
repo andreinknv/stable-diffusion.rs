@@ -442,6 +442,21 @@ fn causal_penalty(seq: usize, device: &Device) -> Result<Tensor> {
     Tensor::from_vec(data, (1, 1, seq, seq), device)
 }
 
+/// One DDPM step's scalars: `mean = clamp(x0) * x0_coeff + sample *
+/// sample_coeff`, then `+ noise * std` unless this is the last step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepCoefficients {
+    pub x0_coeff: f64,
+    pub sample_coeff: f64,
+    /// The prior clamps its prediction to this. 5.0, not 1.0 — the embedding
+    /// is whitened, so its natural range is several standard deviations.
+    pub clip_range: f64,
+    /// `None` at `t == 0`, where no variance is added at all. That is what
+    /// lands the run on a definite answer rather than a sample from a
+    /// distribution around it.
+    pub std: Option<f64>,
+}
+
 /// The prior's own sampler: DDPM over a 768-vector.
 ///
 /// **Nothing else in this project samples like this.** Every other sampler
@@ -494,6 +509,26 @@ impl PriorScheduler {
         sample: &Tensor,
         noise: &Tensor,
     ) -> Result<Tensor> {
+        let c = self.coefficients(timestep)?;
+        // The model predicts x0 directly. Clamped, because an unclamped
+        // prediction early in the run can be far outside the whitened range
+        // and the coefficients below amplify it.
+        let x0 = predicted.clamp(-c.clip_range, c.clip_range)?;
+        let mean = ((x0 * c.x0_coeff)? + (sample * c.sample_coeff)?)?;
+        match c.std {
+            Some(std) => mean + (noise * std)?,
+            None => Ok(mean),
+        }
+    }
+
+    /// The step's scalars, so a second backend can do the three tensor
+    /// operations without reimplementing the schedule.
+    ///
+    /// Split out for the reason `sd_sample::Schedule` is scalar: this is
+    /// closed-form arithmetic over `alphas_cumprod` and touches no tensor, so
+    /// two backends calling it cannot drift apart. The DDPM formulation is the
+    /// part that is easy to get subtly wrong, and it now exists once.
+    pub fn coefficients(&self, timestep: usize) -> Result<StepCoefficients> {
         let t = timestep.min(self.train_timesteps - 1);
         let prev = self.previous_timestep(t)?;
 
@@ -509,43 +544,27 @@ impl PriorScheduler {
         let current_alpha = alpha_prod_t / alpha_prod_prev;
         let current_beta = 1.0 - current_alpha;
 
-        // The model predicts x0 directly. Clamped, because an unclamped
-        // prediction early in the run can be far outside the whitened range
-        // and the coefficients below amplify it.
-        let x0 = predicted.clamp(-self.clip_sample_range, self.clip_sample_range)?;
-
-        let x0_coeff = alpha_prod_prev.sqrt() * current_beta / beta_prod_t;
-        let sample_coeff = current_alpha.sqrt() * beta_prod_prev / beta_prod_t;
-        let mean = ((x0 * x0_coeff)? + (sample * sample_coeff)?)?;
-
         // **Guarded on `t > 0`, not on "is this the last step"**, which is
         // what diffusers does. For this schedule the two coincide — the ladder
         // always ends at 0 — but they are different conditions and copying the
         // literal one costs nothing.
-        if t == 0 {
-            return Ok(mean);
-        }
-        // `fixed_small_log`: the *log* of the variance is what is clamped, and
-        // the standard deviation is its exponential of a half. Using the
-        // variance directly gives noise that is too small by its own square
-        // root — a quieter, blurrier result with nothing to catch it.
-        let variance = (beta_prod_prev / beta_prod_t) * current_beta;
-        let log_variance = variance.max(1e-20).ln();
-        let std = (0.5 * log_variance).exp();
-        mean + (noise * std)?
+        let std = (t != 0).then(|| {
+            // `fixed_small_log`: the *log* of the variance is what is clamped,
+            // and the standard deviation is its exponential of a half. Using
+            // the variance directly gives noise too small by its own square
+            // root — a quieter, blurrier result with nothing to catch it.
+            let variance = (beta_prod_prev / beta_prod_t) * current_beta;
+            (0.5 * variance.max(1e-20).ln()).exp()
+        });
+
+        Ok(StepCoefficients {
+            x0_coeff: alpha_prod_prev.sqrt() * current_beta / beta_prod_t,
+            sample_coeff: current_alpha.sqrt() * beta_prod_prev / beta_prod_t,
+            clip_range: self.clip_sample_range,
+            std,
+        })
     }
 
-    /// The timestep the next step lands on, or `None` at the end of the run.
-    ///
-    /// Read from the schedule rather than computed as `t - ratio`: with a step
-    /// count that does not divide 1000 the two disagree, and the reference
-    /// walks the list.
-    ///
-    /// **`Err` when `t` is not on this schedule at all**, which is a different
-    /// thing from being the last entry and used to be conflated with it — a
-    /// timestep from a 25-step ladder handed to a 50-step scheduler would have
-    /// been treated as the end of the run, skipping the variance and returning
-    /// a quietly wrong sample.
     fn previous_timestep(&self, t: usize) -> Result<Option<usize>> {
         let i = self.timesteps.iter().position(|&x| x == t).ok_or_else(|| {
             sd_tensor::Error::Msg(format!(
