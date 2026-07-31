@@ -28,7 +28,7 @@ pub mod vae;
 
 use std::collections::HashMap;
 
-use sd_tensor::mlx::{Array, Stream};
+use sd_tensor::mlx::{concat, Array, Stream};
 use sd_tensor::{Error, Result};
 
 /// GroupNorm epsilon on `Transformer2DModel`'s spatial wrapper.
@@ -60,6 +60,19 @@ pub struct UNetConfig {
     /// false. **SD 1.5 is false, SD 2.x is true** — the weights differ in rank,
     /// so the wrong choice fails to load rather than rendering wrongly.
     pub use_linear_projection: bool,
+    /// Transformer blocks per attention, per block. SD 1.5 and SD 2.x are 1
+    /// throughout; SDXL is `[1, 2, 10]` and is much deeper at the bottom.
+    pub transformer_layers: Vec<usize>,
+    /// SDXL's micro-conditioning. `None` for everything else here.
+    pub addition: Option<AdditionEmbedding>,
+}
+
+/// SDXL's extra conditioning: image size and crop offsets, sinusoidally
+/// embedded and concatenated with the pooled text embedding.
+#[derive(Debug, Clone, Copy)]
+pub struct AdditionEmbedding {
+    /// Width of the sinusoid applied to each of the six time ids.
+    pub time_embed_dim: usize,
 }
 
 impl UNetConfig {
@@ -69,6 +82,25 @@ impl UNetConfig {
             layers_per_block: 2,
             down_has_attention: vec![true, true, true, false],
             use_linear_projection: false,
+            transformer_layers: vec![1; 4],
+            addition: None,
+        }
+    }
+
+    /// SDXL base: three blocks rather than four, attention on the **last two**
+    /// rather than the first three, a much deeper transformer at the bottom,
+    /// and the text_time micro-conditioning.
+    pub fn sdxl() -> Self {
+        Self {
+            // 320/5 = 640/10 = 1280/20 = 64 wide throughout.
+            heads: vec![5, 10, 20],
+            layers_per_block: 2,
+            down_has_attention: vec![false, true, true],
+            use_linear_projection: true,
+            transformer_layers: vec![1, 2, 10],
+            addition: Some(AdditionEmbedding {
+                time_embed_dim: 256,
+            }),
         }
     }
 
@@ -398,6 +430,24 @@ pub fn transformer_2d(
     y.add(x, s)
 }
 
+/// diffusers' `get_timestep_embedding`, without the MLP.
+///
+/// `flip_sin_to_cos` is true and `downscale_freq_shift` is 0, so cosine comes
+/// first and the exponent divides by `half` rather than `half - 1`. The
+/// frequencies are built on the CPU and uploaded, because `mlx-c` has no
+/// `arange` and this is a small constant.
+pub fn sinusoid_embedding(values: &Array, channels: usize, s: &Stream) -> Result<Array> {
+    let half = channels / 2;
+    let freqs: Vec<f32> = (0..half)
+        .map(|i| (-(10000f32.ln()) * i as f32 / half as f32).exp())
+        .collect();
+    let freqs = Array::from_slice_f32(&freqs, &[1, half])?;
+    let v = values.reshape(&[values.elem_count(), 1], s)?;
+    let angles = v.matmul(&freqs, s)?;
+    // flip_sin_to_cos: cosine first.
+    concat(&[&angles.cos(s)?, &angles.sin(s)?], 1, s)
+}
+
 /// diffusers' `get_timestep_embedding` followed by the `time_embedding` MLP.
 ///
 /// The frequencies are built on the CPU and uploaded once, because `mlx-c` has
@@ -415,16 +465,7 @@ pub fn timestep_embedding(
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
-    let half = channels / 2;
-    let freqs: Vec<f32> = (0..half)
-        .map(|i| (-(10000f32.ln()) * i as f32 / half as f32).exp())
-        .collect();
-    let freqs = Array::from_slice_f32(&freqs, &[1, half])?;
-
-    let t = timestep.reshape(&[timestep.elem_count(), 1], s)?;
-    let angles = t.matmul(&freqs, s)?;
-    // flip_sin_to_cos: cosine first.
-    let emb = sd_tensor::mlx::concat(&[&angles.cos(s)?, &angles.sin(s)?], 1, s)?;
+    let emb = sinusoid_embedding(timestep, channels, s)?;
 
     let h = linear(
         &emb,
@@ -472,6 +513,7 @@ pub fn down_block(
     prefix: &str,
     layers: usize,
     heads: Option<usize>,
+    transformer_layers: usize,
     linear_projection: bool,
     has_downsample: bool,
     s: &Stream,
@@ -486,7 +528,7 @@ pub fn down_block(
                 &h,
                 context,
                 heads,
-                1,
+                transformer_layers,
                 linear_projection,
                 w,
                 &format!("{prefix}.attentions.{i}"),
@@ -538,6 +580,7 @@ pub fn down_pass(
             &format!("down_blocks.{i}"),
             cfg.layers_per_block,
             heads,
+            cfg.transformer_layers[i],
             cfg.use_linear_projection,
             i + 1 < blocks,
             s,
@@ -585,11 +628,12 @@ pub fn mid_block(
     let h = resnet_block(x, temb, w, "mid_block.resnets.0", s)?;
     // The mid block runs at the deepest width, so it takes the last head count.
     let heads = *cfg.heads.last().expect("at least one block");
+    let layers = *cfg.transformer_layers.last().expect("at least one block");
     let h = transformer_2d(
         &h,
         context,
         heads,
-        1,
+        layers,
         cfg.use_linear_projection,
         w,
         "mid_block.attentions.0",
@@ -610,6 +654,7 @@ pub fn up_block(
     prefix: &str,
     layers: usize,
     heads: Option<usize>,
+    transformer_layers: usize,
     linear_projection: bool,
     has_upsample: bool,
     s: &Stream,
@@ -620,14 +665,14 @@ pub fn up_block(
             Error::Msg("mlx: the up pass ran out of skips; the stack is the wrong depth".into())
         })?;
         // Channels last, so the join is on the last axis rather than dim 1.
-        h = sd_tensor::mlx::concat(&[&h, &skip], 3, s)?;
+        h = concat(&[&h, &skip], 3, s)?;
         h = resnet_block(&h, temb, w, &format!("{prefix}.resnets.{i}"), s)?;
         if let Some(heads) = heads {
             h = transformer_2d(
                 &h,
                 context,
                 heads,
-                1,
+                transformer_layers,
                 linear_projection,
                 w,
                 &format!("{prefix}.attentions.{i}"),
@@ -653,7 +698,67 @@ pub fn unet_forward(
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
+    unet_forward_with(sample_nhwc, timestep, context, None, cfg, w, s)
+}
+
+/// `unet_forward` plus SDXL's micro-conditioning: the pooled text embedding
+/// `[n, 1280]` and the six time ids `[n, 6]`.
+///
+/// **Pooled first, then the sinusoid.** The halves are 1280 and 1536, so either
+/// order sums to 2816 and loads and runs — the reversed one just conditions on
+/// nonsense.
+#[allow(clippy::too_many_arguments)]
+pub fn unet_forward_with(
+    sample_nhwc: &Array,
+    timestep: &Array,
+    context: &Array,
+    added: Option<(&Array, &Array)>,
+    cfg: &UNetConfig,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
     let temb = timestep_embedding(timestep, 320, w, s)?;
+    let temb = match (cfg.addition, added) {
+        (Some(add), Some((pooled, time_ids))) => {
+            let [n, ids] = time_ids.shape()[..] else {
+                return Err(Error::Msg(format!(
+                    "mlx: time_ids should be [n, 6], got {:?}",
+                    time_ids.shape()
+                )));
+            };
+            // Each id gets its own sinusoid, then they are flattened.
+            let flat = time_ids.reshape(&[n * ids], s)?;
+            let sinusoid = sinusoid_embedding(&flat, add.time_embed_dim, s)?
+                .reshape(&[n, ids * add.time_embed_dim], s)?;
+            let combined = concat(&[pooled, &sinusoid], 1, s)?;
+            let projected = linear(
+                &combined,
+                get(w, "add_embedding.linear_1.weight")?,
+                Some(get(w, "add_embedding.linear_1.bias")?),
+                s,
+            )?
+            .silu(s)?;
+            let projected = linear(
+                &projected,
+                get(w, "add_embedding.linear_2.weight")?,
+                Some(get(w, "add_embedding.linear_2.bias")?),
+                s,
+            )?;
+            // Added to the timestep embedding, not concatenated with it.
+            temb.add(&projected, s)?
+        }
+        (Some(_), None) => {
+            return Err(Error::Msg(
+                "mlx: this UNet expects SDXL micro-conditioning".into(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(Error::Msg(
+                "mlx: micro-conditioning supplied to a UNet that has no add_embedding".into(),
+            ))
+        }
+        (None, None) => temb,
+    };
     let (h, mut skips) = down_pass(sample_nhwc, &temb, context, cfg, w, s)?;
     let mut h = mid_block(&h, &temb, context, cfg, w, s)?;
 
@@ -676,6 +781,7 @@ pub fn unet_forward(
             &format!("up_blocks.{i}"),
             cfg.layers_per_block + 1,
             heads,
+            cfg.transformer_layers[mirrored],
             cfg.use_linear_projection,
             i + 1 < blocks,
             s,

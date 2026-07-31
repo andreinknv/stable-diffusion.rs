@@ -263,3 +263,97 @@ fn the_sd2_unet_matches_diffusers() {
         "the SD 2.x UNet is {worst:.3e} from diffusers, past atol {ATOL:.0e}"
     );
 }
+
+/// SDXL base, against `tests/golden/sdxl_unet`.
+///
+/// Three blocks rather than four, attention on the **last two** rather than the
+/// first three, transformer depths `[1, 2, 10]`, and the text_time
+/// micro-conditioning: six time ids sinusoidally embedded at 256 each, then
+/// concatenated with the 1280-wide pooled text embedding.
+///
+/// **Pooled first.** 1280 + 1536 = 2816 either way, so the reversed order loads
+/// and runs and simply conditions on nonsense.
+#[test]
+fn the_sdxl_unet_matches_diffusers() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/sdxl_unet");
+    let (refs_path, unet_path) = (
+        dir.join("reference.safetensors"),
+        dir.join("unet.safetensors"),
+    );
+    if !refs_path.exists() || !unet_path.exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no sdxl_unet fixture.");
+        return;
+    }
+    let refs = load_safetensors(&refs_path).expect("reference");
+    let w = load_safetensors(&unet_path).expect("weights");
+    let s = Stream::gpu();
+    let cfg = UNetConfig::sdxl();
+
+    let context = refs.get("context").expect("context");
+    assert_eq!(
+        context.shape(),
+        vec![1, 77, 2048],
+        "SDXL cross-attends at 2048"
+    );
+    let pooled = refs.get("pooled").expect("pooled");
+    let time_ids = refs.get("time_ids").expect("time_ids");
+    assert_eq!(pooled.shape(), vec![1, 1280]);
+    assert_eq!(time_ids.shape(), vec![1, 6]);
+
+    let x = refs
+        .get("sample")
+        .unwrap()
+        .transpose(&[0, 2, 3, 1], &s)
+        .unwrap();
+    let got = sd_models::mlx::unet_forward_with(
+        &x,
+        refs.get("timestep").unwrap(),
+        context,
+        Some((pooled, time_ids)),
+        &cfg,
+        &w,
+        &s,
+    )
+    .unwrap();
+
+    let worst = max_abs(&got, refs.get("output").unwrap(), &s, "sdxl output");
+    assert!(
+        worst <= ATOL,
+        "the SDXL UNet is {worst:.3e} from diffusers, past atol {ATOL:.0e}"
+    );
+}
+
+/// A UNet with micro-conditioning refuses to run without it, and one without
+/// refuses to accept it. Both mistakes otherwise render a plausible wrong
+/// image.
+#[test]
+fn micro_conditioning_is_required_when_the_config_declares_it() {
+    let Some((refs, w)) = fixtures() else { return };
+    let s = Stream::gpu();
+    let x = refs
+        .get("sample")
+        .unwrap()
+        .transpose(&[0, 2, 3, 1], &s)
+        .unwrap();
+    let (t, ctx) = (refs.get("timestep").unwrap(), refs.get("context").unwrap());
+
+    // SDXL config, no conditioning supplied.
+    assert!(
+        sd_models::mlx::unet_forward_with(&x, t, ctx, None, &UNetConfig::sdxl(), &w, &s).is_err(),
+        "an SDXL config must refuse to run without micro-conditioning"
+    );
+    // SD 1.5 config, conditioning supplied.
+    assert!(
+        sd_models::mlx::unet_forward_with(
+            &x,
+            t,
+            ctx,
+            Some((ctx, ctx)),
+            &UNetConfig::sd15(),
+            &w,
+            &s
+        )
+        .is_err(),
+        "SD 1.5 must refuse micro-conditioning it cannot use"
+    );
+}
