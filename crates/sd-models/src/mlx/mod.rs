@@ -21,6 +21,8 @@
 
 /// CLIP's text tower. Its epsilon is 1e-5 and its activation is QuickGelu.
 pub mod clip;
+/// CLIP's vision tower: the image half of the encoder.
+pub mod clip_vision;
 /// ControlNet: a copy of the UNet's down stack that emits corrections.
 pub mod controlnet;
 /// Real-ESRGAN 4x upscaling. Runs after generation and knows about no model.

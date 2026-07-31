@@ -21,6 +21,82 @@ use super::{conv, get, linear, Weights, NORM_GROUPS};
 /// GroupNorm epsilon throughout the VAE. Not the UNet's 1e-5.
 pub const VAE_EPS: f32 = 1e-6;
 
+/// What differs between the VAEs in this repository.
+///
+/// The convolutional geometry does not — `[128, 256, 512, 512]`, two layers a
+/// block, 32 groups — so this is a parameterisation rather than a family of
+/// models. What differs is the latent width, whether the 1x1 quant convolutions
+/// exist, and how the latent is scaled.
+#[derive(Debug, Clone, Copy)]
+pub struct VaeConfig {
+    pub latent_channels: usize,
+    /// **False for Flux.** Building them anyway looks for weights that do not
+    /// exist, which is loud; *not* building them when they do exist silently
+    /// drops a 1x1 convolution, which is not.
+    pub use_quant_conv: bool,
+    pub scaling_factor: f32,
+    /// **Shift first, then scale**, and the decode inverts it in the opposite
+    /// order. Getting either backwards leaves the image recognisable with wrong
+    /// contrast — the failure that survives eyeballing.
+    pub shift_factor: f32,
+}
+
+impl VaeConfig {
+    pub fn sd15() -> Self {
+        Self {
+            latent_channels: 4,
+            use_quant_conv: true,
+            scaling_factor: 0.18215,
+            shift_factor: 0.0,
+        }
+    }
+
+    /// SDXL's, which differs from SD 1.5's only in `scaling_factor`.
+    pub fn sdxl() -> Self {
+        Self {
+            scaling_factor: 0.13025,
+            ..Self::sd15()
+        }
+    }
+
+    /// Flux: a 16-channel latent, no quant convolutions, and a shift.
+    ///
+    /// The wider latent is why Flux images hold fine detail SD's 4-channel one
+    /// cannot represent, and it costs nothing here because the encoder and
+    /// decoder are already parameterised by it.
+    pub fn flux() -> Self {
+        Self {
+            latent_channels: 16,
+            use_quant_conv: false,
+            scaling_factor: 0.3611,
+            shift_factor: 0.1159,
+        }
+    }
+
+    /// SD 3.5: Flux's geometry with its own scale and shift.
+    pub fn sd35() -> Self {
+        Self {
+            scaling_factor: 1.5305,
+            shift_factor: 0.0609,
+            ..Self::flux()
+        }
+    }
+
+    /// `(x - shift) * scale` — a raw latent to the sampler's.
+    pub fn scale(&self, latent: &Array, s: &Stream) -> Result<Array> {
+        latent
+            .sub(&Array::scalar_f32(self.shift_factor)?, s)?
+            .mul(&Array::scalar_f32(self.scaling_factor)?, s)
+    }
+
+    /// `x / scale + shift` — the inverse, in the opposite order.
+    pub fn unscale(&self, latent: &Array, s: &Stream) -> Result<Array> {
+        latent
+            .div(&Array::scalar_f32(self.scaling_factor)?, s)?
+            .add(&Array::scalar_f32(self.shift_factor)?, s)
+    }
+}
+
 /// A VAE resnet: no time embedding, otherwise the UNet's shape.
 fn resnet(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
     let p = |name: &str| format!("{prefix}.{name}");
@@ -162,14 +238,23 @@ pub fn up_block(
 /// `latent_nhwc` is `[n, h, w, 4]`; the result is `[n, 8h, 8w, 3]` in the VAE's
 /// own range, before any scaling the pipeline applies.
 pub fn decode(latent_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Array> {
-    // 1x1, so no padding.
-    let h = conv(
-        latent_nhwc,
-        get(w, "post_quant_conv.weight")?,
-        Some(get(w, "post_quant_conv.bias")?),
-        0,
-        s,
-    )?;
+    decode_with(latent_nhwc, &VaeConfig::sd15(), w, s)
+}
+
+/// [`decode`] for any of the VAEs in [`VaeConfig`].
+pub fn decode_with(latent_nhwc: &Array, cfg: &VaeConfig, w: &Weights, s: &Stream) -> Result<Array> {
+    // 1x1, so no padding. Absent on Flux.
+    let h = if cfg.use_quant_conv {
+        conv(
+            latent_nhwc,
+            get(w, "post_quant_conv.weight")?,
+            Some(get(w, "post_quant_conv.bias")?),
+            0,
+            s,
+        )?
+    } else {
+        latent_nhwc.contiguous(s)?
+    };
     let h = conv(
         &h,
         get(w, "decoder.conv_in.weight")?,
@@ -213,6 +298,16 @@ pub fn decode(latent_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Array> {
 /// Down blocks have `layers_per_block` resnets, one *fewer* than the decoder's
 /// up blocks.
 pub fn encode_moments(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Array> {
+    encode_moments_with(image_nhwc, &VaeConfig::sd15(), w, s)
+}
+
+/// [`encode_moments`] for any of the VAEs in [`VaeConfig`].
+pub fn encode_moments_with(
+    image_nhwc: &Array,
+    cfg: &VaeConfig,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
     let h = conv(
         image_nhwc,
         get(w, "encoder.conv_in.weight")?,
@@ -252,7 +347,10 @@ pub fn encode_moments(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Arr
         1,
         s,
     )?;
-    // 1x1, so no padding.
+    // 1x1, so no padding. Absent on Flux.
+    if !cfg.use_quant_conv {
+        return Ok(h);
+    }
     conv(
         &h,
         get(w, "quant_conv.weight")?,
@@ -268,7 +366,17 @@ pub fn encode_moments(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Arr
 /// them is the caller's job everywhere else in this codebase, and getting the
 /// halves backwards yields noise that loads fine.
 pub fn encode_dist(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<(Array, Array)> {
-    let moments = encode_moments(image_nhwc, w, s)?;
+    encode_dist_with(image_nhwc, &VaeConfig::sd15(), w, s)
+}
+
+/// [`encode_dist`] for any of the VAEs in [`VaeConfig`].
+pub fn encode_dist_with(
+    image_nhwc: &Array,
+    cfg: &VaeConfig,
+    w: &Weights,
+    s: &Stream,
+) -> Result<(Array, Array)> {
+    let moments = encode_moments_with(image_nhwc, cfg, w, s)?;
     let c = moments.shape()[3];
     if c % 2 != 0 {
         return Err(Error::Msg(format!(
@@ -290,6 +398,20 @@ pub fn encode_dist(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<(Array
 /// cases that genuinely want a draw; nothing in a pipeline does.
 pub fn encode(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Array> {
     Ok(encode_dist(image_nhwc, w, s)?.0)
+}
+
+/// [`encode`] for any of the VAEs in [`VaeConfig`], with the scaling applied.
+///
+/// This is the form a pipeline wants: the latent the sampler operates on, not
+/// the distribution the model expresses.
+pub fn encode_scaled(
+    image_nhwc: &Array,
+    cfg: &VaeConfig,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
+    let (mean, _) = encode_dist_with(image_nhwc, cfg, w, s)?;
+    cfg.scale(&mean, s)
 }
 
 /// The encoder's stride-2 downsample.
