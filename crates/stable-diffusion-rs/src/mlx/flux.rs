@@ -33,7 +33,9 @@ use std::path::{Path, PathBuf};
 use sd_models::clip::ClipTokenizer;
 use sd_models::mlx::{
     clip::{self, ClipConfig},
-    flux, normalise_legacy_attention, t5,
+    flux, normalise_legacy_attention,
+    quantized::{self, QuantizedWeights},
+    t5,
     vae::{self, VaeConfig},
     Weights,
 };
@@ -110,8 +112,12 @@ pub struct FluxPipeline {
     clip_tokenizer: ClipTokenizer,
     t5_tokenizer: T5Tokenizer,
     clip: Weights,
-    t5: Weights,
-    transformer: Weights,
+    /// **Quantised at rest.** T5-XXL is 4.7B parameters — 18.8 GB dense in f32
+    /// — and it is only half of what has to be resident.
+    t5: QuantizedWeights,
+    /// Likewise. schnell is 11.89B, which is 47.6 GB dense and does not fit on
+    /// this machine at all.
+    transformer: QuantizedWeights,
     vae: Weights,
     cfg: flux::FluxConfig,
     vae_cfg: VaeConfig,
@@ -145,11 +151,28 @@ impl Default for FluxRunConfig {
 }
 
 impl FluxPipeline {
-    /// Load Flux from a `diffusers` model directory.
+    /// Load Flux from a `diffusers` model directory, **quantised at rest**.
     ///
     /// `cfg` says which variant this is — `schnell()`, `dev()` or `mini()` —
     /// and with it whether a guidance scale is expected.
+    ///
+    /// The transformer and T5 are quantised as they load; the CLIP tower and
+    /// the VAE stay dense because together they are under a gigabyte and the
+    /// VAE has no quantised convolution to use.
     pub fn load(root: &Path, cfg: flux::FluxConfig) -> Result<Self, PipelineError> {
+        Self::load_quantized(root, cfg, quantized::DEFAULT_BITS)
+    }
+
+    /// [`Self::load`] at an explicit bit width for the bulk of the weights.
+    ///
+    /// The sensitive layers are held at 8 regardless — see
+    /// `quantized::sensitive`. `bits` of 0 is not a way to load dense; use
+    /// `from_dense_with` if that is what you want, and check it fits first.
+    pub fn load_quantized(
+        root: &Path,
+        cfg: flux::FluxConfig,
+        bits: usize,
+    ) -> Result<Self, PipelineError> {
         let paths = FluxPaths::in_dir(root);
         for p in [
             &paths.vae,
@@ -169,14 +192,19 @@ impl FluxPipeline {
         }
         let stream = Stream::gpu();
 
-        let mut transformer = Weights::new();
+        let mut dense_transformer = Weights::new();
         for shard in &paths.transformer {
-            transformer.extend(load_safetensors(shard)?);
+            dense_transformer.extend(load_safetensors(shard)?);
         }
-        let mut t5w = Weights::new();
+        let transformer = quantized::from_dense(&dense_transformer, bits, &stream)?;
+        drop(dense_transformer);
+
+        let mut dense_t5 = Weights::new();
         for shard in &paths.t5 {
-            t5w.extend(load_safetensors(shard)?);
+            dense_t5.extend(load_safetensors(shard)?);
         }
+        let t5w = quantized::from_dense(&dense_t5, bits, &stream)?;
+        drop(dense_t5);
         let mut vae_w = load_safetensors(&paths.vae)?;
         normalise_legacy_attention(&mut vae_w);
 
@@ -298,5 +326,20 @@ impl FluxPipeline {
 
     pub fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    /// What this pipeline holds resident, in bytes.
+    ///
+    /// The honest figure: packed weights plus their scales, plus everything
+    /// left dense.
+    pub fn resident_bytes(&self) -> usize {
+        self.transformer.resident_bytes()
+            + self.t5.resident_bytes()
+            + self
+                .clip
+                .values()
+                .map(|a| a.elem_count() * 4)
+                .sum::<usize>()
+            + self.vae.values().map(|a| a.elem_count() * 4).sum::<usize>()
     }
 }

@@ -20,7 +20,7 @@
 use sd_tensor::mlx::{Array, Stream};
 use sd_tensor::{Error, Result};
 
-use super::{get, linear, Weights};
+use super::quantized::WeightSource;
 
 /// T5 v1.1 encoder geometry.
 #[derive(Debug, Clone)]
@@ -121,7 +121,12 @@ pub fn relative_position_bucket(
 }
 
 /// The additive per-head bias, `[1, heads, seq, seq]`.
-pub fn position_bias(cfg: &T5Config, seq: usize, w: &Weights, s: &Stream) -> Result<Array> {
+pub fn position_bias(
+    cfg: &T5Config,
+    seq: usize,
+    w: &impl WeightSource,
+    s: &Stream,
+) -> Result<Array> {
     let buckets = relative_position_bucket(
         seq,
         seq,
@@ -131,10 +136,9 @@ pub fn position_bias(cfg: &T5Config, seq: usize, w: &Weights, s: &Stream) -> Res
     );
     let idx = Array::from_slice_i32(&buckets, &[seq * seq])?;
     // The table lives on the first block only.
-    let table = get(
-        w,
-        "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight",
-    )?;
+    // A lookup table, not a projection, so it is always dense — `take`
+    // indexes rows and there is no matmul to fuse a dequantisation into.
+    let table = w.dense("encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight")?;
     // [seq*seq, heads] -> [seq, seq, heads] -> [1, heads, seq, seq]
     table
         .take(&idx, 0, s)?
@@ -167,7 +171,7 @@ fn attention(
     x: &Array,
     bias: &Array,
     cfg: &T5Config,
-    w: &Weights,
+    w: &impl WeightSource,
     prefix: &str,
     s: &Stream,
 ) -> Result<Array> {
@@ -180,7 +184,7 @@ fn attention(
 
     let proj = |name: &str| -> Result<Array> {
         // No biases anywhere in T5.
-        linear(x, get(w, &p(&format!("{name}.weight")))?, None, s)?
+        w.linear(x, &p(&format!("{name}.weight")), None, s)?
             .reshape(&[b, n, heads, d_kv], s)?
             .transpose(&[0, 2, 1, 3], s)
     };
@@ -191,7 +195,7 @@ fn attention(
         .transpose(&[0, 2, 1, 3], s)?
         .contiguous(s)?
         .reshape(&[b, n, cfg.inner_dim()], s)?;
-    linear(&ctx, get(w, &p("o.weight"))?, None, s)
+    w.linear(&ctx, &p("o.weight"), None, s)
 }
 
 /// Gated GELU: `wo(gelu_new(wi_0(x)) * wi_1(x))`.
@@ -202,18 +206,18 @@ fn attention(
 /// Measured with the erf form here: every hidden state was 200-300x further
 /// from transformers than the candle port, with no single layer obviously
 /// wrong.
-fn feed_forward(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
+fn feed_forward(x: &Array, w: &impl WeightSource, prefix: &str, s: &Stream) -> Result<Array> {
     let p = |n: &str| format!("{prefix}.{n}");
-    let gate = linear(x, get(w, &p("wi_0.weight"))?, None, s)?.gelu_approx(s)?;
-    let up = linear(x, get(w, &p("wi_1.weight"))?, None, s)?;
-    linear(&gate.mul(&up, s)?, get(w, &p("wo.weight"))?, None, s)
+    let gate = w.linear(x, &p("wi_0.weight"), None, s)?.gelu_approx(s)?;
+    let up = w.linear(x, &p("wi_1.weight"), None, s)?;
+    w.linear(&gate.mul(&up, s)?, &p("wo.weight"), None, s)
 }
 
 fn block(
     x: &Array,
     bias: &Array,
     cfg: &T5Config,
-    w: &Weights,
+    w: &impl WeightSource,
     index: usize,
     s: &Stream,
 ) -> Result<Array> {
@@ -221,7 +225,7 @@ fn block(
 
     let normed = rms_norm(
         x,
-        get(w, &l(0, "layer_norm.weight"))?,
+        w.dense(&l(0, "layer_norm.weight"))?,
         cfg.layer_norm_epsilon,
         s,
     )?;
@@ -232,7 +236,7 @@ fn block(
 
     let normed = rms_norm(
         &x,
-        get(w, &l(1, "layer_norm.weight"))?,
+        w.dense(&l(1, "layer_norm.weight"))?,
         cfg.layer_norm_epsilon,
         s,
     )?;
@@ -255,7 +259,7 @@ fn block(
 pub fn encode_hidden_states(
     token_ids: &Array,
     cfg: &T5Config,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<Vec<Array>> {
     let [_, seq] = token_ids.shape()[..] else {
@@ -265,7 +269,7 @@ pub fn encode_hidden_states(
         )));
     };
     let bias = position_bias(cfg, seq, w, s)?;
-    let mut x = get(w, "shared.weight")?.take(token_ids, 0, s)?;
+    let mut x = w.dense("shared.weight")?.take(token_ids, 0, s)?;
 
     let mut states = Vec::with_capacity(cfg.num_layers + 1);
     states.push(x.contiguous(s)?);
@@ -278,7 +282,7 @@ pub fn encode_hidden_states(
     if let Some(last) = states.last_mut() {
         *last = rms_norm(
             last,
-            get(w, "encoder.final_layer_norm.weight")?,
+            w.dense("encoder.final_layer_norm.weight")?,
             cfg.layer_norm_epsilon,
             s,
         )?;
@@ -292,7 +296,12 @@ pub fn encode_hidden_states(
 /// roughly 40,000 by the last block and this norm brings them back to order 1,
 /// so omitting it is a four-orders-of-magnitude discrepancy in one tensor and
 /// none elsewhere.
-pub fn encode(token_ids: &Array, cfg: &T5Config, w: &Weights, s: &Stream) -> Result<Array> {
+pub fn encode(
+    token_ids: &Array,
+    cfg: &T5Config,
+    w: &impl WeightSource,
+    s: &Stream,
+) -> Result<Array> {
     let mut states = encode_hidden_states(token_ids, cfg, w, s)?;
     // The last state is already normalised, per `encode_hidden_states`.
     states

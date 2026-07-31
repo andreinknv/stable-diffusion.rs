@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use sd_models::clip::ClipTokenizer;
 use sd_models::mlx::{
     clip::{self, ClipConfig},
-    normalise_legacy_attention, sd3, t5,
+    normalise_legacy_attention,
+    quantized::{self, QuantizedWeights},
+    sd3, t5,
     vae::{self, VaeConfig},
     Weights,
 };
@@ -95,7 +97,8 @@ pub struct Sd3Pipeline {
     t5_tokenizer: T5Tokenizer,
     clip_l: Weights,
     clip_g: Weights,
-    t5: Weights,
+    /// **Quantised at rest.** T5-XXL is 4.7B parameters, 18.8 GB dense in f32.
+    t5: QuantizedWeights,
     transformer: Weights,
     vae: Weights,
     cfg: sd3::Sd3Config,
@@ -157,11 +160,15 @@ impl Sd3Pipeline {
 
         // Both T5 shards, merged. A single-file assumption drops half the
         // encoder and surfaces as a missing tensor naming one arbitrary layer.
-        let mut t5w: Weights = Weights::new();
+        let mut dense_t5: Weights = Weights::new();
         for shard in &paths.t5 {
             require(shard)?;
-            t5w.extend(load_safetensors(shard)?);
+            dense_t5.extend(load_safetensors(shard)?);
         }
+        // Quantised as it loads. The transformer stays dense — SD 3.5 medium
+        // is 2.47B, which is 9.9 GB in f32 and fits.
+        let t5w = quantized::from_dense(&dense_t5, quantized::DEFAULT_BITS, &stream)?;
+        drop(dense_t5);
 
         let mut vae_w = load_safetensors(&paths.vae)?;
         normalise_legacy_attention(&mut vae_w);
