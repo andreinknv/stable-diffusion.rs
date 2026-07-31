@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use stable_diffusion_rs::mlx::MlxPipeline;
+use stable_diffusion_rs::mlx::{MlxPipeline, SdxlPipeline};
 use stable_diffusion_rs::pipeline::{SamplerKind, Strength, Txt2ImgConfig};
 use stable_diffusion_rs::tensor::mlx::Array;
 
@@ -294,5 +294,104 @@ fn inpaint_bounds_the_edit_to_the_mask() {
         inside > outside * 2.0,
         "the edit moved the outside ({outside:.2}) nearly as much as the inside \
          ({inside:.2}); the mask is not bounding the run"
+    );
+}
+
+// -- SDXL -------------------------------------------------------------------
+
+fn sdxl_dir() -> Option<PathBuf> {
+    let p = PathBuf::from(std::env::var("SD_TEST_SDXL_DIR").ok()?);
+    p.is_dir().then_some(p)
+}
+
+/// SDXL through its own pipeline, at its **native 1024**.
+///
+/// Not 256 like the SD 1.5 tests above: `docs/handoff.md` records that SDXL
+/// below its native resolution is out of distribution and produces mush, so a
+/// small run here would fail the "is this an image" check for a reason that is
+/// the model's and not the port's.
+/// Measured at **24 s** in a release build on this machine, so it is not
+/// ignored — an unrun test is not a gate. A debug build is far slower; the
+/// project's verification command uses `--release` for exactly this reason.
+#[test]
+fn sdxl_txt2img_through_the_public_api() {
+    let Some(dir) = sdxl_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_SDXL_DIR to an SDXL checkpoint.");
+        return;
+    };
+    let pipe = SdxlPipeline::load(&dir).expect("loading SDXL");
+    let cfg = Txt2ImgConfig {
+        width: 1024,
+        height: 1024,
+        steps: 4,
+        sampler: SamplerKind::DpmPlusPlus2M,
+        ..config()
+    };
+    let (w, h, bytes) = pipe.txt2img(&cfg).expect("sdxl txt2img");
+    assert_eq!((w, h), (1024, 1024));
+
+    let (mean, sd, step) = looks_like_an_image(w, h, &bytes);
+    eprintln!("sdxl  mean {mean:.1}  sd {sd:.1}  neighbour step {step:.1}");
+    assert!((5.0..250.0).contains(&mean), "mean {mean:.1}");
+    assert!(sd > 10.0, "a standard deviation of {sd:.1} is a flat field");
+    assert!(step < 40.0, "neighbour step {step:.1} is noise");
+}
+
+/// **The conditioning is 2048 wide, and CLIP-L's half comes first.**
+///
+/// Cheap enough to run always: it loads the towers and encodes one prompt
+/// without touching the UNet. The order is invisible to a shape check — 768 +
+/// 1280 and 1280 + 768 are both 2048 — so the assembled context is compared
+/// against the two halves obtained separately. Each tower is itself gated by
+/// `mlx_golden_clip` and `mlx_golden_sdxl_text_encoder`; what this adds is the
+/// composition.
+#[test]
+fn sdxl_conditioning_puts_clip_l_first() {
+    let Some(dir) = sdxl_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_SDXL_DIR to an SDXL checkpoint.");
+        return;
+    };
+    let pipe = SdxlPipeline::load(&dir).expect("loading SDXL");
+    let s = pipe.stream();
+    let (context, pooled) = pipe.encode_for_test("a red apple").expect("encode");
+    let (l, g, g_pooled) = pipe.encode_halves("a red apple").expect("halves");
+
+    assert_eq!(context.shape(), vec![1, 77, 2048], "768 + 1280");
+    assert_eq!(l.shape(), vec![1, 77, 768], "CLIP-L");
+    assert_eq!(g.shape(), vec![1, 77, 1280], "OpenCLIP bigG");
+    assert_eq!(pooled.shape(), vec![1, 1280], "the pooled vector is bigG's");
+    assert_eq!(
+        pooled.to_vec_f32(s).unwrap(),
+        g_pooled.to_vec_f32(s).unwrap(),
+        "the pooled vector must come from the second tower, not the first"
+    );
+
+    let (ctx, lv, gv) = (
+        context.to_vec_f32(s).unwrap(),
+        l.to_vec_f32(s).unwrap(),
+        g.to_vec_f32(s).unwrap(),
+    );
+    for pos in 0..77 {
+        let row = &ctx[pos * 2048..(pos + 1) * 2048];
+        assert_eq!(
+            &row[..768],
+            &lv[pos * 768..(pos + 1) * 768],
+            "position {pos}: the first 768 features are not CLIP-L's"
+        );
+        assert_eq!(
+            &row[768..],
+            &gv[pos * 1280..(pos + 1) * 1280],
+            "position {pos}: the last 1280 features are not bigG's"
+        );
+    }
+
+    // The two halves are genuinely different tensors, so the check above is
+    // not satisfied trivially. CLIP-L's activations are the larger here —
+    // `mlx_golden_clip` records its peak at 851 against bigG's 66.
+    let peak = |v: &[f32]| v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    eprintln!(
+        "sdxl context: CLIP-L peak {:.2}, bigG peak {:.2}",
+        peak(&lv),
+        peak(&gv)
     );
 }

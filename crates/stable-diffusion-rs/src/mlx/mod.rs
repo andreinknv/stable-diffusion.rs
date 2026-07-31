@@ -38,10 +38,58 @@ use sd_tensor::{Device, Tensor};
 
 use crate::pipeline::{PipelineError, SamplerKind, Strength, Txt2ImgConfig};
 
+pub mod sdxl;
+
+pub use sdxl::SdxlPipeline;
+
 /// `PipelineError` carries no free-form variant of its own, so a message goes
 /// through the tensor error the way the candle pipeline's do.
-fn msg(text: String) -> PipelineError {
+pub(crate) fn msg(text: String) -> PipelineError {
     PipelineError::Tensor(sd_tensor::Error::Msg(text))
+}
+
+/// The discrete training timestep nearest a continuous sigma.
+///
+/// The UNet takes a training timestep, not a sigma. Handing it the sigma runs —
+/// both are one number — and conditions on the wrong point of the schedule
+/// entirely.
+pub(crate) fn timestep_for(schedule: &Schedule, sigma: f64) -> f32 {
+    schedule
+        .sigmas()
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (*a - sigma)
+                .abs()
+                .partial_cmp(&(*b - sigma).abs())
+                .expect("finite sigmas")
+        })
+        .map(|(i, _)| i as f32)
+        .unwrap_or(0.0)
+}
+
+/// A standard-normal draw of `[1, c, h, w]`, delivered in NHWC.
+///
+/// **Through `SeededRng` on the CPU**, which is the module's one deliberate
+/// inefficiency: it makes both backends see identical draws, so a difference
+/// between their images is the models and not the dice.
+pub(crate) fn draw_noise(
+    rng: &mut SeededRng,
+    c: usize,
+    h: usize,
+    w: usize,
+) -> Result<Array, PipelineError> {
+    let t: Tensor = rng.randn((1, c, h, w), &Device::Cpu)?;
+    let v = t.flatten_all()?.to_vec1::<f32>()?;
+    let mut out = vec![0.0f32; v.len()];
+    for ci in 0..c {
+        for y in 0..h {
+            for x in 0..w {
+                out[(y * w + x) * c + ci] = v[ci * h * w + y * w + x];
+            }
+        }
+    }
+    Ok(Array::from_slice_f32(&out, &[1, h, w, c])?)
 }
 
 /// `<|startoftext|>` and `<|endoftext|>` in CLIP's vocabulary.
@@ -187,29 +235,10 @@ impl MlxPipeline {
         }
     }
 
-    /// The discrete training timestep nearest a continuous sigma.
-    ///
-    /// The UNet takes a training timestep, not a sigma. Handing it the sigma
-    /// runs — both are one number — and conditions on the wrong point of the
-    /// schedule entirely.
     fn timestep_for(&self, sigma: f64) -> f32 {
-        self.schedule
-            .sigmas()
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (*a - sigma)
-                    .abs()
-                    .partial_cmp(&(*b - sigma).abs())
-                    .expect("finite sigmas")
-            })
-            .map(|(i, _)| i as f32)
-            .unwrap_or(0.0)
+        timestep_for(&self.schedule, sigma)
     }
 
-    /// A standard-normal draw of `[1, c, h, w]`, in NHWC.
-    ///
-    /// Through `SeededRng` on the CPU — see the module docs.
     fn draw(
         &self,
         rng: &mut SeededRng,
@@ -217,17 +246,7 @@ impl MlxPipeline {
         h: usize,
         w: usize,
     ) -> Result<Array, PipelineError> {
-        let t: Tensor = rng.randn((1, c, h, w), &Device::Cpu)?;
-        let v = t.flatten_all()?.to_vec1::<f32>()?;
-        let mut out = vec![0.0f32; v.len()];
-        for ci in 0..c {
-            for y in 0..h {
-                for x in 0..w {
-                    out[(y * w + x) * c + ci] = v[ci * h * w + y * w + x];
-                }
-            }
-        }
-        Ok(Array::from_slice_f32(&out, &[1, h, w, c])?)
+        draw_noise(rng, c, h, w)
     }
 
     /// The sampling loop, shared by txt2img, img2img and inpaint.

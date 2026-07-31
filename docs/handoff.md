@@ -77,8 +77,9 @@ findings still bind.
    What it does *not* yet carry, all of which the candle `Txt2ImgPipeline` does
    and all of which is orchestration rather than new model work:
 
-   - SDXL, SD 3.5, Flux and unCLIP pipelines (the models are ported; the
-     pipelines around them are not)
+   - SD 3.5, Flux and unCLIP pipelines (the models are ported; the pipelines
+     around them are not). **SDXL is done** — `SdxlPipeline`, txt2img and
+     img2img, verified at its native 1024 in 24 s
    - ControlNet stacking, IP-Adapter, GLIGEN and LoRA *attachment* — each
      model is gated, none is wired into `MlxPipeline`
    - step caching, region/area prompts, two-pass hires, model placement,
