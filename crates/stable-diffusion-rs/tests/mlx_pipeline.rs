@@ -395,3 +395,124 @@ fn sdxl_conditioning_puts_clip_l_first() {
         peak(&gv)
     );
 }
+
+// -- attachments ------------------------------------------------------------
+
+fn controlnet_path() -> Option<PathBuf> {
+    let p = PathBuf::from(std::env::var("SD_TEST_CONTROLNET").ok()?);
+    p.is_file().then_some(p)
+}
+
+fn lora_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/lora/lcm-lora-sdv1-5.safetensors")
+}
+
+/// **A ControlNet must steer, and a scale of 0 must not.**
+///
+/// The hint is a hard vertical edge down the middle — structure a Canny
+/// ControlNet has something to say about, and which the prompt does not
+/// mention, so any effect on the image is the ControlNet's.
+#[test]
+fn a_controlnet_steers_the_image_and_scale_zero_does_not() {
+    let (Some(dir), Some(net)) = (model_dir(), controlnet_path()) else {
+        sd_tensor::skip_missing_fixture!(
+            "SKIP: needs SD_TEST_MODEL_DIR and SD_TEST_CONTROLNET (a .safetensors file)."
+        );
+        return;
+    };
+    let cfg = config();
+    let (w, h) = (cfg.width, cfg.height);
+
+    // A white vertical line on black, in [-1, 1].
+    let mut px = vec![-1.0f32; h * w * 3];
+    for y in 0..h {
+        for c in 0..3 {
+            px[(y * w + w / 2) * 3 + c] = 1.0;
+        }
+    }
+    let hint = Array::from_slice_f32(&px, &[1, h, w, 3]).unwrap();
+
+    let plain = MlxPipeline::load(&dir).expect("plain");
+    let (_, _, without) = plain.txt2img(&cfg).expect("txt2img");
+
+    let mut steered = MlxPipeline::load(&dir).expect("steered");
+    steered.attach_controlnet(&net, 1.0).expect("attach");
+    assert_eq!(steered.controlnet_count(), 1);
+    let (_, _, with) = steered
+        .txt2img_controlled(&cfg, Some(&hint))
+        .expect("controlled");
+
+    let drift = |a: &[u8], b: &[u8]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (*x as f64 - *y as f64).abs())
+            .sum::<f64>()
+            / a.len() as f64
+    };
+    let moved = drift(&without, &with);
+    eprintln!("controlnet at scale 1 moved the image by {moved:.2}/255");
+    assert!(
+        moved > 2.0,
+        "the ControlNet moved the image by only {moved:.2}/255; it is not being applied"
+    );
+
+    // **Scale 0 must be exactly the unsteered run**, not merely close to it.
+    let mut off = MlxPipeline::load(&dir).expect("off");
+    off.attach_controlnet(&net, 0.0).expect("attach");
+    let (_, _, zero) = off.txt2img_controlled(&cfg, Some(&hint)).expect("scale 0");
+    assert_eq!(
+        zero, without,
+        "a ControlNet at scale 0 changed the image; its corrections are not exactly zero"
+    );
+}
+
+/// A ControlNet with nothing to read is refused, rather than steering toward a
+/// blank image.
+#[test]
+fn a_controlnet_without_a_map_is_refused() {
+    let (Some(dir), Some(net)) = (model_dir(), controlnet_path()) else {
+        sd_tensor::skip_missing_fixture!("SKIP: needs SD_TEST_MODEL_DIR and SD_TEST_CONTROLNET.");
+        return;
+    };
+    let mut pipe = MlxPipeline::load(&dir).expect("pipeline");
+    pipe.attach_controlnet(&net, 1.0).expect("attach");
+    assert!(
+        pipe.txt2img(&config()).is_err(),
+        "a ControlNet with no control map must be refused"
+    );
+}
+
+/// **A LoRA must map completely, or not at all.**
+///
+/// A half-applied adapter still renders a plausible image, so partial coverage
+/// is an error rather than a warning.
+#[test]
+fn a_lora_merges_completely_and_changes_the_image() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    if !lora_path().exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no LCM LoRA fixture.");
+        return;
+    }
+    let cfg = config();
+    let plain = MlxPipeline::load(&dir).expect("plain");
+    let (_, _, before) = plain.txt2img(&cfg).expect("txt2img");
+
+    let mut adapted = MlxPipeline::load(&dir).expect("adapted");
+    let merged = adapted.attach_lora(&lora_path(), 1.0).expect("attach");
+    assert_eq!(merged, 278, "lcm-lora-sdv1-5 corrects 278 layers");
+    let (_, _, after) = adapted.txt2img(&cfg).expect("txt2img");
+    assert_ne!(before, after, "the LoRA changed nothing");
+
+    // And a multiplier of 0 is bit-identical to no adapter at all.
+    let mut zeroed = MlxPipeline::load(&dir).expect("zeroed");
+    zeroed.attach_lora(&lora_path(), 0.0).expect("attach");
+    let (_, _, none) = zeroed.txt2img(&cfg).expect("txt2img");
+    assert_eq!(
+        none, before,
+        "a LoRA at multiplier 0 changed the image; it must be an exact no-op"
+    );
+}

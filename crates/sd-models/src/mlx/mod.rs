@@ -222,6 +222,12 @@ pub struct Adapters<'a> {
     /// GLIGEN's grounding tokens.
     pub objs: Option<&'a Array>,
     pub motion: Option<&'a Motion<'a>>,
+    /// A ControlNet's corrections: one per skip, plus one for the mid block.
+    ///
+    /// Added into the skip stack and the mid output rather than replacing
+    /// them. Several ControlNets sum here, which is why the pipeline adds them
+    /// together before handing one set over.
+    pub control: Option<&'a controlnet::Control>,
 }
 
 impl<'a> Adapters<'a> {
@@ -1011,7 +1017,7 @@ pub fn unet_forward_with(
     let ad = Adapters {
         ip,
         objs,
-        motion: None,
+        ..Default::default()
     };
     unet_forward_adapters(
         sample_nhwc,
@@ -1053,6 +1059,25 @@ pub fn unet_forward_adapters(
     let temb = conditioned_temb(timestep, added, class_embeds, cfg, w, s)?;
     let (h, mut skips) = down_pass(sample_nhwc, &temb, context, cfg, ad, w, s)?;
     let mut h = mid_block(&h, &temb, context, cfg, ad, w, s)?;
+
+    // A ControlNet steers by *adding* to what the down pass produced. The
+    // counts must match exactly: a ControlNet built from a different config
+    // emits a plausible number of plausible tensors, and a mismatch here is
+    // the last place it can be caught cheaply.
+    if let Some(control) = ad.control {
+        if control.down.len() != skips.len() {
+            return Err(Error::Msg(format!(
+                "mlx: the ControlNet emitted {} corrections for {} skips; it was built from \
+                 a different config than this UNet",
+                control.down.len(),
+                skips.len()
+            )));
+        }
+        for (skip, correction) in skips.iter_mut().zip(&control.down) {
+            *skip = skip.add(correction, s)?;
+        }
+        h = h.add(&control.mid, s)?;
+    }
 
     // UpBlock2D first, then three CrossAttnUpBlock2D — the reverse of the down
     // pass, and the deepest block is the one without attention. Three resnets

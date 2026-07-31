@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use sd_models::clip::ClipTokenizer;
 use sd_models::mlx::{
-    clip, normalise_legacy_attention, sample, unet_forward_adapters, vae, Adapters, UNetConfig,
-    Weights,
+    clip, controlnet, lora::Lora, normalise_legacy_attention, sample, unet_forward_adapters, vae,
+    Adapters, UNetConfig, Weights,
 };
 use sd_sample::{sigmas_for_steps, Schedule};
 use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
@@ -133,6 +133,16 @@ impl ModelPaths {
     }
 }
 
+/// One ControlNet and how hard it steers.
+///
+/// `scale` multiplies every correction; **0 contributes exactly nothing**
+/// rather than merely almost nothing, which is what makes it a usable off
+/// switch.
+pub struct Control {
+    pub weights: Weights,
+    pub scale: f64,
+}
+
 /// A loaded SD 1.5-family pipeline on MLX.
 pub struct MlxPipeline {
     tokenizer: ClipTokenizer,
@@ -143,6 +153,8 @@ pub struct MlxPipeline {
     vae_cfg: vae::VaeConfig,
     schedule: Schedule,
     stream: Stream,
+    /// Spatial conditioning, in attachment order. Empty is the common case.
+    controlnets: Vec<Control>,
 }
 
 impl MlxPipeline {
@@ -181,7 +193,49 @@ impl MlxPipeline {
             vae_cfg: vae::VaeConfig::sd15(),
             schedule: Schedule::sd15(),
             stream,
+            controlnets: Vec::new(),
         })
+    }
+
+    /// Merge a LoRA into the UNet, in place.
+    ///
+    /// **Coverage is the thing that matters**, not the arithmetic. The merge is
+    /// three lines and hard to get subtly wrong; the name mapping is where an
+    /// adapter silently half-applies, and a half-applied adapter still renders
+    /// a plausible image. So this errors on any layer that found no home rather
+    /// than applying the rest.
+    pub fn attach_lora(&mut self, path: &Path, multiplier: f64) -> Result<usize, PipelineError> {
+        let raw = load_safetensors(path)?;
+        let lora = Lora::from_weights(&raw, &self.stream)?;
+        let applied = lora.merge_into(&mut self.unet, multiplier as f32, &self.stream)?;
+        if !applied.unmatched.is_empty() {
+            return Err(msg(format!(
+                "mlx: {} of the LoRA's layers have no weight in this UNet, first `{}`. \
+                 A LoRA names the layers it corrects, so entries with nowhere to go mean it \
+                 was trained for a different architecture.",
+                applied.unmatched.len(),
+                applied.unmatched.first().map(String::as_str).unwrap_or("?")
+            )));
+        }
+        Ok(applied.merged)
+    }
+
+    /// Attach a ControlNet. Several may be attached, and their corrections sum.
+    ///
+    /// **Built from the same config as this UNet**, which is checked where the
+    /// corrections are added rather than here — a ControlNet for a different
+    /// architecture emits a plausible number of plausible tensors and only the
+    /// count catches it.
+    pub fn attach_controlnet(&mut self, path: &Path, scale: f64) -> Result<(), PipelineError> {
+        let mut weights = load_safetensors(path)?;
+        normalise_legacy_attention(&mut weights);
+        self.controlnets.push(Control { weights, scale });
+        Ok(())
+    }
+
+    /// How many ControlNets are attached.
+    pub fn controlnet_count(&self) -> usize {
+        self.controlnets.len()
     }
 
     /// Encode one prompt to `[1, 77, 768]`.
@@ -263,6 +317,7 @@ impl MlxPipeline {
         cfg_scale: f64,
         sampler: SamplerKind,
         keep: Option<(&Array, &Array)>,
+        hint: Option<&Array>,
         rng: &mut SeededRng,
     ) -> Result<Array, PipelineError> {
         let s = &self.stream;
@@ -280,16 +335,18 @@ impl MlxPipeline {
             let latent_in = sample::scale_model_input(&latent, sigma, s)?;
             let t = self.timestep_for(sigma);
             let timestep = Array::from_slice_f32(&[t, t], &[2])?;
+
+            // Several ControlNets sum. Running them here rather than once
+            // outside the loop is not an optimisation missed: each is
+            // conditioned on the current latent and timestep, so its
+            // corrections differ every step.
+            let control = self.control_for(&latent_in, &timestep, context, hint)?;
+            let ad = Adapters {
+                control: control.as_ref(),
+                ..Default::default()
+            };
             let out = unet_forward_adapters(
-                &latent_in,
-                &timestep,
-                context,
-                None,
-                None,
-                &Adapters::default(),
-                &self.cfg,
-                &self.unet,
-                s,
+                &latent_in, &timestep, context, None, None, &ad, &self.cfg, &self.unet, s,
             )?;
             let noise_pred = sample::guidance(&out, cfg_scale, s)?;
             let denoised = sample::denoise_epsilon(&latent, &noise_pred, sigma, s)?;
@@ -314,6 +371,70 @@ impl MlxPipeline {
         Ok(latent)
     }
 
+    /// Every attached ControlNet's corrections, summed.
+    ///
+    /// `None` when nothing is attached, so the ordinary path allocates
+    /// nothing. A hint is required once one is: a ControlNet with no map to
+    /// read would emit corrections from a blank image, which steers the run
+    /// toward an empty picture rather than doing nothing.
+    fn control_for(
+        &self,
+        latent_in: &Array,
+        timestep: &Array,
+        context: &Array,
+        hint: Option<&Array>,
+    ) -> Result<Option<controlnet::Control>, PipelineError> {
+        if self.controlnets.is_empty() {
+            return Ok(None);
+        }
+        let s = &self.stream;
+        let Some(hint) = hint else {
+            return Err(msg(
+                "mlx: a ControlNet is attached but no control map was supplied".into(),
+            ));
+        };
+        // The hint is doubled to match the guidance batch, exactly as the
+        // latent is — the ControlNet sees both rows.
+        let hint = concat(&[hint, hint], 0, s)?;
+
+        let mut total: Option<controlnet::Control> = None;
+        for net in &self.controlnets {
+            let c = controlnet::forward(
+                latent_in,
+                timestep,
+                context,
+                &hint,
+                net.scale,
+                &self.cfg,
+                &net.weights,
+                s,
+            )?;
+            total = Some(match total {
+                None => c,
+                Some(acc) => {
+                    if acc.down.len() != c.down.len() {
+                        return Err(msg(format!(
+                            "mlx: two ControlNets emitted {} and {} corrections",
+                            acc.down.len(),
+                            c.down.len()
+                        )));
+                    }
+                    let down = acc
+                        .down
+                        .iter()
+                        .zip(&c.down)
+                        .map(|(a, b)| a.add(b, s))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    controlnet::Control {
+                        down,
+                        mid: acc.mid.add(&c.mid, s)?,
+                    }
+                }
+            });
+        }
+        Ok(total)
+    }
+
     /// A latent to `[h, w, 3]` bytes.
     fn decode(&self, latent: &Array) -> Result<(usize, usize, Vec<u8>), PipelineError> {
         let s = &self.stream;
@@ -336,6 +457,18 @@ impl MlxPipeline {
 
     /// Prompt to pixels. Returns `(width, height, RGB bytes)`.
     pub fn txt2img(&self, cfg: &Txt2ImgConfig) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        self.txt2img_controlled(cfg, None)
+    }
+
+    /// [`Self::txt2img`] with a control map for the attached ControlNets.
+    ///
+    /// `hint` is `[1, h, w, 3]` in `[-1, 1]` at the run's own resolution — a
+    /// Canny edge map, a depth map, whatever the ControlNet was trained on.
+    pub fn txt2img_controlled(
+        &self,
+        cfg: &Txt2ImgConfig,
+        hint: Option<&Array>,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
         if cfg.width % 8 != 0 || cfg.height % 8 != 0 {
             return Err(msg(format!(
                 "mlx: {}x{} does not divide into 8-pixel latent cells",
@@ -360,6 +493,7 @@ impl MlxPipeline {
             cfg.cfg_scale,
             cfg.sampler,
             None,
+            hint,
             &mut rng,
         )?;
         self.decode(&latent)
@@ -427,6 +561,7 @@ impl MlxPipeline {
             cfg.cfg_scale,
             cfg.sampler,
             mask.as_ref().map(|m| (m, &init)),
+            None,
             &mut rng,
         )?;
         self.decode(&latent)
