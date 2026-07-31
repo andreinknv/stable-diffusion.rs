@@ -23,6 +23,8 @@
 pub mod clip;
 /// ControlNet: a copy of the UNet's down stack that emits corrections.
 pub mod controlnet;
+/// LoRA adapters, merged into a weight map before any model is built.
+pub mod lora;
 /// The txt2img sampling loop.
 pub mod sample;
 /// TAESD, the tiny autoencoder. Its latent scaling is 1.0, not the VAE's.
