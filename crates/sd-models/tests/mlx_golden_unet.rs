@@ -126,6 +126,7 @@ fn down_block_0_matches_diffusers() {
         8,
         1,
         false,
+        None,
         &w,
         "down_blocks.0.attentions.0",
         &s,
@@ -157,7 +158,7 @@ fn the_whole_down_pass_matches_diffusers() {
     let temb = timestep_embedding(refs.get("timestep").expect("timestep"), 320, &w, &s).unwrap();
 
     let x = sample.transpose(&[0, 2, 3, 1], &s).unwrap();
-    let (_deepest, skips) = down_pass(&x, &temb, context, &cfg, &w, &s).unwrap();
+    let (_deepest, skips) = down_pass(&x, &temb, context, &cfg, None, &w, &s).unwrap();
 
     assert_eq!(skips.len(), 12, "skip stack must have 12 entries");
 
@@ -235,10 +236,17 @@ fn the_mid_block_matches_diffusers() {
         .unwrap();
     let temb = timestep_embedding(refs.get("timestep").unwrap(), 320, &w, &s).unwrap();
     let (deepest, _skips) =
-        down_pass(&x, &temb, refs.get("context").unwrap(), &cfg, &w, &s).unwrap();
-    let mid =
-        sd_models::mlx::mid_block(&deepest, &temb, refs.get("context").unwrap(), &cfg, &w, &s)
-            .unwrap();
+        down_pass(&x, &temb, refs.get("context").unwrap(), &cfg, None, &w, &s).unwrap();
+    let mid = sd_models::mlx::mid_block(
+        &deepest,
+        &temb,
+        refs.get("context").unwrap(),
+        &cfg,
+        None,
+        &w,
+        &s,
+    )
+    .unwrap();
 
     let worst = max_abs(&mid, refs.get("mid_output").unwrap(), &s, "mid_output");
     assert!(
@@ -342,6 +350,7 @@ fn the_sdxl_unet_matches_diffusers() {
         context,
         Some((pooled, time_ids)),
         None,
+        None,
         &cfg,
         &w,
         &s,
@@ -371,8 +380,18 @@ fn micro_conditioning_is_required_when_the_config_declares_it() {
 
     // SDXL config, no conditioning supplied.
     assert!(
-        sd_models::mlx::unet_forward_with(&x, t, ctx, None, None, &UNetConfig::sdxl(), &w, &s)
-            .is_err(),
+        sd_models::mlx::unet_forward_with(
+            &x,
+            t,
+            ctx,
+            None,
+            None,
+            None,
+            &UNetConfig::sdxl(),
+            &w,
+            &s
+        )
+        .is_err(),
         "an SDXL config must refuse to run without micro-conditioning"
     );
     // SD 1.5 config, conditioning supplied.
@@ -382,6 +401,7 @@ fn micro_conditioning_is_required_when_the_config_declares_it() {
             t,
             ctx,
             Some((ctx, ctx)),
+            None,
             None,
             &UNetConfig::sd15(),
             &w,
@@ -436,6 +456,7 @@ fn the_unclip_unet_matches_diffusers() {
         text,
         None,
         Some(refs.get("noised_250").expect("noised_250")),
+        None,
         &cfg,
         &w,
         &s,
@@ -454,7 +475,8 @@ fn the_unclip_unet_matches_diffusers() {
     // different tensor entirely and produces a different image.
     let zeros = Array::from_slice_f32(&vec![0.0; 2048], &[1, 2048]).unwrap();
     let zeroed =
-        sd_models::mlx::unet_forward_with(&x, t, text, None, Some(&zeros), &cfg, &w, &s).unwrap();
+        sd_models::mlx::unet_forward_with(&x, t, text, None, Some(&zeros), None, &cfg, &w, &s)
+            .unwrap();
     let worst_zero = excess(
         &zeroed,
         refs.get("unet_out_zero").unwrap(),
