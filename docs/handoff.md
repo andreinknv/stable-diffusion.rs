@@ -67,18 +67,27 @@ findings still bind.
 6. **What is actually left, and it is two things.** Both are real, and the
    first is the larger.
 
-   **(a) The pipeline layer is entirely candle.** `crates/stable-diffusion-rs/`
-   is 4,921 lines across `pipeline/*.rs` with **zero** MLX in it, and that is
-   the library's public surface — `Txt2ImgPipeline`, `run_inpaint`, the CLI,
-   `api_contract`. `mlx_end_to_end` and `mlx_img2img` prove the *pieces*
-   compose by hand-assembling the loop; they do not go through
-   `Txt2ImgPipeline`, so nothing a caller actually invokes runs on MLX yet.
+   **(a) The pipeline layer.** `MlxPipeline` now exists —
+   `crates/stable-diffusion-rs/src/mlx/`, gated by `mlx_pipeline` — and does
+   **txt2img, img2img and inpaint on SD 1.5 through the public API**: load a
+   model directory, call `txt2img`, get bytes. Same seed gives the same image
+   byte for byte, the two samplers are distinguishable, and a size that does
+   not divide into latent cells is refused.
 
-   This is easy to under-read after the model table above. Every model is
-   ported and gated against diffusers, and none of them is reachable through
-   the public API on MLX. The orchestration — model placement, step caching,
-   region prompts, two-pass hires, ControlNet stacking, progress reporting — is
-   the part that is left, and it is more code than any single model was.
+   What it does *not* yet carry, all of which the candle `Txt2ImgPipeline` does
+   and all of which is orchestration rather than new model work:
+
+   - SDXL, SD 3.5, Flux and unCLIP pipelines (the models are ported; the
+     pipelines around them are not)
+   - ControlNet stacking, IP-Adapter, GLIGEN and LoRA *attachment* — each
+     model is gated, none is wired into `MlxPipeline`
+   - step caching, region/area prompts, two-pass hires, model placement,
+     progress reporting and cancellation
+   - AnimateDiff frame batching
+
+   So the shape has changed since the last entry: this is no longer "the
+   pipeline layer is entirely candle", it is "one pipeline of five works, with
+   the conditioning features unwired".
 
    **(b) Quantised-at-rest inference does not exist on MLX**, so full-size Flux
    and T5-XXL cannot leave candle. The MLX GGUF loader dequantises to f32;
@@ -924,7 +933,7 @@ changing any code.
 | `golden_samplers`, `golden_flow`, `golden_flux_sampling` | `sd-sample` is scalar; shared already |
 | `fused_{adaln,geglu,group_norm}`, `metal_{parity,decoder_parity,smoke}`, `norm_reduction` | die with candle |
 | `flux_schnell_gguf`, `t5_xxl_gguf` | geometry ported; running them needs (b) above |
-| `pipeline_smoke`, `api_contract` | need (a) above — the pipeline layer |
+| `pipeline_smoke`, `api_contract` | need (a) above — SD 1.5 txt2img/img2img/inpaint is done, the rest of the surface is not |
 
 The last two rows are the whole remaining list.
 

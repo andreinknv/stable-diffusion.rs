@@ -19,6 +19,14 @@ pub use sd_tensor as tensor;
 
 pub mod canny;
 pub mod image_io;
+/// The generation pipeline on MLX.
+///
+/// Parallel to [`pipeline`] rather than generic over the backend: `sd-tensor`
+/// presents MLX with its own shape rather than emulating candle's API, so one
+/// pipeline cannot serve both. This is what replaces [`pipeline`] when candle
+/// goes.
+#[cfg(feature = "mlx")]
+pub mod mlx;
 pub mod pipeline;
 
 /// Crate version, for `--version` and bug reports.

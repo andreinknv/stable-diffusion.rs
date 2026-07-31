@@ -1,0 +1,421 @@
+//! The generation pipeline on MLX.
+//!
+//! Every model this needs is already ported and gated against diffusers. What
+//! is here is the orchestration between them — and it is the part a caller
+//! actually invokes, so until it exists the MLX port is a set of verified
+//! pieces rather than a working backend.
+//!
+//! # What is shared with the candle pipeline, and why
+//!
+//! The configuration types — [`Txt2ImgConfig`], [`SamplerKind`], [`Strength`],
+//! [`Progress`] — are plain data and touch no tensor, so they are *imported*
+//! rather than mirrored. So is `sd_sample::Schedule`, which returns `Vec<f64>`.
+//! A second copy of any of them is how the two backends would come to disagree
+//! about what a seed or a strength means.
+//!
+//! What is genuinely rewritten is the tensor work: the guidance batch, the
+//! sampler step, and the NCHW/NHWC boundary.
+//!
+//! # The one thing that must not drift: the noise
+//!
+//! Noise is drawn through `SeededRng` on the CPU and handed to MLX as plain
+//! data, exactly as `mlx_end_to_end` does. That is deliberate rather than
+//! lazy: it makes the two backends see **identical draws**, so any difference
+//! between their images is the models and not the dice. Drawing on the GPU
+//! would be faster and would make every cross-backend comparison meaningless.
+
+use std::path::{Path, PathBuf};
+
+use sd_models::clip::ClipTokenizer;
+use sd_models::mlx::{
+    clip, normalise_legacy_attention, sample, unet_forward_adapters, vae, Adapters, UNetConfig,
+    Weights,
+};
+use sd_sample::{sigmas_for_steps, Schedule};
+use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
+use sd_tensor::rng::SeededRng;
+use sd_tensor::{Device, Tensor};
+
+use crate::pipeline::{PipelineError, SamplerKind, Strength, Txt2ImgConfig};
+
+/// `PipelineError` carries no free-form variant of its own, so a message goes
+/// through the tensor error the way the candle pipeline's do.
+fn msg(text: String) -> PipelineError {
+    PipelineError::Tensor(sd_tensor::Error::Msg(text))
+}
+
+/// `<|startoftext|>` and `<|endoftext|>` in CLIP's vocabulary.
+const BOS: i32 = 49406;
+const EOS: i32 = 49407;
+
+/// Where a checkpoint's four pieces live under a model directory.
+///
+/// Laid out as `diffusers` does, which is what `SD_TEST_MODEL_DIR` points at.
+#[derive(Debug, Clone)]
+pub struct ModelPaths {
+    pub unet: PathBuf,
+    pub vae: PathBuf,
+    pub text_encoder: PathBuf,
+    pub tokenizer: PathBuf,
+}
+
+impl ModelPaths {
+    /// The `diffusers` layout under `root`.
+    pub fn in_dir(root: &Path) -> Self {
+        Self {
+            unet: root.join("unet/diffusion_pytorch_model.safetensors"),
+            vae: root.join("vae/diffusion_pytorch_model.safetensors"),
+            text_encoder: root.join("text_encoder/model.safetensors"),
+            tokenizer: root.join("tokenizer/tokenizer.json"),
+        }
+    }
+
+    /// Every path, for an existence check that names what is missing rather
+    /// than failing at whichever one is loaded first.
+    pub fn missing(&self) -> Vec<&Path> {
+        [
+            self.unet.as_path(),
+            self.vae.as_path(),
+            self.text_encoder.as_path(),
+            self.tokenizer.as_path(),
+        ]
+        .into_iter()
+        .filter(|p| !p.exists())
+        .collect()
+    }
+}
+
+/// A loaded SD 1.5-family pipeline on MLX.
+pub struct MlxPipeline {
+    tokenizer: ClipTokenizer,
+    text_encoder: Weights,
+    unet: Weights,
+    vae: Weights,
+    cfg: UNetConfig,
+    vae_cfg: vae::VaeConfig,
+    schedule: Schedule,
+    stream: Stream,
+}
+
+impl MlxPipeline {
+    /// Load SD 1.5 from a `diffusers` model directory.
+    pub fn load(root: &Path) -> Result<Self, PipelineError> {
+        let paths = ModelPaths::in_dir(root);
+        let missing = paths.missing();
+        if !missing.is_empty() {
+            return Err(msg(format!(
+                "mlx: {} is missing {}",
+                root.display(),
+                missing
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        let stream = Stream::gpu();
+        let tokenizer = ClipTokenizer::from_file(&paths.tokenizer)?;
+
+        // **The stock checkpoint may use the legacy attention names.** The
+        // decoder asks for `to_q` and a published VAE has `query`; converting
+        // once here is what keeps every model module free of the concern.
+        let mut vae = load_safetensors(&paths.vae)?;
+        normalise_legacy_attention(&mut vae);
+        let mut unet = load_safetensors(&paths.unet)?;
+        normalise_legacy_attention(&mut unet);
+
+        Ok(Self {
+            tokenizer,
+            text_encoder: load_safetensors(&paths.text_encoder)?,
+            unet,
+            vae,
+            cfg: UNetConfig::sd15(),
+            vae_cfg: vae::VaeConfig::sd15(),
+            schedule: Schedule::sd15(),
+            stream,
+        })
+    }
+
+    /// Encode one prompt to `[1, 77, 768]`.
+    ///
+    /// An empty prompt is *not* an empty sequence: it is BOS followed by 76
+    /// EOS, which is what the tokenizer produces and what the model was trained
+    /// against. Feeding a zero tensor instead is a different unconditional.
+    fn encode(&self, prompt: &str) -> Result<Array, PipelineError> {
+        let ids = if prompt.is_empty() {
+            let mut v = vec![EOS; clip::MAX_POSITION];
+            v[0] = BOS;
+            v
+        } else {
+            let encoded = self.tokenizer.encode(prompt)?;
+            encoded.iter().map(|&x| x as i32).collect()
+        };
+        if ids.len() != clip::MAX_POSITION {
+            return Err(msg(format!(
+                "mlx: the tokenizer produced {} ids, CLIP takes {}",
+                ids.len(),
+                clip::MAX_POSITION
+            )));
+        }
+        let ids = Array::from_slice_i32(&ids, &[1, clip::MAX_POSITION])?;
+        Ok(clip::text_encoder(&ids, &self.text_encoder, &self.stream)?)
+    }
+
+    /// The guidance batch: unconditional row **first**.
+    ///
+    /// The order is a contract with [`sample::guidance`], which reads row 0 as
+    /// the unconditional. Reversing it runs and drives the image away from the
+    /// prompt instead of toward it.
+    fn conditioning(&self, cfg: &Txt2ImgConfig) -> Result<Array, PipelineError> {
+        let cond = self.encode(&cfg.prompt)?;
+        let uncond = self.encode(&cfg.negative_prompt)?;
+        Ok(concat(&[&uncond, &cond], 0, &self.stream)?)
+    }
+
+    /// The sigma ladder for a sampler and step count.
+    fn sigmas(&self, sampler: SamplerKind, steps: usize) -> Vec<f64> {
+        match sampler {
+            SamplerKind::Lcm => sd_sample::lcm_sigmas(
+                &self.schedule,
+                &sd_sample::lcm_timesteps(
+                    self.schedule.alphas_cumprod.len(),
+                    sd_sample::ORIGINAL_INFERENCE_STEPS,
+                    steps,
+                ),
+            ),
+            _ => sigmas_for_steps(&self.schedule, steps),
+        }
+    }
+
+    /// The discrete training timestep nearest a continuous sigma.
+    ///
+    /// The UNet takes a training timestep, not a sigma. Handing it the sigma
+    /// runs — both are one number — and conditions on the wrong point of the
+    /// schedule entirely.
+    fn timestep_for(&self, sigma: f64) -> f32 {
+        self.schedule
+            .sigmas()
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (*a - sigma)
+                    .abs()
+                    .partial_cmp(&(*b - sigma).abs())
+                    .expect("finite sigmas")
+            })
+            .map(|(i, _)| i as f32)
+            .unwrap_or(0.0)
+    }
+
+    /// A standard-normal draw of `[1, c, h, w]`, in NHWC.
+    ///
+    /// Through `SeededRng` on the CPU — see the module docs.
+    fn draw(
+        &self,
+        rng: &mut SeededRng,
+        c: usize,
+        h: usize,
+        w: usize,
+    ) -> Result<Array, PipelineError> {
+        let t: Tensor = rng.randn((1, c, h, w), &Device::Cpu)?;
+        let v = t.flatten_all()?.to_vec1::<f32>()?;
+        let mut out = vec![0.0f32; v.len()];
+        for ci in 0..c {
+            for y in 0..h {
+                for x in 0..w {
+                    out[(y * w + x) * c + ci] = v[ci * h * w + y * w + x];
+                }
+            }
+        }
+        Ok(Array::from_slice_f32(&out, &[1, h, w, c])?)
+    }
+
+    /// The sampling loop, shared by txt2img, img2img and inpaint.
+    ///
+    /// `sigmas` is a ladder of `n + 1` boundaries; img2img passes a suffix of
+    /// one. `rng` is threaded in rather than created here so the caller
+    /// controls draw order, which is what makes a seed reproducible.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise(
+        &self,
+        mut latent: Array,
+        context: &Array,
+        sigmas: &[f64],
+        cfg_scale: f64,
+        sampler: SamplerKind,
+        keep: Option<(&Array, &Array)>,
+        rng: &mut SeededRng,
+    ) -> Result<Array, PipelineError> {
+        let s = &self.stream;
+        let [_, lh, lw, lc] = latent.shape()[..] else {
+            return Err(msg(format!(
+                "mlx: a latent should be [n, h, w, c], got {:?}",
+                latent.shape()
+            )));
+        };
+        let mut dpm = sample::DpmSolverPlusPlus2M::new();
+
+        for i in 0..sigmas.len().saturating_sub(1) {
+            let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+
+            let latent_in = sample::scale_model_input(&latent, sigma, s)?;
+            let t = self.timestep_for(sigma);
+            let timestep = Array::from_slice_f32(&[t, t], &[2])?;
+            let out = unet_forward_adapters(
+                &latent_in,
+                &timestep,
+                context,
+                None,
+                None,
+                &Adapters::default(),
+                &self.cfg,
+                &self.unet,
+                s,
+            )?;
+            let noise_pred = sample::guidance(&out, cfg_scale, s)?;
+            let denoised = sample::denoise_epsilon(&latent, &noise_pred, sigma, s)?;
+
+            latent = match sampler {
+                // Ancestral: a fresh draw every step, which is why step
+                // caching is refused with it on the candle side too.
+                SamplerKind::EulerAncestral | SamplerKind::Lcm => {
+                    let noise = self.draw(rng, lc, lh, lw)?;
+                    sample::euler_ancestral_step(&latent, &denoised, sigma, sigma_next, &noise, s)?
+                }
+                SamplerKind::DpmPlusPlus2M => dpm.step(&latent, &denoised, sigma, sigma_next, s)?,
+            };
+
+            // Inpainting: restore outside the mask at every step, so the model
+            // sees the true surroundings and what it paints joins up with them.
+            if let Some((mask, init)) = keep {
+                let noise = self.draw(rng, lc, lh, lw)?;
+                latent = sample::restore_outside_mask(&latent, init, mask, &noise, sigma_next, s)?;
+            }
+        }
+        Ok(latent)
+    }
+
+    /// A latent to `[h, w, 3]` bytes.
+    fn decode(&self, latent: &Array) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        let s = &self.stream;
+        let unscaled = self.vae_cfg.unscale(latent, s)?;
+        let image = vae::decode_with(&unscaled, &self.vae_cfg, &self.vae, s)?;
+        let [_, h, w, _] = image.shape()[..] else {
+            return Err(msg(format!(
+                "mlx: the decoder returned {:?}",
+                image.shape()
+            )));
+        };
+        // The VAE emits roughly [-1, 1]; the caller wants bytes.
+        let bytes = image
+            .to_vec_f32(s)?
+            .iter()
+            .map(|&v| (((v + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect();
+        Ok((w, h, bytes))
+    }
+
+    /// Prompt to pixels. Returns `(width, height, RGB bytes)`.
+    pub fn txt2img(&self, cfg: &Txt2ImgConfig) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        if cfg.width % 8 != 0 || cfg.height % 8 != 0 {
+            return Err(msg(format!(
+                "mlx: {}x{} does not divide into 8-pixel latent cells",
+                cfg.width, cfg.height
+            )));
+        }
+        let (lh, lw) = (cfg.height / 8, cfg.width / 8);
+        let context = self.conditioning(cfg)?;
+        let sigmas = self.sigmas(cfg.sampler, cfg.steps);
+
+        let mut rng = SeededRng::new(cfg.seed);
+        // Sampling starts at maximum noise, so the latent is scaled by the
+        // first sigma rather than used raw.
+        let latent = self
+            .draw(&mut rng, 4, lh, lw)?
+            .mul(&Array::scalar_f32(sigmas[0] as f32)?, &self.stream)?;
+
+        let latent = self.denoise(
+            latent,
+            &context,
+            &sigmas,
+            cfg.cfg_scale,
+            cfg.sampler,
+            None,
+            &mut rng,
+        )?;
+        self.decode(&latent)
+    }
+
+    /// An image and a prompt to pixels.
+    ///
+    /// `image` is `[h, w, 3]` in `[-1, 1]`, already at `cfg.width` x
+    /// `cfg.height`. `strength` selects where in the ladder the run begins: at
+    /// strength `s` with `n` steps it starts at `n - round(n*s)`.
+    pub fn img2img(
+        &self,
+        cfg: &Txt2ImgConfig,
+        image: &Array,
+        strength: Strength,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        self.run_masked(cfg, image, strength, None)
+    }
+
+    /// img2img bounded by a mask. `mask_px` is `[1, h, w, 1]`, 1 where the
+    /// model may write.
+    pub fn inpaint(
+        &self,
+        cfg: &Txt2ImgConfig,
+        image: &Array,
+        strength: Strength,
+        mask_px: &Array,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        self.run_masked(cfg, image, strength, Some(mask_px))
+    }
+
+    fn run_masked(
+        &self,
+        cfg: &Txt2ImgConfig,
+        image: &Array,
+        strength: Strength,
+        mask_px: Option<&Array>,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        let s = &self.stream;
+        // The distribution's mean, scaled — the sampler supplies all the
+        // randomness, so drawing here too would add variance the seed does not
+        // control.
+        let init = vae::encode_scaled(image, &self.vae_cfg, &self.vae, s)?;
+        let [_, lh, lw, _] = init.shape()[..] else {
+            return Err(msg(format!("mlx: the encoder returned {:?}", init.shape())));
+        };
+
+        let sigmas = self.sigmas(cfg.sampler, cfg.steps);
+        let start = strength.start_index(cfg.steps);
+        // Strength 0 means "return the input", and there is nothing to run.
+        if start >= cfg.steps {
+            return self.decode(&init);
+        }
+
+        let mut rng = SeededRng::new(cfg.seed);
+        let noise = self.draw(&mut rng, 4, lh, lw)?;
+        let latent = sample::noise_to_sigma(&init, &noise, sigmas[start], s)?;
+
+        let mask = mask_px.map(|m| sample::latent_mask(m, s)).transpose()?;
+        let context = self.conditioning(cfg)?;
+        let latent = self.denoise(
+            latent,
+            &context,
+            &sigmas[start..],
+            cfg.cfg_scale,
+            cfg.sampler,
+            mask.as_ref().map(|m| (m, &init)),
+            &mut rng,
+        )?;
+        self.decode(&latent)
+    }
+
+    /// The stream this pipeline runs on, for callers that build their own
+    /// tensors to hand in.
+    pub fn stream(&self) -> &Stream {
+        &self.stream
+    }
+}
