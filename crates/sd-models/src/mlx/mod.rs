@@ -21,6 +21,8 @@
 
 /// CLIP's text tower. Its epsilon is 1e-5 and its activation is QuickGelu.
 pub mod clip;
+/// The txt2img sampling loop.
+pub mod sample;
 /// The VAE decoder. Its epsilon is 1e-6, not the UNet's 1e-5.
 pub mod vae;
 

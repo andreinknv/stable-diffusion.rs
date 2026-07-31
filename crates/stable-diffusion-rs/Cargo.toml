@@ -21,6 +21,9 @@ image.workspace = true
 
 [features]
 default = []
+# The MLX port, per docs/handoff.md decision (b). Additive: the candle
+# pipeline beside it is untouched and remains the default.
+mlx = ["sd-tensor/mlx", "sd-models/mlx"]
 cuda = ["sd-tensor/cuda", "sd-loader/cuda", "sd-models/cuda", "sd-sample/cuda"]
 metal = ["sd-tensor/metal", "sd-loader/metal", "sd-models/metal", "sd-sample/metal"]
 # Apple BLAS. Links a system framework — adds no native compilation.
