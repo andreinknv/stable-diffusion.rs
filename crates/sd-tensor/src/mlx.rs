@@ -73,6 +73,7 @@ struct mlx_map_string_to_array_iterator {
 
 /// Positions in `mlx_dtype`, which is declared in this order in
 /// `mlx/c/array.h`. These are indices, not arbitrary tags.
+const MLX_INT32: i32 = 7;
 const MLX_FLOAT16: i32 = 9;
 const MLX_FLOAT32: i32 = 10;
 
@@ -144,6 +145,13 @@ unsafe extern "C" {
         s: mlx_stream,
     ) -> i32;
     fn mlx_vector_array_new_data(data: *const mlx_array, size: usize) -> mlx_vector_array;
+    fn mlx_take_axis(
+        res: *mut mlx_array,
+        a: mlx_array,
+        indices: mlx_array,
+        axis: i32,
+        s: mlx_stream,
+    ) -> i32;
     fn mlx_broadcast_to(
         res: *mut mlx_array,
         a: mlx_array,
@@ -776,7 +784,29 @@ impl Array {
     /// `scale` is applied to the query before the product, as diffusers does.
     /// Unmasked — the UNet's transformer attends over everything, which is the
     /// same assumption `unet/attention.rs` makes on the candle path.
+    /// Causal scaled dot-product attention, for CLIP's text tower.
+    pub fn sdpa_causal(
+        &self,
+        keys: &Self,
+        values: &Self,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<Self> {
+        self.sdpa_with_mode(keys, values, scale, c"causal", stream)
+    }
+
     pub fn sdpa(&self, keys: &Self, values: &Self, scale: f32, stream: &Stream) -> Result<Self> {
+        self.sdpa_with_mode(keys, values, scale, c"", stream)
+    }
+
+    fn sdpa_with_mode(
+        &self,
+        keys: &Self,
+        values: &Self,
+        scale: f32,
+        mode: &std::ffi::CStr,
+        stream: &Stream,
+    ) -> Result<Self> {
         let null = mlx_array {
             ctx: std::ptr::null_mut(),
         };
@@ -789,11 +819,10 @@ impl Array {
                     keys.raw,
                     values.raw,
                     scale,
-                    // Empty string is "unmasked". Not NULL — mlx-c reads this
-                    // pointer and a null one segfaults rather than meaning no
-                    // mask; and not "none", which it rejects: the accepted
-                    // values are 'causal', 'array' or ''.
-                    c"".as_ptr(),
+                    // Not NULL — mlx-c reads this pointer and a null one
+                    // segfaults rather than meaning no mask. The accepted
+                    // values are 'causal', 'array' or ''; "none" is rejected.
+                    mode.as_ptr(),
                     null,
                     null,
                     stream.0,
@@ -855,6 +884,50 @@ impl Array {
             "narrow",
         )?;
         Self::wrap(out)
+    }
+
+    /// An i32 array, for indices.
+    pub fn from_slice_i32(data: &[i32], shape: &[usize]) -> Result<Self> {
+        init();
+        let n: usize = shape.iter().product();
+        if n != data.len() {
+            return Err(Error::Msg(format!(
+                "mlx: shape {shape:?} needs {n} elements, got {}",
+                data.len()
+            )));
+        }
+        let dims: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
+        Self::wrap(unsafe {
+            mlx_array_new_data(
+                data.as_ptr().cast(),
+                dims.as_ptr(),
+                dims.len() as i32,
+                MLX_INT32,
+            )
+        })
+    }
+
+    /// Gather rows of `self` along `axis` at `indices` — an embedding lookup
+    /// when `axis` is 0 and `self` is a `[vocab, dim]` table.
+    pub fn take(&self, indices: &Self, axis: usize, stream: &Stream) -> Result<Self> {
+        let mut out = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        check(
+            unsafe { mlx_take_axis(&mut out, self.raw, indices.raw, axis as i32, stream.0) },
+            "take",
+        )?;
+        Self::wrap(out)
+    }
+
+    /// CLIP's activation, `x * sigmoid(1.702 * x)`.
+    ///
+    /// Not the erf GELU: `clip/text_encoder.rs` selects `QuickGelu` for SD 1.5
+    /// and the two differ by enough to move the encoder output.
+    pub fn quick_gelu(&self, stream: &Stream) -> Result<Self> {
+        let k = Self::scalar_f32(1.702)?;
+        let gate = self.mul(&k, stream)?.sigmoid(stream)?;
+        self.mul(&gate, stream)
     }
 
     /// Broadcast to `shape`, which must be compatible with the current one.

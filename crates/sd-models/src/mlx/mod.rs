@@ -19,6 +19,8 @@
 //! in `mlx-examples` and reported as ml-explore/mlx-examples#1434, worth
 //! 5.6e-4 at the UNet output.
 
+/// CLIP's text tower. Its epsilon is 1e-5 and its activation is QuickGelu.
+pub mod clip;
 /// The VAE decoder. Its epsilon is 1e-6, not the UNet's 1e-5.
 pub mod vae;
 
