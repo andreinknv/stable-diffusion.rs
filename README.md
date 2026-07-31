@@ -158,11 +158,7 @@ Compose small, refine large.
 fresh noise every step, so there is nothing to reuse; asking anyway is an error
 rather than a silent no-op.
 
-### Two things that will bite you
-
-**A stock SD 1.5 or SDXL download has no `tokenizer/tokenizer.json`** — the
-repositories ship the slow tokenizer (`vocab.json` + `merges.txt`). Copy
-`tokenizer.json` from `openai/clip-vit-large-patch14`. The error says so.
+### One thing that will bite you
 
 **The same seed reproduces the same picture, and on the same machine the same
 file.** Across machines the reduction order differs, so bytes will not match.

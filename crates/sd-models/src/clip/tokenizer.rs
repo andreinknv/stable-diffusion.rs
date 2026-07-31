@@ -48,6 +48,54 @@ impl ClipTokenizer {
         Err(TokenizeError::NotFound(fast))
     }
 
+    /// Load a tokenizer from a path that may name either form.
+    ///
+    /// `path` may be a `tokenizer.json`, or the directory holding one.
+    /// **A path naming a `tokenizer.json` that is not there still succeeds**
+    /// when `vocab.json` + `merges.txt` sit beside it — which is not a
+    /// tolerant-parsing flourish but the common case: neither
+    /// `stable-diffusion-v1-5` nor `stabilityai/stable-diffusion-xl-base-1.0`
+    /// publishes the fast form at all. Insisting on it meant telling every
+    /// user to go and copy a file out of a third repository.
+    ///
+    /// This is the loader pipelines should call. [`from_file`](Self::from_file)
+    /// stays for the case where one exact file is meant and its absence is an
+    /// error worth reporting.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, TokenizeError> {
+        let path = path.as_ref();
+        if path.is_dir() {
+            return Self::from_dir(path);
+        }
+        if path.is_file() {
+            return Self::from_file(path);
+        }
+        match path.parent() {
+            Some(dir) if dir.is_dir() => Self::from_dir(dir),
+            _ => Err(TokenizeError::NotFound(path.to_path_buf())),
+        }
+    }
+
+    /// Whether [`open`](Self::open) would find a tokenizer at `path`.
+    ///
+    /// For the existence checks a pipeline runs before loading anything, so
+    /// that a stock download is not rejected for lacking a file it was never
+    /// going to have.
+    pub fn present<P: AsRef<Path>>(path: P) -> bool {
+        let path = path.as_ref();
+        let dir = if path.is_dir() {
+            path
+        } else if path.is_file() {
+            return true;
+        } else {
+            match path.parent() {
+                Some(d) => d,
+                None => return false,
+            }
+        };
+        dir.join("tokenizer.json").exists()
+            || (dir.join("vocab.json").exists() && dir.join("merges.txt").exists())
+    }
+
     /// Build CLIP's tokenizer from the slow form, `vocab.json` + `merges.txt`.
     ///
     /// Every piece below is transcribed from a real CLIP `tokenizer.json`, and

@@ -108,21 +108,24 @@ impl ModelPaths {
             unet: root.join("unet/diffusion_pytorch_model.safetensors"),
             vae: root.join("vae/diffusion_pytorch_model.safetensors"),
             text_encoder: root.join("text_encoder/model.safetensors"),
-            tokenizer: root.join("tokenizer/tokenizer.json"),
+            tokenizer: root.join("tokenizer"),
         }
     }
 
     /// Every path, for an existence check that names what is missing rather
     /// than failing at whichever one is loaded first.
     pub fn missing(&self) -> Vec<&Path> {
+        // The tokenizer is asked about differently: it is a directory that has
+        // to hold *a* tokenizer, in either the fast form or the slow one, and
+        // a stock download ships only the slow one.
         [
             self.unet.as_path(),
             self.vae.as_path(),
             self.text_encoder.as_path(),
-            self.tokenizer.as_path(),
         ]
         .into_iter()
         .filter(|p| !p.exists())
+        .chain((!ClipTokenizer::present(&self.tokenizer)).then_some(self.tokenizer.as_path()))
         .collect()
     }
 }
@@ -381,7 +384,7 @@ impl MlxPipeline {
             )));
         }
         let stream = Stream::for_device(device);
-        let tokenizer = ClipTokenizer::from_file(&paths.tokenizer)?;
+        let tokenizer = ClipTokenizer::open(&paths.tokenizer)?;
 
         // **The stock checkpoint may use the legacy attention names.** The
         // decoder asks for `to_q` and a published VAE has `query`; converting

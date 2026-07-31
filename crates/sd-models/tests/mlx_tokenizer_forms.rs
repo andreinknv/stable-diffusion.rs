@@ -140,3 +140,52 @@ fn from_dir_reads_whichever_form_is_present() {
         "the error should name what it looked for, got {err}"
     );
 }
+
+/// **Neither stock repository ships `tokenizer.json`.**
+///
+/// Not a hypothetical. `stable-diffusion-v1-5/stable-diffusion-v1-5` and
+/// `stabilityai/stable-diffusion-xl-base-1.0` both publish `vocab.json` +
+/// `merges.txt` and nothing else — a local `diffusers` cache records the
+/// absence under `.no_exist/`. So `open` has to succeed on a path naming a
+/// `tokenizer.json` that was never going to be there, and this pins that
+/// rather than leaving it to the pipelines to rediscover.
+#[test]
+fn open_succeeds_on_a_named_fast_form_that_does_not_exist() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let fast_path = dir.join("tokenizer/tokenizer.json");
+    if !fast_path.exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no tokenizer fixture.");
+        return;
+    }
+
+    // A directory laid out exactly as a stock download is: slow form only.
+    let stock = std::env::temp_dir().join("sdrs-stock-layout");
+    let _ = std::fs::remove_dir_all(&stock);
+    slow_form_from(&fast_path, &stock).expect("deriving");
+    assert!(!stock.join("tokenizer.json").exists(), "slow form only");
+
+    // What a pipeline holds is the fast form's path, because that is what the
+    // layout names. It must still load.
+    let named = stock.join("tokenizer.json");
+    assert!(
+        ClipTokenizer::present(&named),
+        "present() must see the slow form beside the name it was given"
+    );
+    let tok = ClipTokenizer::open(&named).expect("a stock download must just work");
+    assert_eq!(
+        tok.encode("a rusty crab on a beach").unwrap(),
+        ClipTokenizer::from_file(&fast_path)
+            .unwrap()
+            .encode("a rusty crab on a beach")
+            .unwrap()
+    );
+
+    // And a directory with neither form is still an error that names itself.
+    let empty = std::env::temp_dir().join("sdrs-empty-tokenizer");
+    std::fs::create_dir_all(&empty).expect("mkdir");
+    assert!(!ClipTokenizer::present(empty.join("tokenizer.json")));
+    assert!(ClipTokenizer::open(empty.join("tokenizer.json")).is_err());
+}
