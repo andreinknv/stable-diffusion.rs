@@ -868,3 +868,84 @@ fn an_adapter_without_motion_modules_is_refused() {
     // And a clip of zero frames is a caller error, not a mode.
     assert!(pipe.attach_motion(&motion_adapter(), 0).is_err());
 }
+
+// -- unCLIP -----------------------------------------------------------------
+
+fn unclip_dir() -> Option<PathBuf> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/unclip");
+    p.is_dir().then_some(p)
+}
+
+/// **An image variation conditions on a picture**, and the noise level trades
+/// fidelity for variety.
+///
+/// Two levels are run because a pipeline that ignored `level` would still
+/// produce an image, and would produce the *same* one both times.
+#[test]
+fn unclip_conditions_on_a_reference_image() {
+    let Some(dir) = unclip_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: no unCLIP checkpoint at models/unclip.");
+        return;
+    };
+    let pipe = MlxPipeline::load_unclip(&dir).expect("loading unCLIP");
+    let cfg = config();
+
+    // A flat colour field in CLIP's [0, 1].
+    let mut px = vec![0.0f32; 224 * 224 * 3];
+    for i in 0..224 * 224 {
+        px[i * 3] = 0.85;
+        px[i * 3 + 1] = 0.25;
+        px[i * 3 + 2] = 0.15;
+    }
+    let reference = Array::from_slice_f32(&px, &[1, 224, 224, 3]).unwrap();
+
+    let (w, h, low) = pipe.variation(&cfg, &reference, 0).expect("level 0");
+    let (_, _, high) = pipe.variation(&cfg, &reference, 500).expect("level 500");
+
+    let (mean, sd, step) = looks_like_an_image(w, h, &low);
+    eprintln!("unclip level 0: mean {mean:.1}  sd {sd:.1}  neighbour step {step:.1}");
+    assert!((5.0..250.0).contains(&mean), "mean {mean:.1}");
+    assert!(step < 40.0, "neighbour step {step:.1} is noise");
+
+    assert_ne!(
+        low, high,
+        "the noise level changed nothing; it is not reaching the conditioning"
+    );
+}
+
+/// **A text-to-image unCLIP ships no image tower**, so asking it for a
+/// variation is a clear error rather than a missing file.
+#[test]
+fn a_text_to_image_unclip_cannot_read_a_reference() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/unclip-t2i");
+    if !dir.join("image_normalizer").is_dir() {
+        sd_tensor::skip_missing_fixture!("SKIP: no text-to-image unCLIP checkpoint.");
+        return;
+    }
+    // The checkpoint is complete *except* for the image tower — it has a
+    // prior instead, because a prompt is its only input. So it loads, and it
+    // is the variation that must fail.
+    let pipe = MlxPipeline::load_unclip(&dir).expect("a text-to-image unCLIP still loads");
+    let reference = Array::from_slice_f32(&vec![0.5; 224 * 224 * 3], &[1, 224, 224, 3]).unwrap();
+    assert!(
+        pipe.variation(&config(), &reference, 0).is_err(),
+        "a checkpoint with no image_encoder must refuse a variation rather than \
+         conditioning on nothing"
+    );
+}
+
+/// An ordinary SD 1.5 pipeline refuses a variation rather than ignoring the
+/// image.
+#[test]
+fn a_plain_pipeline_refuses_an_image_variation() {
+    let Some(dir) = model_dir() else {
+        sd_tensor::skip_missing_fixture!("SKIP: set SD_TEST_MODEL_DIR.");
+        return;
+    };
+    let pipe = MlxPipeline::load(&dir).expect("pipeline");
+    let reference = Array::from_slice_f32(&vec![0.5; 224 * 224 * 3], &[1, 224, 224, 3]).unwrap();
+    assert!(
+        pipe.variation(&config(), &reference, 0).is_err(),
+        "a pipeline loaded without `load_unclip` must refuse a variation"
+    );
+}

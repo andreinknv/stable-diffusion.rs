@@ -191,12 +191,20 @@ pub struct MlxPipeline {
     unet: Weights,
     vae: Weights,
     cfg: UNetConfig,
+    /// **The text tower's geometry differs by checkpoint.** SD 1.5 is CLIP-L
+    /// at 768; unCLIP conditions on SD 2.x's OpenCLIP ViT-H at 1024. Reusing
+    /// SD 1.5's here fails at the first reshape, which is the loud direction —
+    /// but only because the widths disagree, not because anything checks.
+    clip_cfg: clip::ClipConfig,
     vae_cfg: vae::VaeConfig,
     schedule: Schedule,
     stream: Stream,
     /// Spatial conditioning, in attachment order. Empty is the common case.
     controlnets: Vec<Control>,
     ip: Option<IpAdapter>,
+    /// unCLIP's image conditioning: the normalizer's statistics and the
+    /// vision tower. Only an unCLIP checkpoint has these.
+    unclip: Option<(Weights, Weights)>,
     /// An AnimateDiff motion adapter, and the clip length it will run at.
     ///
     /// The adapter is a separate checkpoint from the UNet, so it is held apart
@@ -237,13 +245,89 @@ impl MlxPipeline {
             unet,
             vae,
             cfg: UNetConfig::sd15(),
+            clip_cfg: clip::ClipConfig::sd15(),
             vae_cfg: vae::VaeConfig::sd15(),
             schedule: Schedule::sd15(),
             stream,
             controlnets: Vec::new(),
             ip: None,
+            unclip: None,
             motion: None,
         })
+    }
+
+    /// Load an unCLIP checkpoint, whose UNet conditions on a CLIP **image**
+    /// embedding rather than only on text.
+    ///
+    /// `UNetConfig::unclip()` sets `class_projection`, so the UNet refuses to
+    /// run without one — which is the loud direction. The normalizer is
+    /// mandatory and the image tower is not: text-to-image unCLIP checkpoints
+    /// ship no `image_encoder` at all, because a prompt is their only input.
+    pub fn load_unclip(root: &Path) -> Result<Self, PipelineError> {
+        let mut pipe = Self::load(root)?;
+        pipe.cfg = UNetConfig::unclip();
+        // unCLIP's text encoder is SD 2.x's OpenCLIP ViT-H — 1024 wide, 23
+        // layers, plain gelu — not SD 1.5's CLIP-L.
+        pipe.clip_cfg = clip::ClipConfig::sd2();
+
+        let normalizer = root.join("image_normalizer/diffusion_pytorch_model.safetensors");
+        if !normalizer.exists() {
+            return Err(PipelineError::MissingFile(normalizer));
+        }
+        let encoder = root.join("image_encoder/model.safetensors");
+        let vision = if encoder.exists() {
+            load_safetensors(&encoder)?
+        } else {
+            // A text-to-image unCLIP has no tower. Asking it for a variation
+            // is then a clear error rather than a missing file.
+            Weights::new()
+        };
+        pipe.unclip = Some((load_safetensors(&normalizer)?, vision));
+        Ok(pipe)
+    }
+
+    /// An image variation: condition on a picture rather than only a prompt.
+    ///
+    /// `image` is `[1, 224, 224, 3]` in **`[0, 1]`** — CLIP's range. `level`
+    /// says how much noise to add to the embedding before conditioning on it;
+    /// higher means the model is told to trust it less, which is how unCLIP
+    /// trades fidelity for variety.
+    pub fn variation(
+        &self,
+        cfg: &Txt2ImgConfig,
+        image: &Array,
+        level: usize,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        let s = &self.stream;
+        let Some((normalizer, vision)) = &self.unclip else {
+            return Err(msg(
+                "mlx: this is not an unCLIP pipeline; load it with `load_unclip`".into(),
+            ));
+        };
+        if vision.is_empty() {
+            return Err(msg(
+                "mlx: this unCLIP checkpoint ships no image_encoder, so it cannot read a \
+                 reference image — it is a text-to-image variant"
+                    .into(),
+            ));
+        }
+        let pixels = clip_vision::preprocess(image, s)?;
+        let embeds =
+            clip_vision::image_embeds(&pixels, &clip_vision::VisionConfig::vit_h_14(), vision, s)?;
+
+        let mut rng = SeededRng::new(cfg.seed);
+        let dim = embeds.shape()[1];
+        let t: Tensor = rng.randn((1, dim, 1, 1), &Device::Cpu)?;
+        let noise = Array::from_slice_f32(&t.flatten_all()?.to_vec1::<f32>()?, &[1, dim])?;
+
+        let alphas = sd_models::unclip::cosine_alphas_cumprod(unclip::TRAIN_TIMESTEPS);
+        let conditioned = unclip::augment(&embeds, level, &noise, &alphas, normalizer, s)?;
+        // **The unconditional row is zeros of the whole width**, not an
+        // augmented zero embedding.
+        let uncond = unclip::unconditional(1, dim)?;
+        let class_embeds = concat(&[&uncond, &conditioned], 0, s)?;
+
+        self.generate_with_class(cfg, Some(&class_embeds), &mut rng)
     }
 
     /// Attach an AnimateDiff motion adapter and fix the clip length.
@@ -318,7 +402,7 @@ impl MlxPipeline {
             &adapter.vision,
             s,
         )?;
-        let tokens = ip::image_proj(&embeds, clip::HIDDEN, &adapter.weights, s)?;
+        let tokens = ip::image_proj(&embeds, self.clip_cfg.hidden, &adapter.weights, s)?;
         // Doubled to match the guidance batch, unconditional row first. The
         // unconditional row gets the *same* tokens: dropping the image there
         // would make guidance push away from it.
@@ -393,12 +477,12 @@ impl MlxPipeline {
             // id, which matters here because CLIP-L pads with EOS itself — the
             // last one is 60-odd positions past the end of the phrase.
             let ids = self.token_ids(&b.phrase)?;
-            let hidden = clip::text_encoder(&ids, &self.text_encoder, s)?;
+            let hidden = clip::text_encoder_with(&ids, &self.clip_cfg, &self.text_encoder, s)?;
             rows.push(clip::pool(&hidden, &ids, s)?);
             coords.extend_from_slice(&b.bbox);
         }
         let refs: Vec<&Array> = rows.iter().collect();
-        let phrases = concat(&refs, 0, s)?.reshape(&[1, n, clip::HIDDEN], s)?;
+        let phrases = concat(&refs, 0, s)?.reshape(&[1, n, self.clip_cfg.hidden], s)?;
         let boxes_arr = Array::from_slice_f32(&coords, &[1, n, 4])?;
         // Every slot is real here, so every mask is 1. The learned nulls exist
         // for callers batching a fixed number of slots.
@@ -416,7 +500,12 @@ impl MlxPipeline {
     /// against. Feeding a zero tensor instead is a different unconditional.
     fn encode(&self, prompt: &str) -> Result<Array, PipelineError> {
         let ids = self.token_ids(prompt)?;
-        Ok(clip::text_encoder(&ids, &self.text_encoder, &self.stream)?)
+        Ok(clip::text_encoder_with(
+            &ids,
+            &self.clip_cfg,
+            &self.text_encoder,
+            &self.stream,
+        )?)
     }
 
     /// A prompt's 77 token ids.
@@ -501,6 +590,7 @@ impl MlxPipeline {
         sampler: SamplerKind,
         keep: Option<(&Array, &Array)>,
         extras: &Extras<'_>,
+        class_embeds: Option<&Array>,
         rng: &mut SeededRng,
     ) -> Result<Array, PipelineError> {
         let s = &self.stream;
@@ -513,7 +603,7 @@ impl MlxPipeline {
         // **One draw per frame.** A `[1, h, w, c]` noise tensor broadcasts
         // against a clip and gives every frame the *same* ancestral noise,
         // which the motion modules then cannot move apart.
-        let mut draw_all = |rng: &mut SeededRng| -> Result<Array, PipelineError> {
+        let draw_all = |rng: &mut SeededRng| -> Result<Array, PipelineError> {
             let mut rows = Vec::with_capacity(nframes);
             for _ in 0..nframes {
                 rows.push(draw_noise(rng, lc, lh, lw)?);
@@ -581,7 +671,15 @@ impl MlxPipeline {
                 motion: m.as_ref(),
             };
             let out = unet_forward_adapters(
-                &latent_in, &timestep, &context, None, None, &ad, &self.cfg, &self.unet, s,
+                &latent_in,
+                &timestep,
+                &context,
+                None,
+                class_embeds,
+                &ad,
+                &self.cfg,
+                &self.unet,
+                s,
             )?;
             let noise_pred = sample::guidance(&out, cfg_scale, s)?;
             let denoised = sample::denoise_epsilon(&latent, &noise_pred, sigma, s)?;
@@ -738,6 +836,31 @@ impl MlxPipeline {
         reference: Option<&Array>,
         boxes: &[GroundedBox],
     ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        let mut rng = SeededRng::new(cfg.seed);
+        self.generate_inner(cfg, hint, reference, boxes, None, &mut rng)
+    }
+
+    /// [`Self::generate`] with unCLIP's image conditioning, and a caller-owned
+    /// RNG so the draw order stays under one seed.
+    fn generate_with_class(
+        &self,
+        cfg: &Txt2ImgConfig,
+        class_embeds: Option<&Array>,
+        rng: &mut SeededRng,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        self.generate_inner(cfg, None, None, &[], class_embeds, rng)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_inner(
+        &self,
+        cfg: &Txt2ImgConfig,
+        hint: Option<&Array>,
+        reference: Option<&Array>,
+        boxes: &[GroundedBox],
+        class_embeds: Option<&Array>,
+        rng: &mut SeededRng,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
         if cfg.width % 8 != 0 || cfg.height % 8 != 0 {
             return Err(msg(format!(
                 "mlx: {}x{} does not divide into 8-pixel latent cells",
@@ -759,14 +882,13 @@ impl MlxPipeline {
             objs: objs.as_ref(),
         };
 
-        let mut rng = SeededRng::new(cfg.seed);
         // **One draw per frame, in order.** A clip is a batch, so the latent is
         // `[f, h, w, 4]`; drawing one and repeating it would give f identical
         // frames that the motion modules then fail to move apart.
         let frames = self.frames();
         let mut rows = Vec::with_capacity(frames);
         for _ in 0..frames {
-            rows.push(self.draw(&mut rng, 4, lh, lw)?);
+            rows.push(self.draw(rng, 4, lh, lw)?);
         }
         let refs: Vec<&Array> = rows.iter().collect();
         let latent = concat(&refs, 0, &self.stream)?
@@ -780,7 +902,8 @@ impl MlxPipeline {
             cfg.sampler,
             None,
             &extras,
-            &mut rng,
+            class_embeds,
+            rng,
         )?;
         self.decode(&latent)
     }
@@ -856,6 +979,7 @@ impl MlxPipeline {
             cfg.sampler,
             mask.as_ref().map(|m| (m, &init)),
             &Extras::default(),
+            None,
             &mut rng,
         )?;
         self.decode(&latent)
