@@ -889,6 +889,10 @@ fn parse_sampler(name: &str) -> Result<SamplerKind> {
     }
 }
 
+/// The MLX command line.
+#[cfg(feature = "mlx")]
+mod mlx_cli;
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1028,6 +1032,54 @@ fn main() -> Result<()> {
             preview_every,
             taesd,
         } => {
+            // **MLX is the backend when the feature is on.** The candle path
+            // below stays for as long as both exist; the flags mean the same
+            // thing either way, because they describe generation rather than a
+            // backend.
+            #[cfg(feature = "mlx")]
+            {
+                let cfg = sd::pipeline::Txt2ImgConfig {
+                    prompt: prompt.clone(),
+                    negative_prompt: negative_prompt.clone(),
+                    width,
+                    height,
+                    steps,
+                    cfg_scale,
+                    seed,
+                    sampler: mlx_cli::parse_sampler(&sampler)?,
+                    ..Default::default()
+                };
+                let hires_parsed = match &hires {
+                    Some(spec) => Some((mlx_cli::parse_size(spec)?, hires_strength)),
+                    None => None,
+                };
+                let args = mlx_cli::Txt2ImgArgs {
+                    model: model.clone().unwrap_or_default(),
+                    cfg,
+                    output: output.clone(),
+                    sdxl,
+                    lora: lora.clone().map(|p| (p, lora_scale)),
+                    controlnet: Vec::new(),
+                    embeddings: embedding
+                        .iter()
+                        .filter_map(|spec| {
+                            spec.split_once('=')
+                                .map(|(a, b)| (a.to_string(), b.to_string()))
+                        })
+                        .collect(),
+                    motion: motion_adapter.clone().map(|p| (p, frames)),
+                    hires: hires_parsed,
+                    cache_threshold,
+                    regions: Vec::new(),
+                    upscale: None,
+                };
+                let written = mlx_cli::run_txt2img(&args)?;
+                for path in &written {
+                    println!("wrote {}", path.display());
+                }
+                return Ok(());
+            }
+            #[allow(unreachable_code)]
             let cfg = Txt2ImgConfig {
                 prompt,
                 negative_prompt,
