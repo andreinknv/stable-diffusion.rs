@@ -681,9 +681,15 @@ impl MlxPipeline {
 
     /// An image and a prompt to pixels.
     ///
-    /// `image` is `[h, w, 3]` in `[-1, 1]`, already at `cfg.width` x
+    /// `image` is `[1, h, w, 3]` in `[-1, 1]`, already at `cfg.width` x
     /// `cfg.height`. `strength` selects where in the ladder the run begins: at
     /// strength `s` with `n` steps it starts at `n - round(n*s)`.
+    ///
+    /// **Does not yet carry a control map, a reference image or boxes.** With
+    /// a ControlNet attached this errors rather than running unsteered — which
+    /// is the right failure, but it does mean img2img and ControlNet cannot be
+    /// combined here yet. `txt2img_controlled` and `generate` are the
+    /// conditioned entry points.
     pub fn img2img(
         &self,
         cfg: &Txt2ImgConfig,
@@ -695,6 +701,8 @@ impl MlxPipeline {
 
     /// img2img bounded by a mask. `mask_px` is `[1, h, w, 1]`, 1 where the
     /// model may write.
+    ///
+    /// Same conditioning limits as [`Self::img2img`].
     pub fn inpaint(
         &self,
         cfg: &Txt2ImgConfig,
