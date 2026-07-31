@@ -36,6 +36,7 @@ pub mod gligen;
 /// IP-Adapter's decoupled cross-attention.
 pub mod ip;
 /// LoRA adapters, merged into a weight map before any model is built.
+pub mod llm;
 pub mod lora;
 /// AnimateDiff motion modules: attention over time.
 pub mod merge;

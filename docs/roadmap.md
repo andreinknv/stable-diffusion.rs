@@ -526,9 +526,43 @@ In rough order of cost, cheapest first:
   conditioning path, the weight namespace and the modulation source are all
   new, and it needs its own golden references like anything else. A port, not
   a variant.
-- **Qwen Image** and **Z-Image** are new DiTs of familiar shape. On the
-  evidence of the Chroma estimate above, treat "familiar shape" as unverified
-  until someone reads the forward pass.
+- **Qwen Image**, **Z-Image** and **FLUX.2** share one blocker, and it is now
+  gone. All three stopped using T5 and CLIP: Qwen-Image conditions on
+  Qwen2.5-VL (`joint_attention_dim` 3584), Z-Image on Qwen3 (`cap_feat_dim`
+  2560), FLUX.2 on Mistral Small 3.2. Their text encoder is an **ordinary
+  causal LLM** whose hidden states are read instead of its logits — a bigger
+  port than any of the three transformers, and shared by all of them.
+
+  `sd_models::mlx::llm` is that encoder, verified against `transformers` on
+  Qwen3-0.6B: all 28 layers within tolerance, the encoded state at `max_abs`
+  2.9e-4 against a peak of 46.6. One implementation serves all three, because
+  they differ only in widths and two booleans — RMSNorm pre-norm, grouped-query
+  attention, SwiGLU and RoPE throughout, with Qwen2.5 adding a qkv bias and
+  Qwen3 adding QK-norm.
+
+  Three things in it fail quietly, and all three are pinned:
+
+  **The attention is causal.** These are decoders; running one bidirectionally
+  produces an embedding of exactly the right shape from a model that never saw
+  one. The test changes the *last* token and asserts the first token's state
+  does not move — measured at exactly 0, against 14.57 for the last.
+
+  **`head_dim` is not `hidden / heads`.** Qwen3-0.6B is 1024 wide with 16 heads
+  and a head dimension of 128, so its q projection is *wider* than the model.
+  Deriving it by division gives 64 and a projection that does not match its
+  weight.
+
+  **QK-norm is per head.** The weights are `[head_dim]` — 128 against a
+  2048-wide projection — so they apply after the split. Before it, a 128-wide
+  vector broadcasts across 2048, which MLX accepts when the sizes divide.
+
+  Also worth recording: Qwen3's intermediate activations peak near **6,450**,
+  so the comparison is relative rather than absolute. An absolute 1e-4 bound
+  would fail on a correct port, exactly as it would for CLIP.
+
+  What remains per model is the transformer itself, its VAE, and its golden
+  references. Qwen-Image is 60 joint blocks with QK-norm — closest to the
+  already-verified SD 3.5 MMDiT of anything here.
 - **FLUX.2** is a new generation, not a variant.
 - **The video models** are the largest by a wide margin: a temporal axis
   through every block, a 3D VAE, and memory characteristics this machine has

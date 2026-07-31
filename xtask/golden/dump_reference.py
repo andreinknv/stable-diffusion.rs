@@ -232,6 +232,92 @@ def dump_t5(output: pathlib.Path, model_id: str) -> None:
 
 
 
+def dump_llm(output: pathlib.Path, model_id: str) -> None:
+    """A Qwen3-family decoder used as a *text encoder*.
+
+    **Deliberately the smallest checkpoint of the family**, for the same
+    reason `dump_t5` uses T5-small: the architecture is identical at every
+    size — RMSNorm pre-norm, grouped-query attention with QK-norm, SwiGLU,
+    rotary embeddings — so verifying the port at 0.6B and then loading 4B or
+    7B weights into it separates "is the forward right" from "is the name
+    mapping right".
+
+    That split is what makes this tractable at all, because the checkpoints
+    that actually matter here are the text encoders for Qwen-Image (Qwen2.5-VL,
+    hidden 3584), Z-Image (Qwen3, hidden 2560) and FLUX.2 (Mistral, hidden
+    5120), none of which is a reasonable fixture.
+
+    **The hidden states are what a diffusion model consumes, not the logits.**
+    These models are decoders being used as encoders: the sampling head is
+    never run, and the conditioning is a hidden state from partway up the
+    stack. Per-layer states are captured so a divergence localises.
+    """
+    torch = _require("torch")
+    _require("transformers")
+    from transformers import AutoModelForCausalLM
+    from safetensors.torch import save_file
+
+    out = output / "llm"
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"loading {model_id}")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, torch_dtype=torch.float32
+    ).eval()
+    cfg = model.config
+    print(
+        f"  hidden={cfg.hidden_size} layers={cfg.num_hidden_layers} "
+        f"heads={cfg.num_attention_heads} kv_heads={cfg.num_key_value_heads} "
+        f"head_dim={getattr(cfg, 'head_dim', cfg.hidden_size // cfg.num_attention_heads)} "
+        f"intermediate={cfg.intermediate_size} theta={cfg.rope_theta} "
+        f"eps={cfg.rms_norm_eps}"
+    )
+
+    gen = torch.Generator().manual_seed(SEED)
+    # Ids well inside the vocabulary. The tokenizer is a separate concern and
+    # mixing the two would confuse a failure here.
+    ids = torch.randint(0, 10000, (1, 16), generator=gen)
+
+    with torch.no_grad():
+        result = model(input_ids=ids, output_hidden_states=True)
+
+    tensors = {
+        "token_ids": ids.to(torch.int64).contiguous(),
+        # `hidden_states[-1]` is post-final-norm; `hidden_states[0]` is the
+        # embedding before any layer.
+        "last_hidden_state": result.hidden_states[-1].detach().contiguous().clone(),
+    }
+    for i, h in enumerate(result.hidden_states):
+        tensors[f"hidden_{i}"] = h.detach().contiguous().clone()
+
+    save_file(tensors, str(out / "reference.safetensors"))
+    weights = {k: v.detach().contiguous().clone() for k, v in model.state_dict().items()}
+    save_file(weights, str(out / "llm.safetensors"))
+
+    import json
+
+    (out / "config.json").write_text(
+        json.dumps(
+            {
+                "hidden_size": cfg.hidden_size,
+                "num_hidden_layers": cfg.num_hidden_layers,
+                "num_attention_heads": cfg.num_attention_heads,
+                "num_key_value_heads": cfg.num_key_value_heads,
+                "head_dim": getattr(
+                    cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+                ),
+                "intermediate_size": cfg.intermediate_size,
+                "rms_norm_eps": cfg.rms_norm_eps,
+                "rope_theta": cfg.rope_theta,
+                "vocab_size": cfg.vocab_size,
+                "tie_word_embeddings": getattr(cfg, "tie_word_embeddings", False),
+            },
+            indent=2,
+        )
+    )
+    print(f"wrote {out}/reference.safetensors ({len(tensors)} tensors) and llm.safetensors")
+
+
 def dump_flux_transformer(output: pathlib.Path, model_id: str) -> None:
     """Flux's MMDiT against diffusers.
 
@@ -2292,6 +2378,12 @@ def main() -> None:
     t5.add_argument("--model-id", default="google/t5-v1_1-small")
     t5.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    llm = sub.add_parser("llm", help="dump Qwen3-family text-encoder references")
+    # The smallest of the family. See `dump_llm` for why the size does not
+    # matter to what this verifies.
+    llm.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
+    llm.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     fluxt = sub.add_parser("flux_transformer", help="dump Flux MMDiT references")
     fluxt.add_argument("--model-id", default="TencentARC/flux-mini")
     fluxt.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -2447,6 +2539,8 @@ def main() -> None:
         dump_flow(args.output, args.model_id)
     elif args.component == "t5":
         dump_t5(args.output, args.model_id)
+    elif args.component == "llm":
+        dump_llm(args.output, args.model_id)
     elif args.component == "flux_transformer":
         dump_flux_transformer(args.output, args.model_id)
     elif args.component == "flux_sampling":
