@@ -322,6 +322,22 @@ unsafe extern "C" {
     fn mlx_default_cpu_stream_new() -> mlx_stream;
     fn mlx_stream_free(s: mlx_stream) -> i32;
     fn mlx_vector_array_new_value(val: mlx_array) -> mlx_vector_array;
+    fn mlx_vector_array_new() -> mlx_vector_array;
+
+    // Graph compilation. `mlx_compile` traces a closure once and caches the
+    // fused kernels it produces, keyed by input shapes.
+    fn mlx_closure_new_func_payload(
+        fun: unsafe extern "C" fn(*mut mlx_vector_array, mlx_vector_array, *mut c_void) -> i32,
+        payload: *mut c_void,
+        dtor: unsafe extern "C" fn(*mut c_void),
+    ) -> mlx_closure;
+    fn mlx_closure_free(cls: mlx_closure) -> i32;
+    fn mlx_closure_apply(
+        res: *mut mlx_vector_array,
+        cls: mlx_closure,
+        input: mlx_vector_array,
+    ) -> i32;
+    fn mlx_compile(res: *mut mlx_closure, fun: mlx_closure, shapeless: bool) -> i32;
     fn mlx_vector_array_size(vec: mlx_vector_array) -> usize;
     fn mlx_vector_array_get(res: *mut mlx_array, vec: mlx_vector_array, index: usize) -> i32;
 
@@ -1493,6 +1509,153 @@ pub fn save_safetensors(path: &Path, weights: &HashMap<String, Array>) -> Result
     unsafe { mlx_map_string_to_string_free(meta) };
     unsafe { mlx_map_string_to_array_free(map) };
     result
+}
+
+// -- compilation ------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[allow(non_camel_case_types)]
+pub struct mlx_closure {
+    ctx: *mut c_void,
+}
+
+/// A traced and fused function of arrays.
+///
+/// **What this buys, and what it does not.** MLX's compiler fuses chains of
+/// elementwise operations into single kernels, which removes the intermediate
+/// buffers and the per-op dispatch. It does *not* speed up matmul or
+/// convolution, which is where most of a diffusion step goes — so the win is
+/// bounded by how much of the traced region is elementwise, and measuring a
+/// candidate before adopting it is the point of this type existing.
+///
+/// The trace happens on the first call and is cached against the input shapes,
+/// so a compiled function called at a new resolution retraces.
+pub struct Compiled {
+    inner: mlx_closure,
+    /// The uncompiled closure, kept alive because MLX's compiled closure
+    /// borrows the traced function rather than owning a copy.
+    _source: mlx_closure,
+}
+
+// The closure MLX calls back into. `payload` is a boxed Rust function; the
+// signature is fixed by mlx-c, so state travels through the payload pointer
+// rather than through a capture.
+type BoxedFn = Box<dyn Fn(&[Array]) -> Result<Vec<Array>>>;
+
+unsafe extern "C" fn trampoline(
+    res: *mut mlx_vector_array,
+    input: mlx_vector_array,
+    payload: *mut c_void,
+) -> i32 {
+    // A panic must not cross the FFI boundary: unwinding through C is
+    // undefined. Caught here and reported as a non-zero status, which MLX
+    // surfaces as an ordinary error.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let f = unsafe { &*(payload as *const BoxedFn) };
+        let n = unsafe { mlx_vector_array_size(input) };
+        let mut args = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut a = mlx_array {
+                ctx: std::ptr::null_mut(),
+            };
+            if unsafe { mlx_vector_array_get(&mut a, input, i) } != 0 {
+                return None;
+            }
+            match Array::wrap(a) {
+                Ok(arr) => args.push(arr),
+                Err(_) => return None,
+            }
+        }
+        let out = f(&args).ok()?;
+        let raws: Vec<mlx_array> = out.iter().map(|a| a.raw).collect();
+        let vec = unsafe { mlx_vector_array_new_data(raws.as_ptr(), raws.len()) };
+        // The outputs are now owned by the vector MLX takes; forgetting the
+        // wrappers stops the Rust side freeing them underneath it.
+        for a in out {
+            std::mem::forget(a);
+        }
+        Some(vec)
+    }));
+    match result {
+        Ok(Some(vec)) => {
+            unsafe { *res = vec };
+            0
+        }
+        _ => 1,
+    }
+}
+
+unsafe extern "C" fn drop_payload(payload: *mut c_void) {
+    if !payload.is_null() {
+        drop(unsafe { Box::from_raw(payload as *mut BoxedFn) });
+    }
+}
+
+impl Compiled {
+    /// Trace and fuse `f`.
+    ///
+    /// `f` must be **pure in its arguments**: MLX traces it once and reuses the
+    /// result, so anything it reads that is not an argument is captured at
+    /// trace time and frozen. A closure that reads a mutable counter, or that
+    /// branches on a value it computed, produces a kernel that is correct for
+    /// the first call and wrong afterwards — with no error.
+    pub fn new(f: impl Fn(&[Array]) -> Result<Vec<Array>> + 'static) -> Result<Self> {
+        init();
+        let boxed: BoxedFn = Box::new(f);
+        let payload = Box::into_raw(Box::new(boxed)) as *mut c_void;
+        let source = unsafe { mlx_closure_new_func_payload(trampoline, payload, drop_payload) };
+        let mut inner = mlx_closure {
+            ctx: std::ptr::null_mut(),
+        };
+        let status = unsafe { mlx_compile(&mut inner, source, false) };
+        if let Err(e) = check(status, "compile") {
+            unsafe { mlx_closure_free(source) };
+            return Err(e);
+        }
+        Ok(Self {
+            inner,
+            _source: source,
+        })
+    }
+
+    /// Call the compiled function.
+    pub fn call(&self, args: &[&Array]) -> Result<Vec<Array>> {
+        let raws: Vec<mlx_array> = args.iter().map(|a| a.raw).collect();
+        let input = unsafe { mlx_vector_array_new_data(raws.as_ptr(), raws.len()) };
+        let mut out = unsafe { mlx_vector_array_new() };
+        let status = unsafe { mlx_closure_apply(&mut out, self.inner, input) };
+        unsafe { mlx_vector_array_free(input) };
+        if let Err(e) = check(status, "closure apply") {
+            unsafe { mlx_vector_array_free(out) };
+            return Err(e);
+        }
+
+        let n = unsafe { mlx_vector_array_size(out) };
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut a = mlx_array {
+                ctx: std::ptr::null_mut(),
+            };
+            let rc = unsafe { mlx_vector_array_get(&mut a, out, i) };
+            if let Err(e) = check(rc, "vector get") {
+                unsafe { mlx_vector_array_free(out) };
+                return Err(e);
+            }
+            result.push(Array::wrap(a)?);
+        }
+        unsafe { mlx_vector_array_free(out) };
+        Ok(result)
+    }
+}
+
+impl Drop for Compiled {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_closure_free(self.inner);
+            mlx_closure_free(self._source);
+        }
+    }
 }
 
 // -- memory -----------------------------------------------------------------

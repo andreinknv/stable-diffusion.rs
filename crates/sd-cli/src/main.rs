@@ -146,6 +146,11 @@ struct Cli {
     command: Command,
 }
 
+// `txt2img` carries far more flags than the other subcommands, so the enum is
+// as large as its biggest variant. Boxing the payload would mean a manual
+// `FromArgMatches`, which is a lot of hand-written parsing to save one
+// short-lived allocation on a command-line binary.
+#[allow(clippy::large_enum_variant)]
 #[cfg(feature = "mlx")]
 #[derive(Subcommand)]
 enum Command {
@@ -204,6 +209,42 @@ enum Command {
         /// Upscale the result 4x with these Real-ESRGAN weights.
         #[arg(long)]
         upscale: Option<String>,
+        /// IP-Adapter weights, with `--reference` and `--image-encoder`.
+        ///
+        /// Conditions on an image's *style and content* rather than its
+        /// geometry, which is what separates it from a ControlNet.
+        #[arg(long, requires = "reference", requires = "image_encoder")]
+        ip_adapter: Option<String>,
+        /// The CLIP vision tower the adapter was trained against. A separate
+        /// checkpoint, and a large one.
+        #[arg(long)]
+        image_encoder: Option<String>,
+        /// The reference image for `--ip-adapter`.
+        #[arg(long)]
+        reference: Option<String>,
+        #[arg(long, default_value_t = 1.0)]
+        ip_scale: f64,
+        /// A GLIGEN grounding box, as `x0,y0,x1,y1=phrase`. Repeatable.
+        ///
+        /// **Coordinates are normalised to `[0, 1]`, not pixels.** The model
+        /// was trained on normalised boxes, and pixel values put every box off
+        /// the canvas with no error.
+        #[arg(long)]
+        grounded_box: Vec<String>,
+        /// Derive the control map by running Canny edge detection on this
+        /// image, instead of passing a prepared map to `--control-map`.
+        #[arg(long, conflicts_with = "control_map", requires = "controlnet")]
+        canny: Option<String>,
+        #[arg(long, default_value_t = 0.1)]
+        canny_low: f32,
+        #[arg(long, default_value_t = 0.3)]
+        canny_high: f32,
+        /// Decode with TAESD instead of the full VAE.
+        ///
+        /// A tiny distilled decoder: far faster and visibly softer. For
+        /// previews and for sweeping seeds, not for a final image.
+        #[arg(long)]
+        taesd: Option<String>,
     },
 
     /// Generate from an existing image.
@@ -307,9 +348,18 @@ enum Command {
         /// VAE weights, when they are not under `--model`.
         #[arg(long)]
         vae: Option<String>,
-        /// The T5 sentencepiece model, when it is not under `--model`.
+        /// The T5 tokenizer, when it is not under `--model`.
         #[arg(long)]
         t5_tokenizer: Option<String>,
+        /// FLUX.1-Kontext: edit this image by instruction rather than
+        /// generating from scratch.
+        ///
+        /// The reference is encoded and its tokens **appended to the sequence**
+        /// the transformer attends over, marked in the rotary embedding's third
+        /// axis so the model can tell them from the image it is making.
+        /// Needs a Kontext checkpoint; `--variant dev` is the base.
+        #[arg(long)]
+        reference: Option<String>,
         #[arg(short, long, default_value = "out.png")]
         output: String,
     },
@@ -340,6 +390,23 @@ enum Command {
         seed: u64,
         #[arg(long, default_value_t = 4)]
         bits: usize,
+        /// Skip-layer guidance: steer away from a prediction made with these
+        /// blocks bypassed. `7,8,9` is Stability's published set for SD 3.5,
+        /// and helps most with anatomy — hands, limb counts.
+        ///
+        /// **Costs a third model evaluation** for every step inside the
+        /// window, so it is not free.
+        #[arg(long, value_name = "7,8,9")]
+        slg_layers: Option<String>,
+        #[arg(long, default_value_t = 2.8)]
+        slg_scale: f64,
+        /// The fraction of the schedule over which it applies. Early steps set
+        /// composition and late ones texture; pushing away from a degraded
+        /// prediction at either end distorts rather than fixes.
+        #[arg(long, default_value_t = 0.01)]
+        slg_start: f64,
+        #[arg(long, default_value_t = 0.2)]
+        slg_end: f64,
         /// The MMDiT weights, in Stability's original naming.
         #[arg(long)]
         transformer: Option<String>,
@@ -453,6 +520,15 @@ fn main() -> Result<()> {
             cache_threshold,
             region,
             upscale,
+            ip_adapter,
+            image_encoder,
+            reference,
+            ip_scale,
+            grounded_box,
+            canny,
+            canny_low,
+            canny_high,
+            taesd,
         } => {
             let cfg = gen.to_config()?;
             let args = mlx_cli::Txt2ImgArgs {
@@ -480,6 +556,16 @@ fn main() -> Result<()> {
                     .map(|s| split_pair(s))
                     .collect::<Result<Vec<_>>>()?,
                 upscale,
+                ip: match (ip_adapter, image_encoder, reference) {
+                    (Some(a), Some(e), Some(r)) => Some((a, e, r, ip_scale)),
+                    _ => None,
+                },
+                boxes: grounded_box
+                    .iter()
+                    .map(|s| mlx_cli::parse_box(s))
+                    .collect::<Result<Vec<_>>>()?,
+                canny: canny.map(|c| (c, canny_low, canny_high)),
+                taesd,
             };
             for path in mlx_cli::run_txt2img(&args, device)? {
                 println!("wrote {}", path.display());
@@ -548,6 +634,7 @@ fn main() -> Result<()> {
             clip,
             vae,
             t5_tokenizer,
+            reference,
             output,
         } => {
             let args = mlx_cli::FluxArgs {
@@ -567,6 +654,7 @@ fn main() -> Result<()> {
                 clip,
                 vae,
                 t5_tokenizer,
+                reference,
                 output,
             };
             for path in mlx_cli::run_flux(&args, device)? {
@@ -584,6 +672,10 @@ fn main() -> Result<()> {
             cfg_scale,
             seed,
             bits,
+            slg_layers,
+            slg_scale,
+            slg_start,
+            slg_end,
             transformer,
             vae,
             clip_l,
@@ -592,6 +684,22 @@ fn main() -> Result<()> {
             t5_tokenizer,
             output,
         } => {
+            let slg = match &slg_layers {
+                Some(spec) => Some(stable_diffusion_rs::mlx::SkipLayerGuidance {
+                    layers: spec
+                        .split(',')
+                        .map(|p| {
+                            p.trim()
+                                .parse::<usize>()
+                                .with_context(|| format!("block index {p:?} in {spec:?}"))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    scale: slg_scale,
+                    start: slg_start,
+                    end: slg_end,
+                }),
+                None => None,
+            };
             let args = mlx_cli::Sd3Args {
                 model,
                 cfg: stable_diffusion_rs::mlx::Sd3RunConfig {
@@ -602,6 +710,7 @@ fn main() -> Result<()> {
                     steps,
                     cfg_scale,
                     seed,
+                    slg,
                 },
                 bits,
                 transformer,

@@ -87,10 +87,24 @@ impl FluxConfig {
 
 /// `(t, h, w)` coordinates for an `h x w` patch grid, `[1, h*w, 3]`.
 pub fn image_ids(h: usize, w: usize) -> Vec<f32> {
+    image_ids_at(h, w, 0.0)
+}
+
+/// [`image_ids`] with the **`t` axis** set to `index`.
+///
+/// Flux's rotary embedding has three axes and only ever uses two: every image
+/// token sits at `t = 0`. Kontext is what the third is for — a reference
+/// image's tokens are appended to the same sequence and distinguished by their
+/// `t` coordinate, so the model can tell "the picture I am making" from "the
+/// picture I was given" while both occupy the same `(h, w)` grid.
+///
+/// **Without a distinct index the two grids are indistinguishable**, and the
+/// model averages them into a double exposure rather than editing.
+pub fn image_ids_at(h: usize, w: usize, index: f32) -> Vec<f32> {
     let mut v = Vec::with_capacity(h * w * 3);
     for row in 0..h {
         for col in 0..w {
-            v.push(0.0);
+            v.push(index);
             v.push(row as f32);
             v.push(col as f32);
         }
@@ -181,6 +195,22 @@ pub fn rotate(x: &Array, pe: &Rope, s: &Stream) -> Result<Array> {
 /// shift come from the modulation vector instead, which is the whole mechanism
 /// by which Flux is conditioned.
 fn norm_modulate(x: &Array, shift: &Array, scale: &Array, s: &Stream) -> Result<Array> {
+    // **Not compiled, and that was measured rather than assumed.** This chain
+    // is pure and entirely elementwise, runs five times per double block
+    // across 57 blocks, and is the largest elementwise surface in the model —
+    // the obvious candidate for `mlx_compile`, and the same shape the
+    // candle-era hand-written adaLN kernel took 5.26x on.
+    //
+    // MLX does fuse it: 1.44x in isolation at 1024x3072, bit-identical, which
+    // `sd-tensor/tests/mlx_compile.rs` still measures. End to end on Flux
+    // schnell it is worth nothing — 16 steps at 512, alternated:
+    //
+    //     compiled     56.9 s, 56.2 s
+    //     composed     55.4 s, 56.6 s
+    //
+    // A step is mostly quantised matmul, which a fuser does not touch, so the
+    // elementwise share is too small for 1.44x of it to surface. Recorded here
+    // so it is not wired up a second time.
     x.layer_norm(None, None, EPS, s)?
         .mul(&scale.add(&Array::scalar_f32(1.0)?, s)?, s)?
         .add(shift, s)

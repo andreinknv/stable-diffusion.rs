@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 use sd_models::clip::ClipTokenizer;
 use sd_models::mlx::{
     clip, clip_vision, controlnet, gligen, ip, lora::Lora, motion, normalise_legacy_attention,
-    sample, timestep_embedding, unclip, unet_forward_adapters, vae, Adapters, Motion, UNetConfig,
-    Weights,
+    sample, taesd, timestep_embedding, unclip, unet_forward_adapters, vae, Adapters, Motion,
+    UNetConfig, Weights,
 };
 use sd_sample::{steps, Schedule};
 use sd_tensor::mlx::{concat, load_safetensors, Array, Device, Stream};
@@ -45,7 +45,7 @@ pub mod sd3;
 pub mod sdxl;
 
 pub use flux::{FluxPaths, FluxPipeline, FluxRunConfig};
-pub use sd3::{Sd3Paths, Sd3Pipeline, Sd3RunConfig};
+pub use sd3::{Sd3Paths, Sd3Pipeline, Sd3RunConfig, SkipLayerGuidance};
 pub use sdxl::SdxlPipeline;
 
 /// `PipelineError` carries no free-form variant of its own, so a message goes
@@ -160,6 +160,7 @@ pub struct IpAdapter {
 /// Coordinates are `[x0, y0, x1, y1]` in `[0, 1]`, **not pixels** — the model
 /// was trained on normalised boxes and pixel values put every box off the
 /// canvas without an error.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroundedBox {
     pub bbox: [f32; 4],
     pub phrase: String,
@@ -422,6 +423,8 @@ pub struct MlxPipeline {
     /// Spatial conditioning, in attachment order. Empty is the common case.
     controlnets: Vec<Control>,
     ip: Option<IpAdapter>,
+    /// A tiny distilled decoder, used in place of the VAE when attached.
+    taesd: Option<Weights>,
     /// unCLIP's image conditioning: the normalizer's statistics and the
     /// vision tower. Only an unCLIP checkpoint has these.
     unclip: Option<(Weights, Weights)>,
@@ -521,6 +524,7 @@ impl MlxPipeline {
             device,
             controlnets: Vec::new(),
             ip: None,
+            taesd: None,
             unclip: None,
             embeddings: Vec::new(),
             motion: None,
@@ -793,6 +797,21 @@ impl MlxPipeline {
     /// corrections are added rather than here — a ControlNet for a different
     /// architecture emits a plausible number of plausible tensors and only the
     /// count catches it.
+    /// Decode with TAESD instead of the full VAE.
+    ///
+    /// **Faster and visibly softer**, by design: TAESD is a distilled decoder
+    /// with a fraction of the VAE's parameters, so it is for previews and for
+    /// sweeping seeds rather than for a final image. It reads the same scaled
+    /// latent, so nothing else in the pipeline changes.
+    pub fn attach_taesd(&mut self, weights: Weights) {
+        self.taesd = Some(weights);
+    }
+
+    /// Whether a TAESD decoder is attached.
+    pub fn has_taesd(&self) -> bool {
+        self.taesd.is_some()
+    }
+
     pub fn attach_controlnet(&mut self, path: &Path, scale: f64) -> Result<(), PipelineError> {
         let mut weights = load_safetensors(path)?;
         normalise_legacy_attention(&mut weights);
@@ -1460,8 +1479,22 @@ impl MlxPipeline {
 
         for i in 0..n {
             let frame = latent.narrow(0, i, 1, s)?.contiguous(s)?;
-            let unscaled = self.vae_cfg.unscale(&frame, s)?;
-            let image = vae::decode_with(&unscaled, &self.vae_cfg, &self.vae, s)?;
+            let image = match &self.taesd {
+                // **TAESD takes the sampler's latent directly**, where the VAE
+                // wants it unscaled first: `AutoencoderTiny` carries a scaling
+                // factor of 1, so it was distilled on the 0.18215-scaled space
+                // the sampler already works in. Unscaling here would hand it a
+                // latent 5.5x too small, which decodes to a flat grey field.
+                //
+                // Both emit the signed range — measured, min -1.557 max 1.399
+                // on the golden latent — so the byte conversion below is
+                // shared rather than branched.
+                Some(w) => taesd::decode(&frame, w, s)?,
+                None => {
+                    let unscaled = self.vae_cfg.unscale(&frame, s)?;
+                    vae::decode_with(&unscaled, &self.vae_cfg, &self.vae, s)?
+                }
+            };
             let [_, h, w, _] = image.shape()[..] else {
                 return Err(msg(format!(
                     "mlx: the decoder returned {:?}",

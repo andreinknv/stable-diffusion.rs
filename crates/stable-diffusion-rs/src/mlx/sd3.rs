@@ -123,6 +123,37 @@ pub struct Sd3RunConfig {
     pub steps: usize,
     pub cfg_scale: f64,
     pub seed: u64,
+    /// Skip-layer guidance. `None` is off and costs nothing.
+    pub slg: Option<SkipLayerGuidance>,
+}
+
+/// Skip-layer guidance: steer away from a prediction made with some blocks
+/// bypassed.
+///
+/// **Costs a third model evaluation** for every step inside the window, so a
+/// wide window is most of a 50% slowdown. The defaults are Stability's
+/// published recipe for SD 3.5.
+#[derive(Debug, Clone)]
+pub struct SkipLayerGuidance {
+    /// Which joint blocks to bypass. 7, 8 and 9 for SD 3.5.
+    pub layers: Vec<usize>,
+    /// How hard to steer away. 0 disables it bit-identically.
+    pub scale: f64,
+    /// Fraction of the schedule at which to start, in `[0, 1]`.
+    pub start: f64,
+    /// ...and to stop. Outside this window nothing extra runs.
+    pub end: f64,
+}
+
+impl Default for SkipLayerGuidance {
+    fn default() -> Self {
+        Self {
+            layers: vec![7, 8, 9],
+            scale: 2.8,
+            start: 0.01,
+            end: 0.2,
+        }
+    }
 }
 
 impl Default for Sd3RunConfig {
@@ -135,6 +166,7 @@ impl Default for Sd3RunConfig {
             steps: 28,
             cfg_scale: 4.5,
             seed: 0,
+            slg: None,
         }
     }
 }
@@ -161,11 +193,15 @@ impl Sd3Pipeline {
             &paths.vae,
             &paths.clip_l,
             &paths.clip_g,
-            &paths.clip_tokenizer,
             &paths.t5_tokenizer,
         ] {
             require(p)?;
         }
+        // **The CLIP tokenizer is deliberately not on that list.** It cannot
+        // be missing: `ClipTokenizer::open` reads whichever form the checkpoint
+        // ships and falls back to the vocabulary vendored in `sd-models` when
+        // it ships none — and plenty do not. Requiring the path here refused
+        // real checkpoints over a file they were never going to have.
         let stream = Stream::for_device(device);
 
         // Both T5 shards, merged. A single-file assumption drops half the
@@ -219,17 +255,14 @@ impl Sd3Pipeline {
         bits: usize,
         device: Device,
     ) -> Result<Self, PipelineError> {
-        for p in [
-            transformer,
-            vae,
-            clip_l,
-            clip_g,
-            t5,
-            clip_tokenizer,
-            t5_tokenizer,
-        ] {
+        for p in [transformer, vae, clip_l, clip_g, t5, t5_tokenizer] {
             require(p)?;
         }
+        // **The CLIP tokenizer is deliberately not on that list.** It cannot
+        // be missing: `ClipTokenizer::open` reads whichever form the checkpoint
+        // ships and falls back to the vocabulary vendored in `sd-models` when
+        // it ships none — and plenty do not. Requiring the path here refused
+        // real checkpoints over a file they were never going to have.
         let stream = Stream::for_device(device);
         let t5w = if t5.extension().is_some_and(|e| e == "gguf") {
             // llama.cpp's naming, translated on the way in.
@@ -383,10 +416,55 @@ impl Sd3Pipeline {
             // Guidance on the velocity, which is what this model predicts.
             let uncond_v = velocity.narrow(0, 0, 1, s)?;
             let cond_v = velocity.narrow(0, 1, 1, s)?;
-            let guided = cond_v
+            let mut guided = cond_v
                 .sub(&uncond_v, s)?
                 .mul(&Array::scalar_f32(cfg.cfg_scale as f32)?, s)?
                 .add(&uncond_v, s)?;
+
+            // **Skip-layer guidance**: a third pass with a few middle blocks
+            // bypassed, steered *away* from. Stability's finding is that SD
+            // 3.5's anatomy failures come from a small set of blocks, so the
+            // degraded prediction is a usable direction to push against.
+            //
+            // Applied over a **window** of the schedule, not the whole run.
+            // Early steps decide composition and late ones decide texture;
+            // pushing away from a degraded prediction at either end distorts
+            // rather than fixes, which is why the published recipe is 1% to
+            // 20%. It also costs a third model evaluation for every step in
+            // that window, so the window is the cost too.
+            if let Some(slg) = &cfg.slg {
+                let progress = i as f64 / cfg.steps.max(1) as f64;
+                if slg.scale != 0.0
+                    && !slg.layers.is_empty()
+                    && progress >= slg.start
+                    && progress <= slg.end
+                {
+                    // Only the conditional row: the skipped-block pass is a
+                    // worse version of the *prompted* prediction, and running
+                    // the unconditional through it would compare two things
+                    // that differ in two ways.
+                    let cond_latent = latent.contiguous(s)?;
+                    let one_t = Array::from_slice_f32(&[t], &[1])?;
+                    let cond_ctx = context.narrow(0, 1, 1, s)?;
+                    let cond_pooled = pooled.narrow(0, 1, 1, s)?;
+                    let degraded = sd3::forward_skipping(
+                        &cond_latent,
+                        &cond_ctx,
+                        &cond_pooled,
+                        &one_t,
+                        &self.cfg,
+                        &slg.layers,
+                        &self.transformer,
+                        s,
+                    )?;
+                    guided = guided.add(
+                        &cond_v
+                            .sub(&degraded, s)?
+                            .mul(&Array::scalar_f32(slg.scale as f32)?, s)?,
+                        s,
+                    )?;
+                }
+            }
 
             // `x + v * (sigma_next - sigma)` — no epsilon, no ancestral noise.
             latent = latent.add(

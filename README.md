@@ -147,8 +147,13 @@ sdrs flux --model models/flux --variant schnell \
   --transformer-gguf flux1-schnell-Q4_K_S.gguf --t5-gguf t5xxl-Q4_K_S.gguf \
   --prompt "a rusty crab on a beach at sunset" -o out.png
 
-# SD 3.5
-sdrs sd3 --model models/sd35 --prompt "a lighthouse at dusk" -o out.png
+# SD 3.5, with skip-layer guidance for anatomy
+sdrs sd3 --model models/sd35 --prompt "a lighthouse at dusk" \
+  --slg-layers 7,8,9 -o out.png
+
+# FLUX.1-Kontext: edit by instruction
+sdrs flux --model models/kontext --variant dev --reference photo.png \
+  --prompt "make it winter" -o edited.png
 
 # Blend two checkpoints
 sdrs merge --a base.safetensors --b style.safetensors --alpha 0.3 -o mix.safetensors
@@ -174,6 +179,10 @@ Every flag below is optional and composes with the rest.
 | different prompts in different places | `--region left.png="sunflowers"` |
 | fewer model evaluations | `--cache-threshold 0.2` (needs `--sampler dpmpp2m`) |
 | upscale in the same run | `--upscale esrgan_x4.safetensors` |
+| style and content from an image | `--ip-adapter ip.safetensors --image-encoder enc.safetensors --reference ref.png` |
+| put a thing in a place | `--grounded-box 0.1,0.1,0.5,0.5="a red car"` |
+| edges without preparing a map | `--canny photo.png` (with `--controlnet`) |
+| a fast, soft preview decode | `--taesd taesd.safetensors` |
 
 **`--hires` is not the same as generating big.** A model composes at its
 training resolution and duplicates subjects above it — two heads, two horizons.

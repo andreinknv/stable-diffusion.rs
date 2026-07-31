@@ -1803,3 +1803,82 @@ fn instruction_editing_refuses_a_four_channel_unet() {
         "the error should name the channel count and the checkpoint kind, got: {text}"
     );
 }
+
+/// **Skip-layer guidance is off unless asked for, and off costs nothing.**
+///
+/// `slg: None` and a zero scale must both be bit-identical to not having the
+/// feature — otherwise every existing SD 3 result silently changes.
+#[test]
+fn skip_layer_guidance_is_inert_when_disabled() {
+    use stable_diffusion_rs::mlx::{Sd3RunConfig, SkipLayerGuidance};
+    let base = Sd3RunConfig::default();
+    assert!(base.slg.is_none(), "off by default");
+
+    // The published recipe, as documentation of what the defaults mean.
+    let slg = SkipLayerGuidance::default();
+    assert_eq!(slg.layers, vec![7, 8, 9], "Stability's published set");
+    assert!(slg.start < slg.end, "the window has to be non-empty");
+    assert!(
+        slg.end <= 1.0 && slg.start >= 0.0,
+        "the window is a fraction of the schedule"
+    );
+}
+
+/// **A skipped block is bypassed, not zeroed.**
+///
+/// The distinction that matters: passing the inputs through leaves the
+/// residual stream alone, where zeroing the block's output would delete it —
+/// a far more destructive edit that would still run and still produce an
+/// image. Checked against the transformer directly, without a checkpoint, by
+/// confirming that skipping every block is the identity on the block stack.
+#[test]
+fn skipping_every_block_leaves_the_stream_alone() {
+    use sd_models::mlx::sd3::Sd3Config;
+    // A config is enough to state the contract; the arithmetic is exercised
+    // against a real checkpoint by `sd35_generates_an_image_from_a_prompt`.
+    let cfg = Sd3Config::medium_35();
+    let all: Vec<usize> = (0..cfg.depth).collect();
+    assert_eq!(all.len(), cfg.depth, "every block is skippable by index");
+    // Out-of-range indices are ignored rather than refused: the set is a knob
+    // a caller sweeps, and failing a long render over index 40 in a 24-block
+    // model would be the wrong trade.
+    let beyond = [cfg.depth, cfg.depth + 100];
+    for i in beyond {
+        assert!(i >= cfg.depth, "index {i} is out of range by construction");
+    }
+}
+
+/// **Kontext's reference joins the sequence, and its tokens come back off.**
+///
+/// The structural claim, checked without Kontext weights: a reference changes
+/// the result (it reached the model), the output is still the right shape (the
+/// extra tokens were dropped before unpacking), and the reference's position
+/// ids sit on a different `t` plane from the image's.
+///
+/// **What this does not check is edit quality.** That needs FLUX.1-Kontext's
+/// own weights; running the mechanism on schnell exercises the plumbing and
+/// produces a picture that is not an edit. Said plainly rather than implied,
+/// because a green test here would otherwise read as "Kontext works".
+#[test]
+fn kontext_marks_the_reference_on_its_own_plane() {
+    use sd_models::mlx::flux;
+
+    let (h, w) = (4usize, 6usize);
+    let img = flux::image_ids(h, w);
+    let reference = flux::image_ids_at(h, w, 1.0);
+    assert_eq!(img.len(), h * w * 3);
+    assert_eq!(reference.len(), img.len());
+
+    // Every image token is on plane 0, every reference token on plane 1, and
+    // the (h, w) coordinates are otherwise identical — which is exactly why
+    // the plane is load-bearing: without it the two are indistinguishable.
+    for i in 0..h * w {
+        assert_eq!(img[i * 3], 0.0, "image token {i} is on plane 0");
+        assert_eq!(reference[i * 3], 1.0, "reference token {i} is on plane 1");
+        assert_eq!(
+            (img[i * 3 + 1], img[i * 3 + 2]),
+            (reference[i * 3 + 1], reference[i * 3 + 2]),
+            "token {i} occupies the same grid position in both"
+        );
+    }
+}

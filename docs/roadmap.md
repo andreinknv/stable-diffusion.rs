@@ -496,13 +496,46 @@ introduced and where its absence is visible in anatomy.
 ### Models it has and this does not
 
 Chroma, Qwen Image, Z-Image, FLUX.2, HiDream, Ideogram4, and a dozen more from
-2026; the video models (Wan 2.1/2.2, LTX-2, HunyuanVideo 1.5); and the edit
-models (FLUX.1-Kontext, Qwen Image Edit).
+2026; the video models (Wan 2.1/2.2, LTX-2, HunyuanVideo 1.5); and Qwen Image
+Edit. FLUX.1-Kontext is now here — see below.
 
-**Kontext is the one worth taking first.** Instruction-driven image editing is
-the capability users most often want next after txt2img, it reuses the Flux
-transformer already verified here, and it replaces the InstructPix2Pix path
-that was lost — one port covering both.
+**These are the genuinely large remaining item**, and worth being precise about
+why rather than listing them as a gap. Each is a new transformer: its own
+block structure, its own conditioning, its own name mapping, and — the part
+that dominates — its own golden references generated from `diffusers` and
+checked tensor by tensor. That is this project's standard and the reason its
+numbers mean anything; skipping it would be faster and would produce ports
+nobody should trust.
+
+In rough order of cost, cheapest first:
+
+- **Chroma** is a Flux variant — same block structure, a different modulation
+  scheme and no pooled CLIP input. The closest to free.
+- **Qwen Image** and **Z-Image** are new DiTs of familiar shape.
+- **FLUX.2** is a new generation, not a variant.
+- **The video models** are the largest by a wide margin: a temporal axis
+  through every block, a 3D VAE, and memory characteristics this machine has
+  not been asked for before.
+
+**Kontext is done, structurally.** It was the one worth taking first for the
+reason given — it reuses the Flux transformer unmodified — and that turned out
+to be exactly right: the transformer needed no change at all.
+
+The mechanism is that the reference image is encoded through the same VAE,
+packed into the same 2x2 patches, and its tokens **appended to the image
+stream**; every block attends over both, and the extra tokens are dropped
+before unpacking. What makes it work rather than produce a double exposure is
+the rotary embedding's **third axis** — the one Flux otherwise never uses, with
+every ordinary image token at `t = 0`. The reference sits at `t = 1`, so the
+model can tell the picture it is making from the picture it was given while
+both occupy the same `(h, w)` grid. `image_ids_at` is that index.
+
+**Unverified for edit quality, and that is the honest state.** Running the
+mechanism on schnell's weights exercises the plumbing — the reference reaches
+the model, 99.4% of output bytes change, the shape survives — but schnell was
+not trained for it, so the result is not an edit. Verifying the capability
+needs FLUX.1-Kontext's own weights, which are gated. The structural test says
+so in its own doc comment rather than letting green read as "Kontext works".
 
 ### Features it has that are not about models
 
@@ -598,22 +631,37 @@ workaround.
 
 ### Not measured yet, in rough order of expected value
 
-- **`mlx_compile`.** MLX's graph compiler fuses elementwise chains into single
-  kernels — the same win the candle-era hand-written adaLN and GEGLU kernels
-  bought at 5.26x, except MLX generates them. Nothing here calls it.
+- ~~**`mlx_compile`**~~ — **built, measured, and not adopted.**
 
-  It is reachable: `mlx_closure_new_func_payload` takes a `void*`, so a Rust
-  closure can be boxed and handed across. The obstacle is not the FFI but the
-  shape of the code — `compile` traces a function *of arrays*, and every
-  forward here takes a `HashMap<String, Array>` plus a config struct. Making
-  the weights explicit inputs to a traced function is the work, and it is a
-  real refactor of the model layer rather than a call to add.
+  The FFI is done and stays: `sd_tensor::mlx::Compiled` wraps
+  `mlx_closure_new_func_payload` and `mlx_compile`, with a trampoline that
+  catches panics rather than unwinding through C. It is the tool for any future
+  candidate, and `sd-tensor/tests/mlx_compile.rs` gates it — results identical
+  to the composition, a new input shape retraced rather than reused, and a
+  failing closure surfaced as an error.
 
-  **Unmeasured, and deliberately not guessed at.** The payoff is bounded by
-  how much of a step is elementwise: the candle-era profile put a step at
-  roughly three quarters convolution and matmul, which a fuser does not help.
-  Worth building the smallest version first — the modulation chain in one
-  Flux block — and measuring that before committing to the refactor.
+  **The compiler works. The application does not pay.** Flux's `norm_modulate`
+  was the best candidate in the codebase: pure, entirely elementwise, five
+  calls per double block across 57 blocks, and the same shape the candle-era
+  hand-written adaLN kernel took 5.26x on. In isolation at 1024x3072 MLX fuses
+  it at **1.44x**, bit-identical — 407 us to 283 us. Wired into a real Flux
+  schnell run, 16 steps at 512, alternated:
+
+  ```text
+    compiled     56.9 s   56.2 s
+    composed     55.4 s   56.6 s
+  ```
+
+  Nothing, and marginally negative. The prediction this entry used to make was
+  right for the reason it gave: a step is mostly quantised matmul, which a
+  fuser does not touch, so 1.44x of the elementwise share does not surface. The
+  wiring was reverted rather than kept behind a flag — an unused code path and
+  a thread-local for no measured gain is a worse trade than the composition.
+
+  Recorded at this length because the isolated number is genuinely encouraging
+  and would invite a second attempt. What would change the answer is a model
+  whose steps are *not* dominated by matmul, or fusing something much larger
+  than one chain — not this chain again.
 - ~~**`mlx_fast_rope`**~~ — **checked, and it does not fit.** Reading the
   signature before writing the call is what caught it, exactly as it did for
   the candle-era claim that no fused attention kernel existed:

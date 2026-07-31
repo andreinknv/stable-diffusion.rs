@@ -338,6 +338,35 @@ pub fn forward(
     w: &impl WeightSource,
     s: &Stream,
 ) -> Result<Array> {
+    forward_skipping(latents, context, pooled, timestep, cfg, &[], w, s)
+}
+
+/// [`forward`] with some joint blocks **not run at all**.
+///
+/// This is the machinery behind skip-layer guidance. Stability found that SD
+/// 3.5's anatomy failures — hands, limb counts — come from a small set of
+/// middle blocks, and that a third model pass with those blocks bypassed gives
+/// a prediction to steer *away* from. Blocks 7, 8 and 9 are the published set.
+///
+/// **Skipped, not zeroed.** A skipped block passes its inputs through
+/// untouched; zeroing its output would delete the residual stream rather than
+/// leave it alone, which is a different and much more destructive edit.
+///
+/// Out-of-range indices are ignored rather than refused: the set is a tuning
+/// knob a caller sweeps, and failing a long render because index 40 does not
+/// exist in a 24-block model would be the wrong trade. `Sd3Config::depth` is
+/// the bound.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_skipping(
+    latents: &Array,
+    context: &Array,
+    pooled: &Array,
+    timestep: &Array,
+    cfg: &Sd3Config,
+    skip: &[usize],
+    w: &impl WeightSource,
+    s: &Stream,
+) -> Result<Array> {
     let [_, _, lh, lw] = latents.shape()[..] else {
         return Err(Error::Msg(format!("mlx: sd3 got {:?}", latents.shape())));
     };
@@ -381,6 +410,10 @@ pub fn forward(
     )?);
 
     for i in 0..cfg.depth {
+        // A skipped block is a no-op on both streams, not a zeroed one.
+        if skip.contains(&i) {
+            continue;
+        }
         let ctx = context
             .as_ref()
             .ok_or_else(|| Error::Msg("mlx: only the last block may drop context".into()))?;

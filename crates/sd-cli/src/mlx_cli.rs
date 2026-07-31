@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use sd_tensor::mlx::{load_safetensors, Array, Device};
-use stable_diffusion_rs::mlx::{Cancel, MlxPipeline, Progress, Region, Request, SdxlPipeline};
+use stable_diffusion_rs::mlx::{
+    Cancel, GroundedBox, MlxPipeline, Progress, Region, Request, SdxlPipeline,
+};
 use stable_diffusion_rs::pipeline::{Strength, Txt2ImgConfig};
 
 /// Parse `WxH`, or `N` for a square.
@@ -214,6 +216,49 @@ pub struct Txt2ImgArgs {
     pub cache_threshold: f64,
     pub regions: Vec<(String, String)>,
     pub upscale: Option<String>,
+    /// `(adapter, image_encoder, reference, scale)`.
+    pub ip: Option<(String, String, String, f64)>,
+    pub boxes: Vec<GroundedBox>,
+    /// `(source image, low, high)` for Canny edge detection.
+    pub canny: Option<(String, f32, f32)>,
+    pub taesd: Option<String>,
+}
+
+/// Parse `x0,y0,x1,y1=phrase` into a GLIGEN box.
+///
+/// **Coordinates are normalised to `[0, 1]`, not pixels.** Values outside that
+/// range are refused rather than clamped: a caller who wrote pixels means
+/// something the model cannot be told, and clamping would put every box at the
+/// canvas edge instead of saying so.
+pub fn parse_box(spec: &str) -> Result<GroundedBox> {
+    let (coords, phrase) = spec
+        .split_once('=')
+        .with_context(|| format!("{spec:?} should be `x0,y0,x1,y1=phrase`"))?;
+    let parts: Vec<&str> = coords.split(',').collect();
+    if parts.len() != 4 {
+        bail!("{coords:?} should be four comma-separated numbers in [0, 1]");
+    }
+    let mut bbox = [0f32; 4];
+    for (i, part) in parts.iter().enumerate() {
+        let v: f32 = part
+            .trim()
+            .parse()
+            .with_context(|| format!("{part:?} in {spec:?}"))?;
+        if !(0.0..=1.0).contains(&v) {
+            bail!(
+                "{v} in {spec:?} is outside [0, 1]; GLIGEN boxes are normalised, \
+                 not pixels — divide by the width and height"
+            );
+        }
+        bbox[i] = v;
+    }
+    if bbox[0] >= bbox[2] || bbox[1] >= bbox[3] {
+        bail!("{coords:?} is empty or inverted; expected x0 < x1 and y0 < y1");
+    }
+    Ok(GroundedBox {
+        bbox,
+        phrase: phrase.to_string(),
+    })
 }
 
 /// Run txt2img, with whatever was attached.
@@ -255,11 +300,33 @@ pub fn run_txt2img(args: &Txt2ImgArgs, device: Device) -> Result<Vec<PathBuf>> {
         let vectors = raw.remove(&name).expect("just read");
         pipe.attach_embedding(trigger, vectors)?;
     }
+    if let Some((adapter, encoder, _, scale)) = &args.ip {
+        pipe.attach_ip_adapter(Path::new(adapter), Path::new(encoder), *scale)?;
+    }
+    if let Some(path) = &args.taesd {
+        pipe.attach_taesd(load_safetensors(Path::new(path))?);
+    }
     let mut hints = Vec::new();
     for (weights, map, scale) in &args.controlnet {
         pipe.attach_controlnet(Path::new(weights), *scale)?;
         hints.push(load_signed(map, args.cfg.width, args.cfg.height)?);
     }
+    // Canny is an alternative *source* for the same hint, not an extra one.
+    if let Some((src, low, high)) = &args.canny {
+        hints.push(stable_diffusion_rs::canny::hint_from_image(
+            src,
+            args.cfg.width as u32,
+            args.cfg.height as u32,
+            *low,
+            *high,
+        )?);
+    }
+    // **CLIP's range, `[0, 1]`** — not the VAE's `[-1, 1]`, and not the
+    // control map's. The three are the same shape and dtype.
+    let reference = match &args.ip {
+        Some((_, _, path, _)) => Some(load_unit(path, 224, 224)?),
+        None => None,
+    };
     if let Some((path, frames)) = &args.motion {
         pipe.attach_motion(Path::new(path), *frames)?;
     }
@@ -305,10 +372,14 @@ pub fn run_txt2img(args: &Txt2ImgArgs, device: Device) -> Result<Vec<PathBuf>> {
         None => {
             let mut request = Request::new(&args.cfg)
                 .regions(&regions)
+                .boxes(&args.boxes)
                 .cache_threshold(args.cache_threshold)
                 .cancel(Cancel::new());
             if let Some(h) = hint {
                 request = request.hint(h);
+            }
+            if let Some(r) = &reference {
+                request = request.reference(r);
             }
             pipe.run_batch(request, &mut print_progress)?
         }
@@ -474,6 +545,8 @@ pub struct FluxArgs {
     pub clip: Option<String>,
     pub vae: Option<String>,
     pub t5_tokenizer: Option<String>,
+    /// A Kontext reference image to edit.
+    pub reference: Option<String>,
     pub output: String,
 }
 
@@ -538,7 +611,15 @@ pub fn run_flux(args: &FluxArgs, device: Device) -> Result<Vec<PathBuf>> {
         }
     };
     report_memory();
-    let (w, h, bytes) = pipe.txt2img(&args.cfg)?;
+    let (w, h, bytes) = match &args.reference {
+        // **The VAE's range, `[-1, 1]`** — not CLIP's, and not the control
+        // map's. All three are `[1, h, w, 3]` f32.
+        Some(path) => {
+            let image = load_signed(path, args.cfg.width, args.cfg.height)?;
+            pipe.kontext(&args.cfg, &image)?
+        }
+        None => pipe.txt2img(&args.cfg)?,
+    };
     write_images(&args.output, w, h, &bytes, None, None)
 }
 
@@ -623,5 +704,52 @@ pub fn run_unclip(
 fn report_memory() {
     if let Ok(active) = sd_tensor::mlx::active_memory() {
         eprintln!("resident: {}", sd_tensor::ops::human_bytes(active as u64));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **GLIGEN boxes are normalised, and pixels are refused rather than
+    /// clamped.**
+    ///
+    /// A caller who wrote pixels means something the model cannot be told;
+    /// clamping would put every box at the canvas edge and render happily.
+    #[test]
+    fn a_box_in_pixels_is_refused_with_the_fix() {
+        let err = parse_box("10,10,90,90=a crab").expect_err("pixels are not normalised");
+        let text = format!("{err:#}");
+        assert!(text.contains("[0, 1]"), "{text}");
+        assert!(text.contains("divide"), "and says what to do: {text}");
+    }
+
+    #[test]
+    fn a_normalised_box_parses() {
+        let b = parse_box("0.1,0.2,0.8,0.9=a rusty crab").expect("valid");
+        assert_eq!(b.bbox, [0.1, 0.2, 0.8, 0.9]);
+        assert_eq!(b.phrase, "a rusty crab");
+    }
+
+    /// A phrase may contain `=`; only the first splits.
+    #[test]
+    fn the_phrase_may_contain_an_equals_sign() {
+        let b = parse_box("0.0,0.0,1.0,1.0=a sign reading x=y").expect("valid");
+        assert_eq!(b.phrase, "a sign reading x=y");
+    }
+
+    /// An inverted or empty box would produce a degenerate grounding token.
+    #[test]
+    fn an_inverted_box_is_refused() {
+        assert!(parse_box("0.9,0.1,0.1,0.9=x").is_err(), "x0 > x1");
+        assert!(parse_box("0.1,0.9,0.9,0.1=x").is_err(), "y0 > y1");
+        assert!(parse_box("0.5,0.5,0.5,0.9=x").is_err(), "zero width");
+    }
+
+    #[test]
+    fn a_malformed_box_names_the_shape_it_wanted() {
+        assert!(parse_box("no-equals-sign").is_err());
+        assert!(parse_box("0.1,0.2=x").is_err(), "needs four numbers");
+        assert!(parse_box("a,b,c,d=x").is_err(), "needs numbers");
     }
 }

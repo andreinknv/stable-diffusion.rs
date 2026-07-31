@@ -163,6 +163,7 @@ fn sd35_generates_an_image_from_a_prompt() {
         steps: 2,
         cfg_scale: 4.5,
         seed: 42,
+        ..Default::default()
     };
     let (w, h, bytes) = pipe.txt2img(&cfg).expect("sd35 txt2img");
     assert_eq!((w, h), (256, 256));

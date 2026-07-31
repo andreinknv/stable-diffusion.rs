@@ -41,7 +41,7 @@ use sd_models::mlx::{
 };
 use sd_models::t5::T5Tokenizer;
 use sd_sample::flow::{flow_sigmas, flow_timesteps, FlowMatchConfig};
-use sd_tensor::mlx::{load_safetensors, Array, Device, Stream};
+use sd_tensor::mlx::{concat, load_safetensors, Array, Device, Stream};
 use sd_tensor::rng::SeededRng;
 
 use super::{draw_noise, msg};
@@ -175,12 +175,7 @@ impl FluxPipeline {
         device: Device,
     ) -> Result<Self, PipelineError> {
         let paths = FluxPaths::in_dir(root);
-        for p in [
-            &paths.vae,
-            &paths.clip,
-            &paths.clip_tokenizer,
-            &paths.t5_tokenizer,
-        ] {
+        for p in [&paths.vae, &paths.clip, &paths.t5_tokenizer] {
             if !p.exists() {
                 return Err(PipelineError::MissingFile(p.clone()));
             }
@@ -252,18 +247,13 @@ impl FluxPipeline {
         bits: usize,
         device: Device,
     ) -> Result<Self, PipelineError> {
-        for p in [
-            transformer_gguf,
-            t5_gguf,
-            clip,
-            vae,
-            clip_tokenizer,
-            t5_tokenizer,
-        ] {
+        for p in [transformer_gguf, t5_gguf, clip, vae, t5_tokenizer] {
             if !p.exists() {
                 return Err(PipelineError::MissingFile(p.to_path_buf()));
             }
         }
+        // The CLIP tokenizer is deliberately absent from that list: it cannot
+        // be missing. See `ClipTokenizer::open`.
         let stream = Stream::for_device(device);
         let transformer = quantized::from_gguf(transformer_gguf, bits, &stream)?;
         let t5w = quantized::from_gguf_renamed(t5_gguf, bits, sd_loader::t5_key, &stream)?;
@@ -310,6 +300,38 @@ impl FluxPipeline {
 
     /// Prompt to pixels. Returns `(width, height, RGB bytes)`.
     pub fn txt2img(&self, cfg: &FluxRunConfig) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        self.generate(cfg, None)
+    }
+
+    /// Edit an image by instruction — FLUX.1-Kontext.
+    ///
+    /// **The reference joins the token sequence, it does not replace the
+    /// noise.** Kontext encodes the reference through the same VAE, packs it
+    /// into the same 2x2 patches, and appends those tokens to the image
+    /// stream; every block then attends over both, and the extra tokens are
+    /// dropped from the output before unpacking. Nothing about the transformer
+    /// changes, which is why this reuses the verified forward unmodified.
+    ///
+    /// **The reference's tokens are marked in the `t` axis** of the rotary
+    /// embedding — the third axis Flux otherwise never uses, every ordinary
+    /// image token sitting at `t = 0`. Without that the two grids are
+    /// indistinguishable to the model at the same `(h, w)` coordinates, and
+    /// the result is a double exposure rather than an edit.
+    ///
+    /// `reference` is `[1, h, w, 3]` in `[-1, 1]` — the VAE's range.
+    pub fn kontext(
+        &self,
+        cfg: &FluxRunConfig,
+        reference: &Array,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
+        self.generate(cfg, Some(reference))
+    }
+
+    fn generate(
+        &self,
+        cfg: &FluxRunConfig,
+        reference: Option<&Array>,
+    ) -> Result<(usize, usize, Vec<u8>), PipelineError> {
         // 16, not 8: the VAE downsamples by 8 and the patchifier halves again,
         // so an odd number of latent rows cannot pack into 2x2 patches.
         for (what, v) in [("width", cfg.width), ("height", cfg.height)] {
@@ -342,7 +364,35 @@ impl FluxPipeline {
         // `h x w patch grid` and Flux halves the latent into 2x2 patches, so
         // passing the latent gives four times the positions and the rotary
         // embedding fails to reshape — which is how this was found.
-        let img_ids = flux::image_ids(patch_h, patch_w);
+        let mut img_ids = flux::image_ids(patch_h, patch_w);
+
+        // Kontext: encode the reference, pack it, and append both its tokens
+        // and its positions. `ref_len` is what has to come back off the output.
+        let (reference_tokens, ref_len) = match reference {
+            Some(image) => {
+                let latent = vae::encode_scaled(image, &self.vae_cfg, &self.vae, s)?;
+                let [_, rh, rw, _] = latent.shape()[..] else {
+                    return Err(msg(format!("mlx: reference latent {:?}", latent.shape())));
+                };
+                if rh % 2 != 0 || rw % 2 != 0 {
+                    return Err(msg(format!(
+                        "mlx: a {}x{} reference gives a {rh}x{rw} latent, which does not pack \
+                         into 2x2 patches",
+                        rw * 8,
+                        rh * 8
+                    )));
+                }
+                let nchw = latent.transpose(&[0, 3, 1, 2], s)?.contiguous(s)?;
+                let packed = flux::pack_latents(&nchw, s)?;
+                let (rph, rpw) = (rh / 2, rw / 2);
+                // `t = 1`: the first reference. Additional references would
+                // take 2, 3, ... which is why this is an index rather than a
+                // flag.
+                img_ids.extend_from_slice(&flux::image_ids_at(rph, rpw, 1.0));
+                (Some(packed), rph * rpw)
+            }
+            None => (None, 0),
+        };
 
         // Driven by the checkpoint, so a `guidance` setting cannot be silently
         // discarded — nor a required one silently omitted.
@@ -355,8 +405,14 @@ impl FluxPipeline {
         for (i, &t) in timesteps.iter().enumerate() {
             // Flux's timestep is the sigma itself, in [0, 1], not an index.
             let timestep = Array::from_slice_f32(&[(t / 1000.0) as f32], &[1])?;
+            // The reference is re-appended every step: it is conditioning,
+            // not state, so it does not take the velocity update.
+            let input = match &reference_tokens {
+                Some(r) => concat(&[&xs, r], 1, s)?,
+                None => xs.contiguous(s)?,
+            };
             let velocity = flux::forward(
-                &xs,
+                &input,
                 &img_ids,
                 &txt,
                 &timestep,
@@ -366,6 +422,15 @@ impl FluxPipeline {
                 &self.transformer,
                 s,
             )?;
+            // **Drop the reference's tokens before stepping.** The model
+            // predicts a velocity for every token it saw, including the ones
+            // that were conditioning; keeping them would step a latent that is
+            // `img_len + ref_len` long and unpack at the wrong shape.
+            let velocity = if ref_len > 0 {
+                velocity.narrow(1, 0, img_len, s)?
+            } else {
+                velocity
+            };
             // `x + v * (sigma_next - sigma)`.
             xs = xs.add(
                 &velocity.mul(&Array::scalar_f32((sigmas[i + 1] - sigmas[i]) as f32)?, s)?,
