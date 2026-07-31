@@ -1251,7 +1251,7 @@ fn upscaling_quadruples_the_image() {
         return;
     };
     let esrgan = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/golden/esrgan/esrgan.safetensors");
+        .join("../../tests/golden/esrgan/esrgan_x4.safetensors");
     if !esrgan.exists() {
         sd_tensor::skip_missing_fixture!("SKIP: no ESRGAN fixture.");
         return;
