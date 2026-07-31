@@ -107,9 +107,7 @@ fn the_quantized_matmul_agrees_with_the_dense_one() {
             .zip(&g)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        eprintln!(
-            "{bits}-bit matmul: cosine {c:.6}, peak {peak:.3}, max_abs {worst:.4}"
-        );
+        eprintln!("{bits}-bit matmul: cosine {c:.6}, peak {peak:.3}, max_abs {worst:.4}");
         assert!(
             c > 0.999,
             "{bits}-bit matmul correlates only {c:.6} with the dense one; that is a wrong \
@@ -152,13 +150,22 @@ fn the_split_leaves_norms_and_odd_widths_dense() {
     let s = Stream::gpu();
     let mut w: sd_models::mlx::Weights = std::collections::HashMap::new();
     w.insert("blk.0.attn.weight".into(), weight(128, 256));
-    w.insert("blk.0.attn.bias".into(), Array::from_slice_f32(&vec![0.0; 128], &[128]).unwrap());
-    w.insert("blk.0.norm.weight".into(), Array::from_slice_f32(&vec![1.0; 128], &[128]).unwrap());
+    w.insert(
+        "blk.0.attn.bias".into(),
+        Array::from_slice_f32(&vec![0.0; 128], &[128]).unwrap(),
+    );
+    w.insert(
+        "blk.0.norm.weight".into(),
+        Array::from_slice_f32(&vec![1.0; 128], &[128]).unwrap(),
+    );
     // 100 does not divide by 64.
     w.insert("blk.0.odd.weight".into(), weight(32, 100));
 
     let q = quantized::from_dense(&w, DEFAULT_BITS, &s).expect("split");
-    assert!(q.quantized.contains_key("blk.0.attn.weight"), "a 2-D weight");
+    assert!(
+        q.quantized.contains_key("blk.0.attn.weight"),
+        "a 2-D weight"
+    );
     assert!(q.dense.contains_key("blk.0.attn.bias"), "a bias is 1-D");
     assert!(q.dense.contains_key("blk.0.norm.weight"), "a norm is 1-D");
     assert!(
@@ -183,10 +190,7 @@ fn the_linear_dispatches_to_the_right_kernel() {
     let x_big = activation(4, 256);
     let x_small = activation(4, 32);
     let want_big = x_big
-        .matmul(
-            &dense_map["big.weight"].transpose(&[1, 0], &s).unwrap(),
-            &s,
-        )
+        .matmul(&dense_map["big.weight"].transpose(&[1, 0], &s).unwrap(), &s)
         .unwrap()
         .to_vec_f32(&s)
         .unwrap();
@@ -268,4 +272,103 @@ fn flux_schnell_loads_quantised_and_fits() {
         "schnell came to {gb:.2} GB, which is too small to be the whole model — check \
          the loader is not skipping tensors"
     );
+}
+
+/// **The whole transformer, run quantised, against the same one run dense.**
+///
+/// The tests above check one matmul. This checks that 57 blocks of them
+/// compose without the error compounding into a different picture — which is
+/// the question quantised-at-rest actually has to answer, and the one a single
+/// layer cannot.
+///
+/// flux-mini rather than schnell because a dense reference has to fit beside
+/// the quantised copy; the architecture is the same.
+#[test]
+fn the_flux_transformer_agrees_with_itself_quantised() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden");
+    let (refs_p, w_p) = (
+        root.join("flux_transformer/reference.safetensors"),
+        root.join("flux/flux-mini.safetensors"),
+    );
+    if !refs_p.exists() || !w_p.exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no flux fixture.");
+        return;
+    }
+    let s = Stream::gpu();
+    let refs = sd_tensor::mlx::load_safetensors(&refs_p).expect("reference");
+    let raw = sd_tensor::mlx::load_safetensors(&w_p).expect("weights");
+    let mut dense: sd_models::mlx::Weights = std::collections::HashMap::new();
+    for (name, t) in &raw {
+        dense.insert(name.clone(), t.to_f32(&s).expect("f32"));
+    }
+
+    let cfg = sd_models::mlx::flux::FluxConfig::mini();
+    let scalar = |k: &str| -> usize { refs.get(k).unwrap().to_vec_f32(&s).unwrap()[0] as usize };
+    let ids = sd_models::mlx::flux::image_ids(scalar("latent_h"), scalar("latent_w"));
+
+    fn run_with(
+        w: &impl sd_models::mlx::quantized::WeightSource,
+        refs: &std::collections::HashMap<String, Array>,
+        ids: &[f32],
+        cfg: &sd_models::mlx::flux::FluxConfig,
+        s: &Stream,
+    ) -> Vec<f32> {
+        sd_models::mlx::flux::forward(
+            refs.get("hidden_states").unwrap(),
+            ids,
+            refs.get("encoder_hidden_states").unwrap(),
+            refs.get("timestep").unwrap(),
+            refs.get("pooled_projections").unwrap(),
+            Some(refs.get("guidance").unwrap()),
+            cfg,
+            w,
+            s,
+        )
+        .expect("forward")
+        .to_vec_f32(s)
+        .unwrap()
+    }
+
+    let want = run_with(&dense, &refs, &ids, &cfg, &s);
+    let dense_bytes: usize = dense.values().map(|a| a.elem_count() * 4).sum();
+
+    // Three rows: 8-bit everywhere, 4-bit everywhere, and 4-bit under the
+    // default policy that keeps the sensitive layers dense.
+    let mut measured: Vec<(&str, f64, f64)> = Vec::new();
+    for (label, bits, policy) in [
+        ("8-bit, all      ", 8usize, false),
+        ("4-bit, all      ", 4, false),
+        ("4-bit, mixed    ", 4, true),
+    ] {
+        let q = if policy {
+            quantized::from_dense(&dense, bits, &s).expect("quantise")
+        } else {
+            quantized::from_dense_with(&dense, |_| bits, &s).expect("quantise")
+        };
+        let got = run_with(&q, &refs, &ids, &cfg, &s);
+        let c = cosine(&want, &got);
+        let ratio = q.resident_bytes() as f64 / dense_bytes as f64;
+        let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let worst = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "flux-mini {label}: cosine {c:.6}, peak {peak:.3}, max_abs {worst:.4}, \
+             {:.1}% of dense",
+            ratio * 100.0
+        );
+        // Only the floor that separates "quantisation loss" from "wrong
+        // contraction": a fault anywhere in 57 blocks lands near zero. The
+        // per-row bounds are asserted after the loop, where the three can be
+        // compared against each other.
+        assert!(
+            c > 0.5,
+            "{label} ran the transformer to cosine {c:.6}; that is a fault, not \
+             quantisation loss"
+        );
+        assert!(ratio < 0.45, "{label} saved nothing: {:.1}%", ratio * 100.0);
+        measured.push((label, c, ratio));
+    }
 }

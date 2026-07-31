@@ -20,7 +20,7 @@
 use sd_tensor::mlx::{concat, Array, Stream};
 use sd_tensor::{Error, Result};
 
-use super::{get, linear, Weights};
+use super::quantized::WeightSource;
 
 const TIME_EMBED_DIM: usize = 256;
 /// Flux scales the timestep by this before embedding it. The SD UNet does not.
@@ -191,14 +191,14 @@ fn norm_modulate(x: &Array, shift: &Array, scale: &Array, s: &Stream) -> Result<
 fn modulation(
     vec: &Array,
     double: bool,
-    w: &Weights,
+    w: &impl WeightSource,
     prefix: &str,
     s: &Stream,
 ) -> Result<Vec<Array>> {
-    let out = linear(
+    let out = w.linear(
         &vec.silu(s)?,
-        get(w, &format!("{prefix}.lin.weight"))?,
-        w.get(&format!("{prefix}.lin.bias")),
+        &format!("{prefix}.lin.weight"),
+        w.optional(&format!("{prefix}.lin.bias")),
         s,
     )?;
     let [b, total] = out.shape()[..] else {
@@ -249,7 +249,7 @@ fn double_block(
     pe: &Rope,
     index: usize,
     cfg: &FluxConfig,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<(Array, Array)> {
     let path = format!("double_blocks.{index}");
@@ -261,22 +261,22 @@ fn double_block(
 
     let stream_qkv = |x: &Array, m: &[Array], tag: &str| -> Result<(Array, Array, Array)> {
         let normed = norm_modulate(x, &m[0], &m[1], s)?;
-        let qkv = linear(
+        let qkv = w.linear(
             &normed,
-            get(w, &format!("{path}.{tag}_attn.qkv.weight"))?,
-            w.get(&format!("{path}.{tag}_attn.qkv.bias")),
+            &format!("{path}.{tag}_attn.qkv.weight"),
+            w.optional(&format!("{path}.{tag}_attn.qkv.bias")),
             s,
         )?;
         let (q, k, v) = split_qkv(&qkv, heads, hd, s)?;
         Ok((
             qk_norm(
                 &q,
-                get(w, &format!("{path}.{tag}_attn.norm.query_norm.scale"))?,
+                w.dense(&format!("{path}.{tag}_attn.norm.query_norm.scale"))?,
                 s,
             )?,
             qk_norm(
                 &k,
-                get(w, &format!("{path}.{tag}_attn.norm.key_norm.scale"))?,
+                w.dense(&format!("{path}.{tag}_attn.norm.key_norm.scale"))?,
                 s,
             )?,
             v,
@@ -299,27 +299,28 @@ fn double_block(
 
     let finish = |x: &Array, a: &Array, m: &[Array], tag: &str| -> Result<Array> {
         let x = x.add(
-            &linear(
+            &w.linear(
                 a,
-                get(w, &format!("{path}.{tag}_attn.proj.weight"))?,
-                w.get(&format!("{path}.{tag}_attn.proj.bias")),
+                &format!("{path}.{tag}_attn.proj.weight"),
+                w.optional(&format!("{path}.{tag}_attn.proj.bias")),
                 s,
             )?
             .mul(&m[2], s)?,
             s,
         )?;
         let ff_in = norm_modulate(&x, &m[3], &m[4], s)?;
-        let ff = linear(
-            &ff_in,
-            get(w, &format!("{path}.{tag}_mlp.0.weight"))?,
-            w.get(&format!("{path}.{tag}_mlp.0.bias")),
-            s,
-        )?
-        .gelu_approx(s)?;
-        let ff = linear(
+        let ff = w
+            .linear(
+                &ff_in,
+                &format!("{path}.{tag}_mlp.0.weight"),
+                w.optional(&format!("{path}.{tag}_mlp.0.bias")),
+                s,
+            )?
+            .gelu_approx(s)?;
+        let ff = w.linear(
             &ff,
-            get(w, &format!("{path}.{tag}_mlp.2.weight"))?,
-            w.get(&format!("{path}.{tag}_mlp.2.bias")),
+            &format!("{path}.{tag}_mlp.2.weight"),
+            w.optional(&format!("{path}.{tag}_mlp.2.bias")),
             s,
         )?;
         x.add(&ff.mul(&m[5], s)?, s)
@@ -338,7 +339,7 @@ fn single_block(
     pe: &Rope,
     index: usize,
     cfg: &FluxConfig,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<Array> {
     let path = format!("single_blocks.{index}");
@@ -348,10 +349,10 @@ fn single_block(
     let m = modulation(vec, false, w, &format!("{path}.modulation"), s)?;
     let normed = norm_modulate(x, &m[0], &m[1], s)?;
 
-    let projected = linear(
+    let projected = w.linear(
         &normed,
-        get(w, &format!("{path}.linear1.weight"))?,
-        w.get(&format!("{path}.linear1.bias")),
+        &format!("{path}.linear1.weight"),
+        w.optional(&format!("{path}.linear1.bias")),
         s,
     )?;
     let last = projected.shape().len() - 1;
@@ -360,22 +361,22 @@ fn single_block(
 
     let (q, k, v) = split_qkv(&qkv.contiguous(s)?, heads, hd, s)?;
     let q = rotate(
-        &qk_norm(&q, get(w, &format!("{path}.norm.query_norm.scale"))?, s)?,
+        &qk_norm(&q, w.dense(&format!("{path}.norm.query_norm.scale"))?, s)?,
         pe,
         s,
     )?;
     let k = rotate(
-        &qk_norm(&k, get(w, &format!("{path}.norm.key_norm.scale"))?, s)?,
+        &qk_norm(&k, w.dense(&format!("{path}.norm.key_norm.scale"))?, s)?,
         pe,
         s,
     )?;
     let attn = merge_heads(&q.sdpa(&k, &v, 1.0 / (hd as f32).sqrt(), s)?, s)?;
 
     let joined = concat(&[&attn, &mlp.contiguous(s)?.gelu_approx(s)?], 2, s)?;
-    let out = linear(
+    let out = w.linear(
         &joined,
-        get(w, &format!("{path}.linear2.weight"))?,
-        w.get(&format!("{path}.linear2.bias")),
+        &format!("{path}.linear2.weight"),
+        w.optional(&format!("{path}.linear2.bias")),
         s,
     )?;
     x.add(&out.mul(&m[2], s)?, s)
@@ -399,19 +400,15 @@ fn timestep_embedding(t: &Array, dim: usize, theta: f32, s: &Stream) -> Result<A
 }
 
 /// Two-layer MLP with SiLU between, used for every conditioning input.
-fn mlp_embedder(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
+fn mlp_embedder(x: &Array, w: &impl WeightSource, prefix: &str, s: &Stream) -> Result<Array> {
     let p = |n: &str| format!("{prefix}.{n}");
-    let h = linear(
-        x,
-        get(w, &p("in_layer.weight"))?,
-        w.get(&p("in_layer.bias")),
-        s,
-    )?
-    .silu(s)?;
-    linear(
+    let h = w
+        .linear(x, &p("in_layer.weight"), w.optional(&p("in_layer.bias")), s)?
+        .silu(s)?;
+    w.linear(
         &h,
-        get(w, &p("out_layer.weight"))?,
-        w.get(&p("out_layer.bias")),
+        &p("out_layer.weight"),
+        w.optional(&p("out_layer.bias")),
         s,
     )
 }
@@ -430,11 +427,11 @@ pub fn forward(
     pooled: &Array,
     guidance: Option<&Array>,
     cfg: &FluxConfig,
-    w: &Weights,
+    w: &impl WeightSource,
     s: &Stream,
 ) -> Result<Array> {
-    let mut img = linear(img, get(w, "img_in.weight")?, w.get("img_in.bias"), s)?;
-    let mut txt = linear(txt, get(w, "txt_in.weight")?, w.get("txt_in.bias"), s)?;
+    let mut img = w.linear(img, "img_in.weight", w.optional("img_in.bias"), s)?;
+    let mut txt = w.linear(txt, "txt_in.weight", w.optional("txt_in.bias"), s)?;
 
     let mut vec = mlp_embedder(
         &timestep_embedding(timestep, TIME_EMBED_DIM, cfg.theta, s)?,
@@ -492,10 +489,10 @@ pub fn forward(
     // The output head: modulate, then project back to patch channels. **Shift
     // comes first here**, unlike `modulation`, which yields (shift, scale,
     // gate) — the ordering is per-module, not global.
-    let params = linear(
+    let params = w.linear(
         &vec.silu(s)?,
-        get(w, "final_layer.adaLN_modulation.1.weight")?,
-        w.get("final_layer.adaLN_modulation.1.bias"),
+        "final_layer.adaLN_modulation.1.weight",
+        w.optional("final_layer.adaLN_modulation.1.bias"),
         s,
     )?;
     let [b, total] = params.shape()[..] else {
@@ -507,10 +504,10 @@ pub fn forward(
     let scale = params.narrow(2, dim, dim, s)?;
 
     let out = norm_modulate(&img, &shift, &scale, s)?;
-    linear(
+    w.linear(
         &out,
-        get(w, "final_layer.linear.weight")?,
-        w.get("final_layer.linear.bias"),
+        "final_layer.linear.weight",
+        w.optional("final_layer.linear.bias"),
         s,
     )
 }

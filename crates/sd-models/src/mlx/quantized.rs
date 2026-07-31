@@ -85,6 +85,43 @@ impl QuantizedWeights {
     }
 }
 
+/// Tensors that need more bits than the rest.
+///
+/// **Not every parameter tolerates 4 bits equally.** A modulation layer emits
+/// the shift, scale and gate that *multiply* the residual stream, so an error
+/// there is multiplied by everything downstream rather than added to it. The
+/// input and output projections sit outside the residual and are read once
+/// each, with nothing after them to average the error away.
+///
+/// Measured on flux-mini, whole-transformer cosine against the dense run, with
+/// resident size as a fraction of dense f32:
+///
+/// ```text
+///   4-bit everywhere            0.9334   15.6 %
+///   8-bit everywhere            0.9993   28.1 %
+///   these layers dense, rest 4  0.9924   39.0 %   <- worse than 8-bit
+///   these layers 8, rest 4      0.9919   19.1 %   <- the default
+/// ```
+///
+/// The third row is why the policy assigns a *bit width* rather than a
+/// boolean: keeping these dense recovers the accuracy and costs more than
+/// simply using 8 bits throughout, which would make the policy pointless. At 8
+/// bits they cost 3.5 points of size and buy back nearly six points of cosine.
+pub fn sensitive(name: &str) -> bool {
+    name.contains("_mod.lin")
+        || name.contains("modulation")
+        || name.contains("_embedder")
+        || name.starts_with("img_in")
+        || name.starts_with("txt_in")
+        || name.starts_with("final_layer")
+}
+
+/// The default policy: [`sensitive`] layers at 8 bits, everything else at
+/// `bits`.
+pub fn mixed(bits: usize) -> impl Fn(&str) -> usize {
+    move |name: &str| if sensitive(name) { 8 } else { bits }
+}
+
 /// Is this tensor worth quantising?
 ///
 /// 2-D, and its input width a multiple of the group size. Everything else stays
@@ -111,8 +148,9 @@ pub fn from_gguf(path: &Path, bits: usize, s: &Stream) -> Result<QuantizedWeight
         let array = Array::from_slice_f32(&values, &info.shape)?;
         drop(values);
 
+        let want = if sensitive(&info.name) { 8 } else { bits };
         if quantizable(&info.shape) {
-            let q = QuantizedArray::quantize(&array, GROUP_SIZE, bits, s)?;
+            let q = QuantizedArray::quantize(&array, GROUP_SIZE, want, s)?;
             // **Evaluate before dropping the dense source.** MLX is lazy, so
             // without this the quantisation is a graph node holding a
             // reference to every dense tensor in the file — which is the 47.6
@@ -138,10 +176,23 @@ pub fn from_gguf(path: &Path, bits: usize, s: &Stream) -> Result<QuantizedWeight
 /// because it quantises once rather than on top of GGUF's own loss. It does
 /// require the dense weights to fit, which is the trade.
 pub fn from_dense(w: &Weights, bits: usize, s: &Stream) -> Result<QuantizedWeights> {
+    from_dense_with(w, mixed(bits), s)
+}
+
+/// [`from_dense`] with an explicit per-tensor bit width.
+///
+/// `bits_for` returns the width for a tensor; **0 keeps it dense**. See
+/// [`mixed`] for the default and [`sensitive`] for why it is not uniform.
+pub fn from_dense_with(
+    w: &Weights,
+    bits_for: impl Fn(&str) -> usize,
+    s: &Stream,
+) -> Result<QuantizedWeights> {
     let mut quantized = HashMap::new();
     let mut dense: Weights = HashMap::new();
     for (name, array) in w {
-        if quantizable(&array.shape()) {
+        let bits = bits_for(name);
+        if bits >= 2 && quantizable(&array.shape()) {
             let q = QuantizedArray::quantize(array, GROUP_SIZE, bits, s)?;
             sd_tensor::mlx::eval(&[&q.weight, &q.scales, &q.biases])?;
             quantized.insert(name.clone(), q);
@@ -176,5 +227,67 @@ pub fn linear(
     match bias {
         Some(b) => y.add(b, s),
         None => Ok(y),
+    }
+}
+
+/// Where a model's weights come from, dense or quantised.
+///
+/// One trait so a forward pass is written once. The alternative — a second copy
+/// of `flux::forward` differing only in which `linear` it calls — is how the
+/// two would come to disagree about, say, which projection carries a bias.
+pub trait WeightSource {
+    /// `x @ w[name].T + bias`, by whatever kernel suits how `name` is held.
+    fn linear(&self, x: &Array, name: &str, bias: Option<&Array>, s: &Stream) -> Result<Array>;
+
+    /// A tensor that is always dense: a norm scale, a bias, an embedding.
+    ///
+    /// **Not for weights.** Asking for a quantised one here is an error rather
+    /// than a silent dequantisation, because a caller that reaches past
+    /// [`Self::linear`] is the caller that materialises the model.
+    fn dense(&self, name: &str) -> Result<&Array>;
+
+    /// `dense`, but absent is `None` rather than an error — for optional
+    /// biases.
+    fn optional(&self, name: &str) -> Option<&Array>;
+}
+
+impl WeightSource for Weights {
+    fn linear(&self, x: &Array, name: &str, bias: Option<&Array>, s: &Stream) -> Result<Array> {
+        let w = self
+            .get(name)
+            .ok_or_else(|| Error::Msg(format!("mlx: missing tensor {name}")))?;
+        super::linear(x, w, bias, s)
+    }
+
+    fn dense(&self, name: &str) -> Result<&Array> {
+        self.get(name)
+            .ok_or_else(|| Error::Msg(format!("mlx: missing tensor {name}")))
+    }
+
+    fn optional(&self, name: &str) -> Option<&Array> {
+        self.get(name)
+    }
+}
+
+impl WeightSource for QuantizedWeights {
+    fn linear(&self, x: &Array, name: &str, bias: Option<&Array>, s: &Stream) -> Result<Array> {
+        linear(x, name, bias, self, s)
+    }
+
+    fn dense(&self, name: &str) -> Result<&Array> {
+        self.dense.get(name).ok_or_else(|| {
+            if self.quantized.contains_key(name) {
+                Error::Msg(format!(
+                    "mlx: {name} is quantised; reach it through `linear` rather than \
+                     dequantising it"
+                ))
+            } else {
+                Error::Msg(format!("mlx: missing tensor {name}"))
+            }
+        })
+    }
+
+    fn optional(&self, name: &str) -> Option<&Array> {
+        self.dense.get(name)
     }
 }

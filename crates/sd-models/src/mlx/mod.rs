@@ -41,6 +41,8 @@ pub mod lora;
 pub mod motion;
 /// unCLIP's prior: a diffusion model over a 768-vector.
 pub mod prior;
+/// Weights held quantised at rest.
+pub mod quantized;
 /// The txt2img sampling loop.
 pub mod sample;
 /// SD 3 / SD 3.5's MMDiT transformer.
@@ -49,8 +51,6 @@ pub mod sd3;
 pub mod t5;
 /// TAESD, the tiny autoencoder. Its latent scaling is 1.0, not the VAE's.
 pub mod taesd;
-/// Weights held quantised at rest.
-pub mod quantized;
 /// unCLIP's noise augmentation.
 pub mod unclip;
 /// The VAE decoder. Its epsilon is 1e-6, not the UNet's 1e-5.

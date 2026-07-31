@@ -1371,12 +1371,7 @@ impl QuantizedArray {
     /// out.
     ///
     /// `group_size` must divide the *input* width, and 64 is MLX's default.
-    pub fn quantize(
-        w: &Array,
-        group_size: usize,
-        bits: usize,
-        stream: &Stream,
-    ) -> Result<Self> {
+    pub fn quantize(w: &Array, group_size: usize, bits: usize, stream: &Stream) -> Result<Self> {
         let mode = CString::new(QUANT_MODE).expect("literal");
         let null = mlx_array {
             ctx: std::ptr::null_mut(),
