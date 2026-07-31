@@ -17,6 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
+use sd_models::clip::ClipTokenizer;
 use sd_models::mlx::{clip, sample, unet_forward, vae, UNetConfig};
 use sd_sample::{sigmas_for_steps, Schedule};
 use sd_tensor::mlx::{load_safetensors, Array, Stream};
@@ -26,6 +27,7 @@ use sd_tensor::{Device, Tensor};
 /// The SD VAE's convention. TAESD's is 1.0; using the wrong one is a plausible
 /// image in wrong colours.
 const VAE_SCALE: f32 = 0.18215;
+const PROMPT: &str = "a photograph of an astronaut riding a horse on mars";
 const STEPS: usize = 20;
 const CFG_SCALE: f64 = 7.5;
 /// `<|startoftext|>` and `<|endoftext|>` in SD 1.5's vocabulary.
@@ -90,9 +92,21 @@ fn txt2img_produces_an_image() {
     let clip_w = load_safetensors(&needed[2]).expect("clip");
     let clip_refs = load_safetensors(&needed[3]).expect("clip reference");
 
-    // The conditional prompt is the fixture's tokenisation; the unconditional
-    // one is the empty string, which CLIP pads with EOS.
-    let cond_ids = {
+    // **A real prompt, tokenised by the real tokenizer.** `ClipTokenizer`
+    // returns `Vec<u32>` and never touches a tensor, so it is backend-free and
+    // needed no porting — this is the test that says so, rather than the claim
+    // being made in a comment somewhere.
+    let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/clip_tokenizer/tokenizer.json");
+    let cond_ids = if tokenizer_path.exists() {
+        let tok = ClipTokenizer::from_file(&tokenizer_path).expect("tokenizer");
+        let ids = tok.encode(PROMPT).expect("encode");
+        assert_eq!(ids.len(), clip::MAX_POSITION, "CLIP pads to 77");
+        let v: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
+        Array::from_slice_i32(&v, &[1, clip::MAX_POSITION]).unwrap()
+    } else {
+        // Fall back to the fixture's tokenisation so the pipeline is still
+        // exercised on a machine without the tokenizer.
         let ids = clip_refs.get("token_ids").expect("token_ids");
         let f = ids.to_f32(&s).unwrap().to_vec_f32(&s).unwrap();
         let v: Vec<i32> = f.iter().map(|&x| x as i32).collect();
