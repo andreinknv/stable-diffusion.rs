@@ -49,6 +49,8 @@ pub mod sd3;
 pub mod t5;
 /// TAESD, the tiny autoencoder. Its latent scaling is 1.0, not the VAE's.
 pub mod taesd;
+/// Weights held quantised at rest.
+pub mod quantized;
 /// unCLIP's noise augmentation.
 pub mod unclip;
 /// The VAE decoder. Its epsilon is 1e-6, not the UNet's 1e-5.

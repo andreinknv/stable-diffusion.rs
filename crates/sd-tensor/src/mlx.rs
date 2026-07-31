@@ -53,6 +53,32 @@ struct mlx_vector_array {
     ctx: *mut c_void,
 }
 
+/// `mlx_optional_int`. Passed by value, so the layout has to match exactly:
+/// an `int` then a `bool`, not a tagged union.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct mlx_optional_int {
+    value: i32,
+    has_value: bool,
+}
+
+impl mlx_optional_int {
+    fn some(v: i32) -> Self {
+        Self {
+            value: v,
+            has_value: true,
+        }
+    }
+}
+
+/// `mlx_optional_dtype`, which quantisation takes for the output type.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct mlx_optional_dtype {
+    value: i32,
+    has_value: bool,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct mlx_map_string_to_array {
@@ -285,6 +311,46 @@ unsafe extern "C" {
     fn mlx_default_cpu_stream_new() -> mlx_stream;
     fn mlx_stream_free(s: mlx_stream) -> i32;
     fn mlx_vector_array_new_value(val: mlx_array) -> mlx_vector_array;
+    fn mlx_vector_array_size(vec: mlx_vector_array) -> usize;
+    fn mlx_vector_array_get(res: *mut mlx_array, vec: mlx_vector_array, index: usize) -> i32;
+
+    // quantisation
+    #[allow(clippy::too_many_arguments)]
+    fn mlx_quantize(
+        res: *mut mlx_vector_array,
+        w: mlx_array,
+        group_size: mlx_optional_int,
+        bits: mlx_optional_int,
+        mode: *const c_char,
+        global_scale: mlx_array,
+        s: mlx_stream,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn mlx_dequantize(
+        res: *mut mlx_array,
+        w: mlx_array,
+        scales: mlx_array,
+        biases: mlx_array,
+        group_size: mlx_optional_int,
+        bits: mlx_optional_int,
+        mode: *const c_char,
+        global_scale: mlx_array,
+        dtype: mlx_optional_dtype,
+        s: mlx_stream,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn mlx_quantized_matmul(
+        res: *mut mlx_array,
+        x: mlx_array,
+        w: mlx_array,
+        scales: mlx_array,
+        biases: mlx_array,
+        transpose: bool,
+        group_size: mlx_optional_int,
+        bits: mlx_optional_int,
+        mode: *const c_char,
+        s: mlx_stream,
+    ) -> i32;
     fn mlx_vector_array_free(vec: mlx_vector_array) -> i32;
     fn mlx_eval(outputs: mlx_vector_array) -> i32;
     fn mlx_set_error_handler(
@@ -1270,4 +1336,169 @@ pub fn eval(arrays: &[&Array]) -> Result<()> {
         check(status, "eval")?;
     }
     Ok(())
+}
+
+// -- quantisation -----------------------------------------------------------
+
+/// MLX's default quantisation mode. `affine` is scale-and-bias per group,
+/// which is what `mlx.quantize` uses when you do not ask for anything else.
+const QUANT_MODE: &str = "affine";
+
+/// A weight held **quantised at rest**, with the scales and biases that
+/// reconstruct it.
+///
+/// The whole point is that this is never fully materialised. A 12B-parameter
+/// transformer is 47.6 GB dense in f32 and does not fit on a 36 GB machine; at
+/// 4 bits with group-64 scales it is about 6.7 GB, and the dequantisation
+/// happens inside the matmul kernel one tile at a time.
+///
+/// **`bits` and `group_size` are not free parameters.** They have to match what
+/// the weight was quantised with, and nothing in the tensors themselves records
+/// it — a mismatched pair reconstructs plausible numbers from the right bits in
+/// the wrong places.
+#[derive(Debug)]
+pub struct QuantizedArray {
+    /// The packed weights, `uint32` with `32 / bits` values per element.
+    pub weight: Array,
+    pub scales: Array,
+    pub biases: Array,
+    pub group_size: usize,
+    pub bits: usize,
+}
+
+impl QuantizedArray {
+    /// Quantise a dense array. `[out, in]` in, packed `[out, in * bits / 32]`
+    /// out.
+    ///
+    /// `group_size` must divide the *input* width, and 64 is MLX's default.
+    pub fn quantize(
+        w: &Array,
+        group_size: usize,
+        bits: usize,
+        stream: &Stream,
+    ) -> Result<Self> {
+        let mode = CString::new(QUANT_MODE).expect("literal");
+        let null = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        let mut out = mlx_vector_array {
+            ctx: std::ptr::null_mut(),
+        };
+        check(
+            unsafe {
+                mlx_quantize(
+                    &mut out,
+                    w.raw,
+                    mlx_optional_int::some(group_size as i32),
+                    mlx_optional_int::some(bits as i32),
+                    mode.as_ptr(),
+                    null,
+                    stream.0,
+                )
+            },
+            "quantize",
+        )?;
+
+        // Three arrays out: weight, scales, biases.
+        let n = unsafe { mlx_vector_array_size(out) };
+        if n != 3 {
+            unsafe { mlx_vector_array_free(out) };
+            return Err(Error::Msg(format!(
+                "mlx: quantize returned {n} arrays, expected weight, scales and biases"
+            )));
+        }
+        let mut parts = Vec::with_capacity(3);
+        for i in 0..3 {
+            let mut a = null;
+            let rc = unsafe { mlx_vector_array_get(&mut a, out, i) };
+            if rc != 0 {
+                unsafe { mlx_vector_array_free(out) };
+                return Err(Error::Msg(format!("mlx: quantize output {i}")));
+            }
+            parts.push(Array { raw: a });
+        }
+        unsafe { mlx_vector_array_free(out) };
+        let mut it = parts.into_iter();
+        Ok(Self {
+            weight: it.next().expect("three"),
+            scales: it.next().expect("three"),
+            biases: it.next().expect("three"),
+            group_size,
+            bits,
+        })
+    }
+
+    /// Reconstruct the dense array.
+    ///
+    /// **For testing and for layers that have no quantised kernel**, not for
+    /// the hot path — materialising every weight is exactly what this type
+    /// exists to avoid.
+    pub fn dequantize(&self, stream: &Stream) -> Result<Array> {
+        let mode = CString::new(QUANT_MODE).expect("literal");
+        let null = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        let mut out = null;
+        check(
+            unsafe {
+                mlx_dequantize(
+                    &mut out,
+                    self.weight.raw,
+                    self.scales.raw,
+                    self.biases.raw,
+                    mlx_optional_int::some(self.group_size as i32),
+                    mlx_optional_int::some(self.bits as i32),
+                    mode.as_ptr(),
+                    null,
+                    mlx_optional_dtype {
+                        value: 0,
+                        has_value: false,
+                    },
+                    stream.0,
+                )
+            },
+            "dequantize",
+        )?;
+        Ok(Array { raw: out })
+    }
+
+    /// `x @ weight.T`, dequantising inside the kernel.
+    ///
+    /// `transpose` is true because a `diffusers` linear stores `[out, in]` and
+    /// this multiplies by its transpose — the same convention the dense
+    /// `linear` here uses. Passing false runs and contracts the wrong axis.
+    pub fn matmul(&self, x: &Array, stream: &Stream) -> Result<Array> {
+        let mode = CString::new(QUANT_MODE).expect("literal");
+        let mut out = mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
+        check(
+            unsafe {
+                mlx_quantized_matmul(
+                    &mut out,
+                    x.raw,
+                    self.weight.raw,
+                    self.scales.raw,
+                    self.biases.raw,
+                    true,
+                    mlx_optional_int::some(self.group_size as i32),
+                    mlx_optional_int::some(self.bits as i32),
+                    mode.as_ptr(),
+                    stream.0,
+                )
+            },
+            "quantized_matmul",
+        )?;
+        Ok(Array { raw: out })
+    }
+
+    /// Bytes this weight occupies, for a residency report.
+    ///
+    /// The packed weights plus both scale tensors — the honest figure, not just
+    /// the bits, because at group 64 the scales are a real 6 % on top.
+    pub fn resident_bytes(&self) -> usize {
+        let packed = self.weight.elem_count() * 4;
+        let scales = (self.scales.elem_count() + self.biases.elem_count()) * 4;
+        packed + scales
+    }
 }
