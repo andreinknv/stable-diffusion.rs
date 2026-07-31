@@ -113,3 +113,70 @@ fn guidance_is_required_exactly_when_the_checkpoint_has_it() {
         "schnell takes none"
     );
 }
+
+/// **Pins the rotary convention as interleaved.**
+///
+/// `rope.rs` warns that a transposed or half-split rotation is still a
+/// rotation, so it yields a coherent image with the geometry subtly wrong
+/// rather than an error. The golden test above already rules that out — a
+/// wrong convention is an O(1) divergence, not 3.5e-6 — but it rules it out
+/// implicitly, across a whole model. This checks the arithmetic directly, so a
+/// future edit to `apply_rope` fails here with a name rather than there with a
+/// number.
+///
+/// With one frequency and a 2-wide head, the rotation is exactly
+/// `[[cos, -sin], [sin, cos]]` applied to `(x0, x1)`.
+#[test]
+fn rope_is_interleaved_and_rotates_the_right_pairs() {
+    let s = Stream::gpu();
+    // theta irrelevant at dim 2: omega[0] = 1, so the angle is the position.
+    let axes = [2usize];
+    // One token at position 1 radian.
+    let pe = flux::embed_nd(&[1.0], 1, &axes, 10_000.0).unwrap();
+    let cos = pe.cos.to_vec_f32(&s).unwrap();
+    let sin = pe.sin.to_vec_f32(&s).unwrap();
+    assert!((cos[0] - 1.0f32.cos()).abs() < 1e-6, "cos of the position");
+    assert!((sin[0] - 1.0f32.sin()).abs() < 1e-6, "sin of the position");
+
+    // x = (3, 4) as one head of width 2.
+    let x = Array::from_slice_f32(&[3.0, 4.0], &[1, 1, 1, 2]).unwrap();
+    let got = flux::rotate(&x, &pe, &s).unwrap().to_vec_f32(&s).unwrap();
+
+    let (c, sn) = (1.0f32.cos(), 1.0f32.sin());
+    let want = [3.0 * c - 4.0 * sn, 3.0 * sn + 4.0 * c];
+    for i in 0..2 {
+        assert!(
+            (got[i] - want[i]).abs() < 1e-5,
+            "element {i}: {} != {} — the rotation is not the interleaved \
+             [[cos, -sin], [sin, cos]] on (x0, x1)",
+            got[i],
+            want[i]
+        );
+    }
+
+    // And it is *not* the split-half convention, which would pair x0 with x1
+    // as halves rather than as a couple. At width 2 the two coincide, so use a
+    // 4-wide head where they differ.
+    let axes4 = [4usize];
+    let pe4 = flux::embed_nd(&[1.0], 1, &axes4, 10_000.0).unwrap();
+    let x4 = Array::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 1, 4]).unwrap();
+    let g4 = flux::rotate(&x4, &pe4, &s).unwrap().to_vec_f32(&s).unwrap();
+    let c4 = pe4.cos.to_vec_f32(&s).unwrap();
+    let s4 = pe4.sin.to_vec_f32(&s).unwrap();
+    // Interleaved: pairs are (0,1) and (2,3).
+    let expect = [
+        1.0 * c4[0] - 2.0 * s4[0],
+        1.0 * s4[0] + 2.0 * c4[0],
+        3.0 * c4[1] - 4.0 * s4[1],
+        3.0 * s4[1] + 4.0 * c4[1],
+    ];
+    // Split-half would pair (0,2) and (1,3) instead.
+    let split_half_first = 1.0 * c4[0] - 3.0 * s4[0];
+    for i in 0..4 {
+        assert!((g4[i] - expect[i]).abs() < 1e-5, "interleaved element {i}");
+    }
+    assert!(
+        (g4[0] - split_half_first).abs() > 1e-6,
+        "interleaved and split-half must differ at width 4, or this test proves nothing"
+    );
+}

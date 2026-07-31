@@ -148,7 +148,7 @@ pub fn embed_nd(ids: &[f32], seq: usize, axes_dim: &[usize], theta: f32) -> Resu
 /// per frequency because that is what the reference does, and a transposed or
 /// half-split rotation is still a rotation — it produces a coherent image with
 /// the geometry subtly wrong.
-fn apply_rope(x: &Array, pe: &Rope, s: &Stream) -> Result<Array> {
+pub fn rotate(x: &Array, pe: &Rope, s: &Stream) -> Result<Array> {
     let [b, h, n, d] = x.shape()[..] else {
         return Err(Error::Msg(format!("mlx: rope got {:?}", x.shape())));
     };
@@ -287,8 +287,8 @@ fn double_block(
 
     // Text first, then image — the same order the position ids were
     // concatenated in, which is what makes the rotary embedding line up.
-    let q = apply_rope(&concat(&[&txt_q, &img_q], 2, s)?, pe, s)?;
-    let k = apply_rope(&concat(&[&txt_k, &img_k], 2, s)?, pe, s)?;
+    let q = rotate(&concat(&[&txt_q, &img_q], 2, s)?, pe, s)?;
+    let k = rotate(&concat(&[&txt_k, &img_k], 2, s)?, pe, s)?;
     let v = concat(&[&txt_v, &img_v], 2, s)?;
     let attn = merge_heads(&q.sdpa(&k, &v, scale, s)?, s)?;
 
@@ -359,12 +359,12 @@ fn single_block(
     let mlp = projected.narrow(last, 3 * h, cfg.mlp_hidden(), s)?;
 
     let (q, k, v) = split_qkv(&qkv.contiguous(s)?, heads, hd, s)?;
-    let q = apply_rope(
+    let q = rotate(
         &qk_norm(&q, get(w, &format!("{path}.norm.query_norm.scale"))?, s)?,
         pe,
         s,
     )?;
-    let k = apply_rope(
+    let k = rotate(
         &qk_norm(&k, get(w, &format!("{path}.norm.key_norm.scale"))?, s)?,
         pe,
         s,
