@@ -159,7 +159,8 @@ fn the_whole_down_pass_matches_diffusers() {
     let temb = timestep_embedding(refs.get("timestep").expect("timestep"), 320, &w, &s).unwrap();
 
     let x = sample.transpose(&[0, 2, 3, 1], &s).unwrap();
-    let (_deepest, skips) = down_pass(&x, &temb, context, &cfg, None, None, &w, &s).unwrap();
+    let (_deepest, skips) =
+        down_pass(&x, &temb, context, &cfg, &Default::default(), &w, &s).unwrap();
 
     assert_eq!(skips.len(), 12, "skip stack must have 12 entries");
 
@@ -241,8 +242,7 @@ fn the_mid_block_matches_diffusers() {
         &temb,
         refs.get("context").unwrap(),
         &cfg,
-        None,
-        None,
+        &Default::default(),
         &w,
         &s,
     )
@@ -252,8 +252,7 @@ fn the_mid_block_matches_diffusers() {
         &temb,
         refs.get("context").unwrap(),
         &cfg,
-        None,
-        None,
+        &Default::default(),
         &w,
         &s,
     )

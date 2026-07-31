@@ -7,12 +7,14 @@ Saying **go** means: read this file, take the first unchecked item under
 
 ### Start here
 
-1. **Decide the fork, and write the answer down.** Nothing else moves until
-   this exists — see [The fork to decide before writing any
-   code](#the-fork-to-decide-before-writing-any-code). Either `sd-tensor`
-   emulates candle's API over MLX and the 102 downstream files stay untouched,
-   or roughly 500 call sites change to MLX's own shape. The two do not share a
-   first commit, so guessing is more expensive than deciding.
+Steps 1–3 are done and the port is most of the way through step 4. What is left
+is at the bottom of this list; the crossed-out items are kept because their
+findings still bind.
+
+1. ~~**Decide the fork.**~~ — **decided 2026-07-30: (b), MLX's own shape.**
+   `sd-tensor` does *not* emulate candle's API. See [The fork to decide before
+   writing any code](#the-fork-to-decide-before-writing-any-code) for the
+   reasoning, which turned on `mlx-c`'s actual signatures rather than on taste.
 
 2. ~~**Spike GGUF before binding anything.**~~ — **done 2026-07-30, and it
    does not block.** Reading and dequantising GGUF needs one Python library and
@@ -21,45 +23,46 @@ Saying **go** means: read this file, take the first unchecked item under
    cosine of ~0.995 through MLX's own 4-bit. Full numbers and the
    double-quantisation trap under [Order of work](#order-of-work).
 
-3. **Bind `mlx-c` behind `sd-tensor`.** — **started 2026-07-30; the flag
-   exists and one op agrees.** `cargo test -p sd-tensor --features mlx` builds
-   against MLX and passes: elementwise add matches candle exactly, laziness is
-   asserted rather than assumed, and the default build links nothing new. What
-   is there is `Array`, `Stream`, `add` and `eval` — the skeleton, not the
-   surface. Continue from `src/mlx.rs`.
-   - **Install:** `brew install mlx-c` (pulls `mlx`). `build.rs` finds both via
-     `MLX_C_PREFIX`/`MLX_PREFIX` or Homebrew and links nothing when the feature
-     is off. Bindings are hand-written; `bindgen` would put libclang in every
-     build of this crate for a dozen declarations.
-   - **Owed, and known:** `mlx-c` reports errors through a process-global
-     handler, so `check()` currently surfaces a status code and no message.
-     A thread-local trampoline around `mlx_set_error_handler` is needed before
-     the error text is worth anything.
-   - `mlx-c` is Apple's own C API (github.com/ml-explore/mlx-c). Bind it
-     directly; `cargo search mlx` finds no first-party Rust crate, and the
-     third-party shims are still 0.2.x (`rlx-mlx` 0.2.13), as before.
-   - It goes in `sd-tensor` and nowhere else. `scripts/check-seam.sh` enforces
-     that no crate outside it names the backend, and CI runs it. That rule is
-     what makes this migration bounded rather than total — do not weaken it to
-     make the port easier.
-   - Target surface: **not** "the ~20 ops `sd-models` calls" — that estimate
-     was wrong. Measured 2026-07-30: 49 distinct items over 596 import sites
-     in 102 files, and 85% of them are candle's own types re-exported by the
-     seam. See [What the seam actually
-     hides](#what-the-seam-actually-hides) before estimating this step.
-   - Success looks like: `sd-tensor` compiles against MLX behind a feature
-     flag, with candle still the default, and one trivial op agreeing between
-     the two.
+3. ~~**Bind `mlx-c` behind `sd-tensor`.**~~ — **done.** `crates/sd-tensor/src/mlx.rs`
+   carries the hand-written FFI: `Array`, `Stream`, ~45 ops, safetensors
+   loading, and the thread-local error trampoline that the first draft owed.
+   `build.rs` links mlx-c/mlx only under `--features mlx`, via
+   `MLX_C_PREFIX`/`MLX_PREFIX` or Homebrew. `scripts/check-seam.sh` still
+   passes: nothing outside `sd-tensor` names either backend.
 
-4. **Port SD 1.5 end to end**, gated on `golden_unet` and `golden_vae`. The
-   checkpoint is at `models/sd15` and those are the strictest tests in the
-   repo. Do not start a second model until the first is green.
+4. **Port the models.** Everything below is green against the same golden
+   fixtures the candle path uses, at the same measured tolerances:
 
-5. **Run both backends in parallel** until every golden test passes on MLX.
+   | model | gate | worst |
+   |---|---|---|
+   | SD 1.5 UNet | `mlx_golden_unet` | 3.353e-4 excess |
+   | SD 2.x / SDXL / unCLIP UNets | `mlx_golden_unet` | within `UNET_TOL` |
+   | VAE encoder + decoder | `mlx_golden_vae` | 1.9e-5 |
+   | CLIP text tower | `mlx_golden_clip` | within f32 ULP at peak 851 |
+   | T5 v1.1 | `mlx_golden_t5` | 2.6e-5 |
+   | SD 3.5 MMDiT | `mlx_golden_sd3` | 3.75e-6 |
+   | Flux DiT | `mlx_golden_flux` | 3.49e-6 |
+   | TAESD | `mlx_golden_taesd` | 7.42e-6 decode, 3.21e-6 encode |
+   | Real-ESRGAN | `mlx_golden_esrgan` | 2.205e-6 |
+   | ControlNet | `mlx_golden_controlnet` | 2.038e-5 |
+   | LoRA | `mlx_lora` | bit-identical to `sd-loader` |
+   | IP-Adapter | `mlx_golden_ip_adapter` | 1.200e-5 |
+   | GLIGEN | `mlx_golden_gligen` | 1.049e-5 |
+   | AnimateDiff | `mlx_golden_motion` | 7.63e-6 module, 4.59e-5 whole UNet |
+   | GGUF | `mlx_gguf` | bit-exact against candle |
+
+5. **img2img and inpainting** — **done**, `mlx_img2img`. `vae::encode` gives
+   the distribution's mean, `sample::noise_to_sigma` noises it to where
+   `strength` starts, `sample::latent_mask` reduces a pixel mask 8x8 by *max*,
+   and `sample::restore_outside_mask` runs the composite inside the loop. See
+   [img2img and inpainting on MLX](#img2img-and-inpainting-on-mlx).
+
+6. **What is actually left.** This is the gate for deleting candle:
+   - **Port the 405 candle tests.** Deleting candle before this is what turns a
+     migration into a rewrite with no oracle.
+
+7. **Run both backends in parallel** until every golden test passes on MLX.
    Delete candle in one commit, not gradually.
-
-6. **Finish GGUF**, gated on `flux_schnell_gguf`, carrying whatever the spike
-   in step 2 established.
 
 Verification, unchanged and non-negotiable:
 
@@ -765,6 +768,97 @@ inspection:
 Frame count is ambient (`motion::with_frames`), for the same reason the
 IP-Adapter's weights are: it must reach 21 modules and is uniform. The UNet has
 no frame axis — frames ride on the batch.
+
+**On MLX this is `crates/sd-models/src/mlx/motion.rs`, and the ambient state is
+gone.** All three traps above transferred unchanged and are stated in the
+module rather than rediscovered. Two things came out simpler:
+
+- **No ordered name list, and no counter.** `MotionSource::sd15_names` exists
+  because candle builds modules in construction order and has to hand them out
+  one at a time. The MLX blocks already know their own prefix, so the path is
+  `{prefix}.motion_modules.{i}` and the mid block's is
+  `mid_block.motion_modules.0`. The 21-entry list and the thread-local that
+  serves it have no MLX counterpart.
+- **No `with_frames` guard.** The frame count travels in `Motion { weights,
+  frames }`, inside the `Adapters` bundle the pass already carries.
+
+`Adapters` replaced the `ip`/`objs` argument pair across `down_block`,
+`down_pass`, `mid_block` and `up_block` — the list had outgrown its slot and
+motion would have been the third. `unet_forward_with` keeps its old signature
+and delegates; `unet_forward_adapters` is the struct form, and the only one
+that can carry motion.
+
+**NHWC changes where the regroup lands.** candle folds `[b*f, c, h, w]` to
+`[b, c, f, h, w]`; channels-last means the MLX side folds to
+`[b, f*h, w, c]` instead. Group statistics span the clip either way, which is
+the property that matters — but the shapes are not transliterations of each
+other and reading one as the other gives the per-frame normalisation this
+document warns about.
+
+Four tests gate it: the module against the fixture (**7.629e-6** at peak
+4.611), the whole 21-module UNet (**4.593e-5** excess, inside even the plain
+`ATOL`), a perturbation probe, and a check that the adapter changes the output
+at all.
+
+**The perturbation probe took two attempts, and the first was a wrong test
+rather than a wrong module.** The obvious invariant — feed four identical
+frames, demand four identical outputs — is false by construction: the
+positional encoding differs per frame, so identical inputs *must* give
+different outputs. The probe that works pokes one pixel of one frame and
+compares how far the response travels along each axis: **4.145e-1** to the same
+pixel in other frames against **1.647e-2** to other pixels. The second number
+is not zero and cannot be — GroupNorm's statistics span the clip, so everything
+leaks into everything through the mean and variance. That leak is what the
+ratio measures against.
+
+Its first run measured 3.365e-1 against 2.245e-1, a ratio of 1.5. That was the
+probe's grid, not the module: at 2x2 a single poked pixel is a sixteenth of
+each group's population, so the norm leak swamped the signal. At the UNet's own
+8x8 the separation is 25x.
+
+## img2img and inpainting on MLX
+
+Ported 2026-07-31, gated by `mlx_img2img`. The models underneath were already
+gated — the VAE encoder at `mlx_golden_vae`, the UNet at `mlx_golden_unet` — so
+what needed testing was the part with no reference tensor to compare against:
+whether `strength` and the mask *mean* what they claim. Both fail silently. A
+run that ignores its strength still produces an image; an inpaint that quietly
+repaints the whole canvas still produces an image.
+
+`Strength` is imported from the pipeline crate rather than reimplemented, on
+the same grounds as `sd_sample::Schedule`: `start_index` is arithmetic on two
+integers and touches no tensor, so the two backends call the same function and
+cannot drift apart. What is new on the MLX side is four things, all in
+`mlx/sample.rs` and `mlx/vae.rs`:
+
+- `vae::encode_dist` / `vae::encode` — the moments split into `(mean, logvar)`,
+  and the **mean**, unscaled. Not a draw: the sampler supplies all the
+  randomness, so drawing here too would add variance the seed does not control.
+- `sample::noise_to_sigma` — what makes strength mean something.
+- `sample::latent_mask` — 8x8 **maximum**, not mean, for the reason the candle
+  side records: one white pixel in a block must free that latent cell, and
+  averaging would give 1/64 — an almost-frozen cell producing a hard seam
+  exactly at the mask edge. This needed a `max` reduction added to
+  `sd-tensor/src/mlx.rs`; only `sum` and `mean` existed.
+- `sample::restore_outside_mask` — the composite, **inside the loop**. That is
+  what keeps the model's context honest: it sees the true surroundings at every
+  step, so what it paints joins up with them.
+
+Measured on the VAE fixture at 8 steps:
+
+```text
+  distance from source   strength 0  0.0373   0.25  0.0607   0.95  0.6791
+  masked edit            inside 0.4777   outside 0.0543
+```
+
+**The first run of this test failed for a reason that was the test's fault, and
+it is worth writing down.** It encoded `encoder_input` from the VAE fixture,
+assuming it was an image. It is `torch.randn(1, 3, 256, 256)` — white noise,
+which no autoencoder can represent. The round trip measured 0.8656 and the mask
+containment failed, both because the VAE could not reproduce the source, not
+because anything in the pipeline was wrong. The fixture's `image` — the
+decoder's own output, and therefore on the VAE's manifold — round-trips at
+0.0373. **A fixture named for its role is not evidence of its contents.**
 
 **Two-pass generation works**, `--hires 1024`, and the failure it fixes is
 visible rather than theoretical. SD 1.5 asked to compose at 1024 directly

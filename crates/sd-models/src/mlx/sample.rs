@@ -16,7 +16,7 @@
 //! 5. One Euler-ancestral step.
 
 use sd_tensor::mlx::{concat, Array, Stream};
-use sd_tensor::Result;
+use sd_tensor::{Error, Result};
 
 /// One Euler-ancestral step, the arithmetic of
 /// `sd_sample::euler_ancestral_step` on MLX arrays.
@@ -160,4 +160,76 @@ impl DpmSolverPlusPlus2M {
         self.prev_t = Some(t);
         Ok(x_next)
     }
+}
+
+// -- img2img and inpainting ------------------------------------------------
+//
+// `Strength` itself is not reimplemented here, for the same reason
+// `sd_sample::Schedule` is not: `Strength::start_index` is arithmetic on two
+// integers and touches no tensor, so the two backends call the same function
+// and cannot drift. Only the tensor work is below.
+
+/// Noise an encoded latent to the sigma the run starts at.
+///
+/// This is what makes strength mean something: a later start is less noise and
+/// so a smaller departure from the input. `noise` must be standard normal and
+/// shaped like the latent — the caller owns the draw, and with it
+/// reproducibility.
+pub fn noise_to_sigma(latent: &Array, noise: &Array, sigma: f64, s: &Stream) -> Result<Array> {
+    latent.add(&noise.mul(&Array::scalar_f32(sigma as f32)?, s)?, s)
+}
+
+/// Reduce a pixel-resolution mask to the latent grid by 8x8 **maximum**.
+///
+/// **Max, not mean, and the two are not interchangeable.** One white pixel in
+/// an 8x8 block means that latent cell must be free to change: a latent cell
+/// is not a pixel, and averaging would give 1/64 — an almost-frozen cell,
+/// producing a hard seam exactly at the mask edge, where it is most visible.
+/// The cost is that repainting dilates the mask by up to one latent cell,
+/// which the pixel-space composite at the end takes back.
+///
+/// `mask_px` is `[1, h, w, 1]` with 1 where the model may write; the result is
+/// `[1, h/8, w/8, 1]`.
+pub fn latent_mask(mask_px: &Array, s: &Stream) -> Result<Array> {
+    let [n, h, w, c] = mask_px.shape()[..] else {
+        return Err(Error::Msg(format!(
+            "mlx: a mask should be [n, h, w, 1], got {:?}",
+            mask_px.shape()
+        )));
+    };
+    if h % 8 != 0 || w % 8 != 0 {
+        return Err(Error::Msg(format!(
+            "mlx: a {h}x{w} mask does not divide into latent cells"
+        )));
+    }
+    mask_px
+        .reshape(&[n, h / 8, 8, w / 8, 8, c], s)?
+        .max(&[2, 4], false, s)
+}
+
+/// Restore everything outside the mask to the original, noised to the level
+/// the next step expects.
+///
+/// **Called inside the sampling loop, not once at the end.** That is what keeps
+/// the model's context honest: it sees the true surroundings at every step, so
+/// what it paints actually joins up with them. Compositing only at the end
+/// produces an edit that is locally plausible and does not meet its border.
+///
+/// `mask` is 1 where the model may write. At the final step `sigma_next` is 0
+/// and the original goes back unnoised.
+pub fn restore_outside_mask(
+    latent: &Array,
+    init: &Array,
+    mask: &Array,
+    noise: &Array,
+    sigma_next: f64,
+    s: &Stream,
+) -> Result<Array> {
+    let restored = if sigma_next > 0.0 {
+        noise_to_sigma(init, noise, sigma_next, s)?
+    } else {
+        init.contiguous(s)?
+    };
+    let keep = Array::scalar_f32(1.0)?.sub(mask, s)?;
+    latent.mul(mask, s)?.add(&restored.mul(&keep, s)?, s)
 }

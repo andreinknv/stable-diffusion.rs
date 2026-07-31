@@ -262,6 +262,36 @@ pub fn encode_moments(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Arr
     )
 }
 
+/// The latent distribution's `(mean, logvar)`, each `[n, h/8, w/8, 4]`.
+///
+/// `encode_moments` emits both halves stacked on the channel axis; splitting
+/// them is the caller's job everywhere else in this codebase, and getting the
+/// halves backwards yields noise that loads fine.
+pub fn encode_dist(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<(Array, Array)> {
+    let moments = encode_moments(image_nhwc, w, s)?;
+    let c = moments.shape()[3];
+    if c % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "mlx: moments should have an even channel count, got {c}"
+        )));
+    }
+    let half = c / 2;
+    Ok((
+        moments.narrow(3, 0, half, s)?.contiguous(s)?,
+        moments.narrow(3, half, half, s)?.contiguous(s)?,
+    ))
+}
+
+/// The distribution's **mean**, unscaled — what img2img encodes with.
+///
+/// Not a draw from the distribution. The sampler supplies all the randomness,
+/// so drawing here too would add variance the seed does not control and make
+/// the run irreproducible. `encode_sampled` on the candle side exists for the
+/// cases that genuinely want a draw; nothing in a pipeline does.
+pub fn encode(image_nhwc: &Array, w: &Weights, s: &Stream) -> Result<Array> {
+    Ok(encode_dist(image_nhwc, w, s)?.0)
+}
+
 /// The encoder's stride-2 downsample.
 ///
 /// **Asymmetric padding**: one row at the bottom and one column at the right,

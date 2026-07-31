@@ -33,6 +33,8 @@ pub mod gligen;
 pub mod ip;
 /// LoRA adapters, merged into a weight map before any model is built.
 pub mod lora;
+/// AnimateDiff motion modules: attention over time.
+pub mod motion;
 /// The txt2img sampling loop.
 pub mod sample;
 /// SD 3 / SD 3.5's MMDiT transformer.
@@ -188,6 +190,53 @@ pub(crate) fn conv_strided(
     match b {
         Some(b) => y.add(b, s),
         None => Ok(y),
+    }
+}
+
+/// An AnimateDiff motion adapter: its own weights, and the clip length.
+///
+/// Separate from the UNet's `Weights` because it is a separate checkpoint. The
+/// module paths need no ordered name list — `down_blocks.0.motion_modules.1`
+/// is the block's own prefix plus the resnet index, so each block derives its
+/// own.
+#[derive(Clone, Copy)]
+pub struct Motion<'a> {
+    pub weights: &'a Weights,
+    /// Frames per clip. They ride on the batch axis, so `[b*f, h, w, c]`.
+    pub frames: usize,
+}
+
+/// The optional things that hang off a UNet pass.
+///
+/// Bundled rather than passed one by one: every block function needs all of
+/// them and the list had already outgrown its argument slot.
+#[derive(Default, Clone, Copy)]
+pub struct Adapters<'a> {
+    pub ip: Option<&'a ip::IpAdapter<'a>>,
+    /// GLIGEN's grounding tokens.
+    pub objs: Option<&'a Array>,
+    pub motion: Option<&'a Motion<'a>>,
+}
+
+impl<'a> Adapters<'a> {
+    /// The motion module at `prefix.motion_modules.index`, if the adapter
+    /// carries one. Adapters that omit the mid block are why this is an
+    /// `Option` rather than an error.
+    fn motion_at(
+        &self,
+        h: &Array,
+        prefix: &str,
+        index: usize,
+        s: &Stream,
+    ) -> Result<Option<Array>> {
+        let Some(m) = self.motion else {
+            return Ok(None);
+        };
+        let path = format!("{prefix}.motion_modules.{index}");
+        if !motion::present(m.weights, &path) {
+            return Ok(None);
+        }
+        motion::forward(h, m.frames, m.weights, &path, s).map(Some)
     }
 }
 
@@ -586,8 +635,7 @@ pub fn down_block(
     heads: Option<usize>,
     transformer_layers: usize,
     linear_projection: bool,
-    ip: Option<&ip::IpAdapter<'_>>,
-    objs: Option<&Array>,
+    ad: &Adapters<'_>,
     has_downsample: bool,
     s: &Stream,
 ) -> Result<(Array, Vec<Array>)> {
@@ -603,12 +651,18 @@ pub fn down_block(
                 heads,
                 transformer_layers,
                 linear_projection,
-                ip,
-                objs,
+                ad.ip,
+                ad.objs,
                 w,
                 &format!("{prefix}.attentions.{i}"),
                 s,
             )?;
+        }
+        // **Before the skip is pushed**, so the up pass receives features that
+        // have already been mixed across time. Pushing first also runs, keeps
+        // every shape, and sends per-frame features up.
+        if let Some(mixed) = ad.motion_at(&h, prefix, i, s)? {
+            h = mixed;
         }
         skips.push(h.contiguous(s)?);
     }
@@ -632,8 +686,7 @@ pub fn down_pass(
     temb: &Array,
     context: &Array,
     cfg: &UNetConfig,
-    ip: Option<&ip::IpAdapter<'_>>,
-    objs: Option<&Array>,
+    ad: &Adapters<'_>,
     w: &Weights,
     s: &Stream,
 ) -> Result<(Array, Vec<Array>)> {
@@ -660,8 +713,7 @@ pub fn down_pass(
             heads,
             cfg.transformer_layers[i],
             cfg.use_linear_projection,
-            ip,
-            objs,
+            ad,
             i + 1 < blocks,
             s,
         )?;
@@ -703,8 +755,7 @@ pub fn mid_block(
     temb: &Array,
     context: &Array,
     cfg: &UNetConfig,
-    ip: Option<&ip::IpAdapter<'_>>,
-    objs: Option<&Array>,
+    ad: &Adapters<'_>,
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
@@ -718,12 +769,18 @@ pub fn mid_block(
         heads,
         layers,
         cfg.use_linear_projection,
-        ip,
-        objs,
+        ad.ip,
+        ad.objs,
         w,
         "mid_block.attentions.0",
         s,
     )?;
+    // After the attention and before the second resnet: the mid block carries
+    // exactly one module, and this is where the reference puts it.
+    let h = match ad.motion_at(&h, "mid_block", 0, s)? {
+        Some(mixed) => mixed,
+        None => h,
+    };
     resnet_block(&h, temb, w, "mid_block.resnets.1", s)
 }
 
@@ -741,8 +798,7 @@ pub fn up_block(
     heads: Option<usize>,
     transformer_layers: usize,
     linear_projection: bool,
-    ip: Option<&ip::IpAdapter<'_>>,
-    objs: Option<&Array>,
+    ad: &Adapters<'_>,
     has_upsample: bool,
     s: &Stream,
 ) -> Result<Array> {
@@ -761,12 +817,15 @@ pub fn up_block(
                 heads,
                 transformer_layers,
                 linear_projection,
-                ip,
-                objs,
+                ad.ip,
+                ad.objs,
                 w,
                 &format!("{prefix}.attentions.{i}"),
                 s,
             )?;
+        }
+        if let Some(mixed) = ad.motion_at(&h, prefix, i, s)? {
+            h = mixed;
         }
     }
     if has_upsample {
@@ -820,9 +879,46 @@ pub fn unet_forward_with(
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
+    let ad = Adapters {
+        ip,
+        objs,
+        motion: None,
+    };
+    unet_forward_adapters(
+        sample_nhwc,
+        timestep,
+        context,
+        added,
+        class_embeds,
+        &ad,
+        cfg,
+        w,
+        s,
+    )
+}
+
+/// `unet_forward_with` over an [`Adapters`] bundle — the form that can carry an
+/// AnimateDiff motion adapter.
+///
+/// With `Adapters::motion` set, the sample's batch axis is `b*f` and every
+/// frame of a clip must be contiguous within it: `[clip0_frame0, clip0_frame1,
+/// ..., clip1_frame0, ...]`. Interleaving the two runs and produces a plausible
+/// wrong video.
+#[allow(clippy::too_many_arguments)]
+pub fn unet_forward_adapters(
+    sample_nhwc: &Array,
+    timestep: &Array,
+    context: &Array,
+    added: Option<(&Array, &Array)>,
+    class_embeds: Option<&Array>,
+    ad: &Adapters<'_>,
+    cfg: &UNetConfig,
+    w: &Weights,
+    s: &Stream,
+) -> Result<Array> {
     // The adapter walks its layers in visit order, so the counter has to start
     // from zero on every pass rather than continue across a run.
-    if let Some(a) = ip {
+    if let Some(a) = ad.ip {
         a.rewind();
     }
     let temb = timestep_embedding(timestep, 320, w, s)?;
@@ -899,8 +995,8 @@ pub fn unet_forward_with(
         }
         (false, None) => temb,
     };
-    let (h, mut skips) = down_pass(sample_nhwc, &temb, context, cfg, ip, objs, w, s)?;
-    let mut h = mid_block(&h, &temb, context, cfg, ip, objs, w, s)?;
+    let (h, mut skips) = down_pass(sample_nhwc, &temb, context, cfg, ad, w, s)?;
+    let mut h = mid_block(&h, &temb, context, cfg, ad, w, s)?;
 
     // UpBlock2D first, then three CrossAttnUpBlock2D — the reverse of the down
     // pass, and the deepest block is the one without attention. Three resnets
@@ -923,8 +1019,7 @@ pub fn unet_forward_with(
             heads,
             cfg.transformer_layers[mirrored],
             cfg.use_linear_projection,
-            ip,
-            objs,
+            ad,
             i + 1 < blocks,
             s,
         )?;

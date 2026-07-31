@@ -228,6 +228,14 @@ unsafe extern "C" {
         keepdims: bool,
         s: mlx_stream,
     ) -> i32;
+    fn mlx_max_axes(
+        res: *mut mlx_array,
+        a: mlx_array,
+        axes: *const i32,
+        axes_num: usize,
+        keepdims: bool,
+        s: mlx_stream,
+    ) -> i32;
     fn mlx_softmax_axis(
         res: *mut mlx_array,
         a: mlx_array,
@@ -578,6 +586,13 @@ impl Array {
 
     pub fn sum(&self, axes: &[usize], keepdims: bool, stream: &Stream) -> Result<Self> {
         self.reduce(axes, keepdims, stream, "sum", mlx_sum_axes)
+    }
+
+    /// Reduce by maximum over `axes`. An inpainting mask is downsampled with
+    /// this rather than with [`Self::mean`] — see `mlx::sample::latent_mask`
+    /// for why the two are not interchangeable.
+    pub fn max(&self, axes: &[usize], keepdims: bool, stream: &Stream) -> Result<Self> {
+        self.reduce(axes, keepdims, stream, "max", mlx_max_axes)
     }
 
     pub fn mean(&self, axes: &[usize], keepdims: bool, stream: &Stream) -> Result<Self> {
