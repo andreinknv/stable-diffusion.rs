@@ -49,7 +49,14 @@ findings still bind.
    | IP-Adapter | `mlx_golden_ip_adapter` | 1.200e-5 |
    | GLIGEN | `mlx_golden_gligen` | 1.049e-5 |
    | AnimateDiff | `mlx_golden_motion` | 7.63e-6 module, 4.59e-5 whole UNet |
-   | GGUF | `mlx_gguf` | bit-exact against candle |
+   | SDXL text encoder 2 | `mlx_golden_sdxl_text_encoder` | 1.909e-4 excess |
+   | CLIP vision (ViT-H) | `mlx_golden_clip_vision` | 1.509e-4 excess |
+   | Flux VAE | `mlx_golden_flux_vae` | 2.83e-5 decode |
+   | SDXL ControlNet | `mlx_golden_controlnet_sdxl` | 4.53e-5 mid |
+   | unCLIP prior | `mlx_golden_prior` | 2.85e-6 masked |
+   | Tiled VAE | `mlx_vae_tiled` | mean_abs 0.008 against whole |
+   | GGUF reader | `mlx_gguf_agrees_with_candle` | bit-exact |
+   | GGUF models | `mlx_gguf_models` | 1.000000 from f16 |
 
 5. **img2img and inpainting** — **done**, `mlx_img2img`. `vae::encode` gives
    the distribution's mean, `sample::noise_to_sigma` noises it to where
@@ -815,6 +822,90 @@ Its first run measured 3.365e-1 against 2.245e-1, a ratio of 1.5. That was the
 probe's grid, not the module: at 2x2 a single poked pixel is a sixteenth of
 each group's population, so the norm leak swamped the signal. At the UNet's own
 8x8 the separation is 25x.
+
+## Closing the MLX test gap, 2026-07-31
+
+After the model ports, twenty-two candle test binaries had no MLX counterpart.
+Most were already covered under a different name — `golden_unet_attention` and
+`golden_unet_blocks` by `mlx_golden_unet`, `golden_clip_encoder` by
+`mlx_golden_clip`, `golden_flux_transformer` by `mlx_golden_flux`. Some never
+need one: `golden_clip_tokenizer` touches no tensor, and `metal_parity` /
+`metal_decoder_parity` compare candle CPU against candle Metal and die with
+candle. Six were real gaps, and all six are now closed:
+
+| gap | why it was separate |
+|---|---|
+| SDXL text encoder 2 | plain `gelu`, penultimate layer, projected pooling |
+| CLIP vision (ViT-H) | the tower IP-Adapter and unCLIP condition on |
+| Flux VAE | 16 latent channels, no quant convs, a latent *shift* |
+| SDXL ControlNet | `addition_embed_type: "text_time"` |
+| unCLIP prior | DDPM over a 768-vector, and a load-bearing text mask |
+| Tiled VAE | the seam, which no whole-image comparison catches |
+
+Two pieces of shared machinery came out of it, both on the same principle —
+**scalar or string logic that both backends need should exist once**:
+
+- `PriorScheduler::coefficients` returns the DDPM step's scalars. The tensor
+  work is three lines on either side; the formulation is the part that is easy
+  to get subtly wrong, and it is now written down in one place.
+- `sd_loader::ldm` is called from the MLX GGUF loader unchanged. A second copy
+  of a name mapping is precisely how two backends come to disagree about which
+  tensor is which.
+
+Plus `conditioned_temb`, extracted from the UNet's forward so an SDXL
+ControlNet builds the identical conditioning vector rather than a parallel one.
+
+### Four tests failed first on their own premises
+
+Worth recording, because in each case the instinct was to suspect the port:
+
+- **The AnimateDiff perturbation probe.** "Four identical frames must give four
+  identical outputs" is false by construction — the positional encoding differs
+  per frame.
+- **The img2img round trip.** It encoded `encoder_input` from the VAE fixture,
+  which is `torch.randn` — noise no autoencoder can represent. The fixture's
+  `image` is the decoder's own output and round-trips at 0.0373.
+- **The Flux VAE round trip.** The fixture unscales `latent`, not
+  `encoder_scaled_mean`.
+- **The unCLIP prior.** The reference forward was dumped at timestep 500;
+  `step_timestep` belongs to the scheduler fixtures beside it.
+
+**A fixture named for its role is not evidence of its contents.** Three of the
+four were fixed by reading `xtask/golden/dump_reference.py` rather than by
+changing any code.
+
+### The workspace would not build under `--features mlx` at all
+
+Found only by running the real verification command rather than a per-crate
+one. Seven `sd-cli` examples reach into `sd_tensor::mps` or `sd_tensor::fused`,
+which exist only under `metal`, and none was gated — so `cargo test --workspace
+--features mlx` died in the build before compiling a single test. They now
+carry `required-features = ["metal"]` in `sd-cli/Cargo.toml`, and `sd-cli` has
+an `mlx` feature so `--workspace --features mlx` resolves for every member
+instead of quietly building that one with defaults.
+
+Worth stating plainly because it is the same shape as the `SD_TEST_CONTROLNET`
+omission this document already records: **a command that is not run in full is
+not a passing command.** Both were invisible to every narrower invocation.
+
+### Bounds that were derived rather than chosen
+
+Two tests needed a looser bound than `DEFAULT_ATOL`, and in both cases the
+number came from a measurement that already existed:
+
+- **SDXL's bigG tower, 5e-4.** The excess is 1.909e-4 on the penultimate state,
+  and `diagnose_the_residual` says why that is accumulation: **one element in
+  98,560** violates, at reference value 0.038, where 32 layers of f32 leave an
+  absolute floor near 2.4e-4. Everything with `|ref| > 1` agrees to 3.077e-4
+  relative.
+- **The Flux encoder, 2e-3.** Transcribed from `golden_flux_vae.rs`, which
+  measured diffusers' own encoder in f32 against f64 at **9.605e-4** — the
+  reference's own noise floor. candle sits at 9.606e-4, exactly on it; this
+  port at 1.515e-3, which is what a different reduction order costs there. SD's
+  encoder measures 1.226e-4 by the same method, which is why it holds to 1e-4.
+
+Neither is a licence to widen. A structural fault in the Flux encoder measures
+17.32, not 2e-3.
 
 ## img2img and inpainting on MLX
 

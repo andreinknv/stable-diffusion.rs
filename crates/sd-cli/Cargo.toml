@@ -23,6 +23,45 @@ name = "backend_bench"
 path = "examples/backend_bench.rs"
 test = true
 
+# These reach into `sd_tensor::mps` or `sd_tensor::fused`, which only exist
+# under `metal`. Without the gate they fail to build under any other feature
+# set — including `--features mlx`, where they stopped the whole workspace run
+# before a single test had been compiled.
+[[example]]
+name = "mps_diag"
+path = "examples/mps_diag.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "mps_conv"
+path = "examples/mps_conv.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "cpu_group_norm"
+path = "examples/cpu_group_norm.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "adaln_kernel"
+path = "examples/adaln_kernel.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "geglu_kernel"
+path = "examples/geglu_kernel.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "gelu_tail"
+path = "examples/gelu_tail.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "group_norm_kernel"
+path = "examples/group_norm_kernel.rs"
+required-features = ["metal"]
+
 [dependencies]
 stable-diffusion-rs.workspace = true
 sd-tensor.workspace = true
@@ -35,4 +74,8 @@ tracing-subscriber.workspace = true
 default = []
 cuda = ["stable-diffusion-rs/cuda", "sd-tensor/cuda"]
 metal = ["stable-diffusion-rs/metal", "sd-tensor/metal"]
+# The CLI has no MLX-specific code yet; the feature exists so that
+# `--workspace --features mlx` resolves for every member rather than silently
+# building this one with defaults.
+mlx = ["stable-diffusion-rs/mlx", "sd-tensor/mlx"]
 accelerate = ["stable-diffusion-rs/accelerate", "sd-tensor/accelerate"]
