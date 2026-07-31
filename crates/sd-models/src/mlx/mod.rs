@@ -40,6 +40,49 @@ pub const RESNET_EPS: f32 = 1e-5;
 /// SD 1.5 normalises over 32 groups throughout.
 pub const NORM_GROUPS: usize = 32;
 
+/// What differs between UNets of this family.
+///
+/// SD 1.5 and SD 2.x share every block shape and differ only here, so the
+/// modules below take a config rather than hard-coding SD 1.5 and being copied
+/// for the next architecture.
+#[derive(Debug, Clone)]
+pub struct UNetConfig {
+    /// Attention **head counts** per block, despite diffusers naming the field
+    /// `attention_head_dim`. SD 1.5 is `[8; 4]`, giving 40-wide heads at the
+    /// first block; SD 2.x is `[5, 10, 20, 20]`, giving 64 throughout.
+    pub heads: Vec<usize>,
+    /// Resnets per down block. The up blocks take one more.
+    pub layers_per_block: usize,
+    /// Which down blocks carry a transformer. SD 1.5 and SD 2.x attend on all
+    /// but the deepest.
+    pub down_has_attention: Vec<bool>,
+    /// `proj_in`/`proj_out` are `Linear` when true and 1x1 convolutions when
+    /// false. **SD 1.5 is false, SD 2.x is true** — the weights differ in rank,
+    /// so the wrong choice fails to load rather than rendering wrongly.
+    pub use_linear_projection: bool,
+}
+
+impl UNetConfig {
+    pub fn sd15() -> Self {
+        Self {
+            heads: vec![8; 4],
+            layers_per_block: 2,
+            down_has_attention: vec![true, true, true, false],
+            use_linear_projection: false,
+        }
+    }
+
+    /// SD 2.x: 64-wide heads throughout, cross-attention at 1024, and linear
+    /// projections in the transformer.
+    pub fn sd2() -> Self {
+        Self {
+            heads: vec![5, 10, 20, 20],
+            use_linear_projection: true,
+            ..Self::sd15()
+        }
+    }
+}
+
 /// The tensors of a checkpoint, by their diffusers names.
 pub type Weights = HashMap<String, Array>;
 
@@ -275,11 +318,13 @@ fn transformer_block(
 ///
 /// SD 1.5 has `use_linear_projection: false`, so `proj_in`/`proj_out` are 1x1
 /// convolutions rather than linear layers.
+#[allow(clippy::too_many_arguments)]
 pub fn transformer_2d(
     x: &Array,
     context: &Array,
     heads: usize,
     layers: usize,
+    linear_projection: bool,
     w: &Weights,
     prefix: &str,
     s: &Stream,
@@ -300,15 +345,28 @@ pub fn transformer_2d(
         Some(get(w, &p("norm.bias"))?),
         s,
     )?;
-    let y = conv(
-        &y,
-        get(w, &p("proj_in.weight"))?,
-        Some(get(w, &p("proj_in.bias"))?),
-        0,
-        s,
-    )?;
-
-    let mut seq = y.reshape(&[n, h * wd, c], s)?;
+    // A linear projection consumes the flattened sequence; a 1x1 convolution
+    // consumes the spatial grid. Same arithmetic, different weight rank — SD
+    // 1.5 ships 4-D weights here and SD 2.x ships 2-D, so the wrong branch
+    // fails to load rather than rendering wrongly.
+    let mut seq = if linear_projection {
+        let flat = y.reshape(&[n, h * wd, c], s)?;
+        linear(
+            &flat,
+            get(w, &p("proj_in.weight"))?,
+            w.get(&p("proj_in.bias")),
+            s,
+        )?
+    } else {
+        conv(
+            &y,
+            get(w, &p("proj_in.weight"))?,
+            Some(get(w, &p("proj_in.bias"))?),
+            0,
+            s,
+        )?
+        .reshape(&[n, h * wd, c], s)?
+    };
     for i in 0..layers {
         seq = transformer_block(
             &seq,
@@ -320,14 +378,23 @@ pub fn transformer_2d(
         )?;
     }
 
-    let y = seq.reshape(&[n, h, wd, c], s)?;
-    let y = conv(
-        &y,
-        get(w, &p("proj_out.weight"))?,
-        Some(get(w, &p("proj_out.bias"))?),
-        0,
-        s,
-    )?;
+    let y = if linear_projection {
+        linear(
+            &seq,
+            get(w, &p("proj_out.weight"))?,
+            w.get(&p("proj_out.bias")),
+            s,
+        )?
+        .reshape(&[n, h, wd, c], s)?
+    } else {
+        conv(
+            &seq.reshape(&[n, h, wd, c], s)?,
+            get(w, &p("proj_out.weight"))?,
+            Some(get(w, &p("proj_out.bias"))?),
+            0,
+            s,
+        )?
+    };
     y.add(x, s)
 }
 
@@ -405,6 +472,7 @@ pub fn down_block(
     prefix: &str,
     layers: usize,
     heads: Option<usize>,
+    linear_projection: bool,
     has_downsample: bool,
     s: &Stream,
 ) -> Result<(Array, Vec<Array>)> {
@@ -419,6 +487,7 @@ pub fn down_block(
                 context,
                 heads,
                 1,
+                linear_projection,
                 w,
                 &format!("{prefix}.attentions.{i}"),
                 s,
@@ -444,6 +513,7 @@ pub fn down_pass(
     sample_nhwc: &Array,
     temb: &Array,
     context: &Array,
+    cfg: &UNetConfig,
     w: &Weights,
     s: &Stream,
 ) -> Result<(Array, Vec<Array>)> {
@@ -456,26 +526,20 @@ pub fn down_pass(
     )?;
     let mut skips = vec![h.contiguous(s)?];
 
-    // SD 1.5 attends on every block but the deepest, and the deepest has no
-    // downsampler either.
-    for (i, (heads, has_down)) in [
-        (Some(8), true),
-        (Some(8), true),
-        (Some(8), true),
-        (None, false),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    // The deepest block has neither attention nor a downsampler.
+    let blocks = cfg.down_has_attention.len();
+    for i in 0..blocks {
+        let heads = cfg.down_has_attention[i].then(|| cfg.heads[i]);
         let (out, mut block_skips) = down_block(
             &h,
             temb,
             context,
             w,
             &format!("down_blocks.{i}"),
-            2,
+            cfg.layers_per_block,
             heads,
-            has_down,
+            cfg.use_linear_projection,
+            i + 1 < blocks,
             s,
         )?;
         h = out;
@@ -514,11 +578,23 @@ pub fn mid_block(
     x: &Array,
     temb: &Array,
     context: &Array,
+    cfg: &UNetConfig,
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
     let h = resnet_block(x, temb, w, "mid_block.resnets.0", s)?;
-    let h = transformer_2d(&h, context, 8, 1, w, "mid_block.attentions.0", s)?;
+    // The mid block runs at the deepest width, so it takes the last head count.
+    let heads = *cfg.heads.last().expect("at least one block");
+    let h = transformer_2d(
+        &h,
+        context,
+        heads,
+        1,
+        cfg.use_linear_projection,
+        w,
+        "mid_block.attentions.0",
+        s,
+    )?;
     resnet_block(&h, temb, w, "mid_block.resnets.1", s)
 }
 
@@ -534,6 +610,7 @@ pub fn up_block(
     prefix: &str,
     layers: usize,
     heads: Option<usize>,
+    linear_projection: bool,
     has_upsample: bool,
     s: &Stream,
 ) -> Result<Array> {
@@ -551,6 +628,7 @@ pub fn up_block(
                 context,
                 heads,
                 1,
+                linear_projection,
                 w,
                 &format!("{prefix}.attentions.{i}"),
                 s,
@@ -571,26 +649,24 @@ pub fn unet_forward(
     sample_nhwc: &Array,
     timestep: &Array,
     context: &Array,
+    cfg: &UNetConfig,
     w: &Weights,
     s: &Stream,
 ) -> Result<Array> {
     let temb = timestep_embedding(timestep, 320, w, s)?;
-    let (h, mut skips) = down_pass(sample_nhwc, &temb, context, w, s)?;
-    let mut h = mid_block(&h, &temb, context, w, s)?;
+    let (h, mut skips) = down_pass(sample_nhwc, &temb, context, cfg, w, s)?;
+    let mut h = mid_block(&h, &temb, context, cfg, w, s)?;
 
     // UpBlock2D first, then three CrossAttnUpBlock2D — the reverse of the down
     // pass, and the deepest block is the one without attention. Three resnets
     // each, one more than the down side, because the extra one consumes
     // conv_in's skip at the end.
-    for (i, (heads, has_up)) in [
-        (None, true),
-        (Some(8), true),
-        (Some(8), true),
-        (Some(8), false),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    // The up pass mirrors the down pass, so its attention flags and head counts
+    // are the down-side ones reversed.
+    let blocks = cfg.down_has_attention.len();
+    for i in 0..blocks {
+        let mirrored = blocks - 1 - i;
+        let heads = cfg.down_has_attention[mirrored].then(|| cfg.heads[mirrored]);
         h = up_block(
             &h,
             &temb,
@@ -598,9 +674,10 @@ pub fn unet_forward(
             &mut skips,
             w,
             &format!("up_blocks.{i}"),
-            3,
+            cfg.layers_per_block + 1,
             heads,
-            has_up,
+            cfg.use_linear_projection,
+            i + 1 < blocks,
             s,
         )?;
     }

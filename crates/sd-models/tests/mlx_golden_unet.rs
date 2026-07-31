@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use sd_models::mlx::{down_pass, resnet_block, timestep_embedding, transformer_2d};
+use sd_models::mlx::{down_pass, resnet_block, timestep_embedding, transformer_2d, UNetConfig};
 use sd_tensor::mlx::{load_safetensors, Array, Stream};
 
 /// `sd_tensor::testing::DEFAULT_ATOL`.
@@ -89,7 +89,17 @@ fn down_block_0_matches_diffusers() {
 
     let h = resnet_block(&h, &temb, &w, "down_blocks.0.resnets.0", &s).unwrap();
     // 8 heads, one transformer layer, as UNetConfig::sd15 says.
-    let h = transformer_2d(&h, context, 8, 1, &w, "down_blocks.0.attentions.0", &s).unwrap();
+    let h = transformer_2d(
+        &h,
+        context,
+        8,
+        1,
+        false,
+        &w,
+        "down_blocks.0.attentions.0",
+        &s,
+    )
+    .unwrap();
 
     let worst = max_abs(&h, refs.get("down_01").unwrap(), &s, "down_01");
     assert!(
@@ -109,13 +119,14 @@ fn down_block_0_matches_diffusers() {
 fn the_whole_down_pass_matches_diffusers() {
     let Some((refs, w)) = fixtures() else { return };
     let s = Stream::gpu();
+    let cfg = UNetConfig::sd15();
 
     let sample = refs.get("sample").expect("sample");
     let context = refs.get("context").expect("context");
     let temb = timestep_embedding(refs.get("timestep").expect("timestep"), 320, &w, &s).unwrap();
 
     let x = sample.transpose(&[0, 2, 3, 1], &s).unwrap();
-    let (_deepest, skips) = down_pass(&x, &temb, context, &w, &s).unwrap();
+    let (_deepest, skips) = down_pass(&x, &temb, context, &cfg, &w, &s).unwrap();
 
     assert_eq!(skips.len(), 12, "skip stack must have 12 entries");
 
@@ -149,6 +160,7 @@ fn the_whole_down_pass_matches_diffusers() {
 fn the_whole_unet_matches_diffusers() {
     let Some((refs, w)) = fixtures() else { return };
     let s = Stream::gpu();
+    let cfg = UNetConfig::sd15();
 
     let x = refs
         .get("sample")
@@ -159,6 +171,7 @@ fn the_whole_unet_matches_diffusers() {
         &x,
         refs.get("timestep").unwrap(),
         refs.get("context").unwrap(),
+        &cfg,
         &w,
         &s,
     )
@@ -181,6 +194,7 @@ fn the_whole_unet_matches_diffusers() {
 fn the_mid_block_matches_diffusers() {
     let Some((refs, w)) = fixtures() else { return };
     let s = Stream::gpu();
+    let cfg = UNetConfig::sd15();
     const MID_ATOL: f32 = 1e-3;
 
     let x = refs
@@ -189,13 +203,63 @@ fn the_mid_block_matches_diffusers() {
         .transpose(&[0, 2, 3, 1], &s)
         .unwrap();
     let temb = timestep_embedding(refs.get("timestep").unwrap(), 320, &w, &s).unwrap();
-    let (deepest, _skips) = down_pass(&x, &temb, refs.get("context").unwrap(), &w, &s).unwrap();
+    let (deepest, _skips) =
+        down_pass(&x, &temb, refs.get("context").unwrap(), &cfg, &w, &s).unwrap();
     let mid =
-        sd_models::mlx::mid_block(&deepest, &temb, refs.get("context").unwrap(), &w, &s).unwrap();
+        sd_models::mlx::mid_block(&deepest, &temb, refs.get("context").unwrap(), &cfg, &w, &s)
+            .unwrap();
 
     let worst = max_abs(&mid, refs.get("mid_output").unwrap(), &s, "mid_output");
     assert!(
         worst <= MID_ATOL,
         "mid_block is {worst:.3e}, past {MID_ATOL:.0e}"
+    );
+}
+
+/// SD 2.x, against `tests/golden/unet_full_cross1024`.
+///
+/// Same block shapes as SD 1.5 and three differences, all in `UNetConfig`:
+/// 64-wide heads throughout rather than 40 at the first block, cross-attention
+/// at 1024, and **linear projections** in the transformer where SD 1.5 uses
+/// 1x1 convolutions. The last is the one that matters most here — the weights
+/// differ in rank, so choosing wrongly fails to load rather than rendering
+/// wrongly, which is the good failure.
+#[test]
+fn the_sd2_unet_matches_diffusers() {
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/unet_full_cross1024");
+    let (refs_path, unet_path) = (
+        dir.join("reference.safetensors"),
+        dir.join("unet.safetensors"),
+    );
+    if !refs_path.exists() || !unet_path.exists() {
+        sd_tensor::skip_missing_fixture!("SKIP: no unet_full_cross1024 fixture.");
+        return;
+    }
+    let refs = load_safetensors(&refs_path).expect("reference");
+    let w = load_safetensors(&unet_path).expect("weights");
+    let s = Stream::gpu();
+    let cfg = UNetConfig::sd2();
+
+    let context = refs.get("context").expect("context");
+    assert_eq!(
+        context.shape(),
+        vec![1, 77, 1024],
+        "SD 2.x cross-attends at 1024"
+    );
+
+    let x = refs
+        .get("sample")
+        .unwrap()
+        .transpose(&[0, 2, 3, 1], &s)
+        .unwrap();
+    let got =
+        sd_models::mlx::unet_forward(&x, refs.get("timestep").unwrap(), context, &cfg, &w, &s)
+            .unwrap();
+
+    let worst = max_abs(&got, refs.get("output").unwrap(), &s, "sd2 output");
+    assert!(
+        worst <= ATOL,
+        "the SD 2.x UNet is {worst:.3e} from diffusers, past atol {ATOL:.0e}"
     );
 }

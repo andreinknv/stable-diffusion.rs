@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sd_models::mlx::{clip, sample, unet_forward, vae};
+use sd_models::mlx::{clip, sample, unet_forward, vae, UNetConfig};
 use sd_sample::{sigmas_for_steps, Schedule};
 use sd_tensor::mlx::{load_safetensors, Array, Stream};
 use sd_tensor::rng::SeededRng;
@@ -84,6 +84,7 @@ fn txt2img_produces_an_image() {
     }
 
     let s = Stream::gpu();
+    let cfg = UNetConfig::sd15();
     let unet_w = load_safetensors(&needed[0]).expect("unet");
     let vae_w = load_safetensors(&needed[1]).expect("vae");
     let clip_w = load_safetensors(&needed[2]).expect("clip");
@@ -144,7 +145,7 @@ fn txt2img_produces_an_image() {
             .expect("non-empty schedule");
         let timestep = Array::from_slice_f32(&[t, t], &[2]).unwrap();
 
-        let out = unet_forward(&latent_in, &timestep, &context, &unet_w, &s).expect("unet");
+        let out = unet_forward(&latent_in, &timestep, &context, &cfg, &unet_w, &s).expect("unet");
         let noise_pred = sample::guidance(&out, CFG_SCALE, &s).expect("cfg");
         let denoised = sample::denoise_epsilon(&latent, &noise_pred, sigma, &s).expect("denoise");
 
