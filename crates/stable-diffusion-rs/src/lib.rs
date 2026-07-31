@@ -17,6 +17,7 @@ pub use sd_models as models;
 pub use sd_sample as sample;
 pub use sd_tensor as tensor;
 
+#[cfg(feature = "mlx")]
 pub mod canny;
 /// Generation settings, backend-free.
 pub mod config;

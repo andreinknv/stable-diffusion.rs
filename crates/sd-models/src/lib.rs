@@ -17,6 +17,11 @@
 /// CLIP's tokenizer.
 pub mod clip;
 /// The models.
+///
+/// Gated because it is the whole MLX-dependent half of this crate. Without the
+/// feature the tokenizers and the scalar schedules still build, which is what
+/// lets a machine with no MLX check that the crate graph is intact.
+#[cfg(feature = "mlx")]
 pub mod mlx;
 /// Scalar schedules, shared and tensor-free.
 pub mod schedules;

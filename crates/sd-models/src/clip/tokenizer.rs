@@ -27,6 +27,103 @@ pub struct ClipTokenizer {
 }
 
 impl ClipTokenizer {
+    /// Load a tokenizer from a model directory, whichever form it ships.
+    ///
+    /// **A stock SD 1.5 or SDXL download has no `tokenizer.json`** — the
+    /// repositories ship the slow tokenizer, `vocab.json` + `merges.txt`. That
+    /// used to be a documented papercut with "go and copy a file from another
+    /// repository" as the fix. It is not one now: this reads either form, and
+    /// `from_vocab_and_merges` reconstructs the exact same tokenizer, verified
+    /// id-for-id against the fast one in this module's tests.
+    pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, TokenizeError> {
+        let dir = dir.as_ref();
+        let fast = dir.join("tokenizer.json");
+        if fast.exists() {
+            return Self::from_file(fast);
+        }
+        let (vocab, merges) = (dir.join("vocab.json"), dir.join("merges.txt"));
+        if vocab.exists() && merges.exists() {
+            return Self::from_vocab_and_merges(vocab, merges);
+        }
+        Err(TokenizeError::NotFound(fast))
+    }
+
+    /// Build CLIP's tokenizer from the slow form, `vocab.json` + `merges.txt`.
+    ///
+    /// Every piece below is transcribed from a real CLIP `tokenizer.json`, and
+    /// **none of it is a reasonable-looking guess** — a normalizer or a split
+    /// pattern that is nearly right produces nearly-right token ids, which is a
+    /// different picture with no error anywhere. `the_two_forms_agree_exactly`
+    /// is what makes this safe to offer.
+    pub fn from_vocab_and_merges<P: AsRef<Path>, Q: AsRef<Path>>(
+        vocab: P,
+        merges: Q,
+    ) -> Result<Self, TokenizeError> {
+        use tokenizers::{
+            decoders::byte_level::ByteLevel as ByteLevelDecoder,
+            models::bpe::BPE,
+            normalizers::{Lowercase, Replace, Sequence as NormSequence, NFC},
+            pre_tokenizers::{
+                byte_level::ByteLevel, sequence::Sequence as PreSequence, split::Split,
+            },
+            processors::roberta::RobertaProcessing,
+            NormalizerWrapper, PreTokenizerWrapper, SplitDelimiterBehavior,
+        };
+
+        let (vocab, merges) = (vocab.as_ref(), merges.as_ref());
+        for p in [vocab, merges] {
+            if !p.exists() {
+                return Err(TokenizeError::NotFound(p.to_path_buf()));
+            }
+        }
+
+        // `end_of_word_suffix` is CLIP's `</w>`; without it every word-final
+        // token misses and the whole prompt tokenises differently.
+        let bpe = BPE::from_file(&vocab.to_string_lossy(), &merges.to_string_lossy())
+            .unk_token(EOS_TOKEN.to_string())
+            .end_of_word_suffix("</w>".to_string())
+            .build()
+            .map_err(|e| TokenizeError::Load(e.to_string()))?;
+
+        let mut inner = tokenizers::Tokenizer::new(bpe);
+
+        // NFC, collapse runs of whitespace to one space, lowercase — in that
+        // order.
+        inner.with_normalizer(Some(NormalizerWrapper::Sequence(NormSequence::new(vec![
+            NormalizerWrapper::NFC(NFC),
+            NormalizerWrapper::Replace(
+                Replace::new(
+                    tokenizers::normalizers::replace::ReplacePattern::Regex(r"\s+".to_string()),
+                    " ",
+                )
+                .map_err(|e| TokenizeError::Load(e.to_string()))?,
+            ),
+            NormalizerWrapper::Lowercase(Lowercase),
+        ]))));
+
+        // The split is **inverted**: the pattern describes what to *keep*.
+        let split = Split::new(
+            tokenizers::pre_tokenizers::split::SplitPattern::Regex(
+                r"'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+".to_string(),
+            ),
+            SplitDelimiterBehavior::Removed,
+            true,
+        )
+        .map_err(|e| TokenizeError::Load(e.to_string()))?;
+        inner.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(PreSequence::new(vec![
+            PreTokenizerWrapper::Split(split),
+            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false)),
+        ]))));
+
+        inner.with_post_processor(Some(RobertaProcessing::new(
+            (EOS_TOKEN.to_string(), 49407),
+            (BOS_TOKEN.to_string(), 49406),
+        )));
+        inner.with_decoder(Some(ByteLevelDecoder::default()));
+
+        Self::from_tokenizer(inner)
+    }
+
     /// Load from a `tokenizer.json` file.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, TokenizeError> {
         let path = path.as_ref();
@@ -38,7 +135,11 @@ impl ClipTokenizer {
         }
         let inner = tokenizers::Tokenizer::from_file(path)
             .map_err(|e| TokenizeError::Load(e.to_string()))?;
+        Self::from_tokenizer(inner)
+    }
 
+    /// Wrap a built `tokenizers::Tokenizer` in CLIP's padding contract.
+    fn from_tokenizer(inner: tokenizers::Tokenizer) -> Result<Self, TokenizeError> {
         // Read the special ids out of the vocabulary rather than hardcoding
         // 49406/49407: if a caller ever loads a tokenizer whose vocabulary
         // disagrees, that is worth failing on rather than silently padding

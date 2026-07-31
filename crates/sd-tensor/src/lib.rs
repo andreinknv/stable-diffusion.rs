@@ -70,6 +70,7 @@ pub mod ops {
 }
 
 pub mod rng {
+    #[cfg(feature = "mlx")]
     use super::Result;
 
     /// A standard-normal draw as an MLX array, `[n, c, h, w]` in **NHWC**.

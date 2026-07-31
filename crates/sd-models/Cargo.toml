@@ -19,3 +19,8 @@ tokenizers.workspace = true
 # The MLX port of the models, per docs/handoff.md decision (b).
 mlx = ["sd-tensor/mlx"]
 default = []
+
+[dev-dependencies]
+# The tests derive the slow tokenizer form from the fast one by asking the
+# model to save itself. Already in the tree as a normal dependency.
+tokenizers.workspace = true

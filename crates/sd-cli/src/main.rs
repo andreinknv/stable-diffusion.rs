@@ -4,14 +4,32 @@
 //! a backend, which is why they are unchanged from the candle CLI this
 //! replaces — a command that worked before works now.
 
+#[cfg(feature = "mlx")]
 mod mlx_cli;
 
+#[cfg(not(feature = "mlx"))]
+fn main() {
+    eprintln!(
+        "sdrs was built without a compute backend.\n\n\
+         Build it with `--features mlx` (and `brew install mlx-c` first). The \
+         feature is optional so that a machine without MLX can still check that \
+         the crate graph is intact — not so that the binary can run without one."
+    );
+    std::process::exit(2);
+}
+
+#[cfg(feature = "mlx")]
 use anyhow::{Context, Result};
+#[cfg(feature = "mlx")]
 use clap::{Parser, Subcommand};
+#[cfg(feature = "mlx")]
 use stable_diffusion_rs as sd;
+#[cfg(feature = "mlx")]
 use stable_diffusion_rs::config::Txt2ImgConfig;
+#[cfg(feature = "mlx")]
 use stable_diffusion_rs::tensor::mlx::Device;
 
+#[cfg(feature = "mlx")]
 #[derive(Parser)]
 #[command(
     name = "sdrs",
@@ -32,6 +50,7 @@ struct Cli {
     command: Command,
 }
 
+#[cfg(feature = "mlx")]
 #[derive(Subcommand)]
 enum Command {
     /// Generate an image from a text prompt.
@@ -157,6 +176,7 @@ enum Command {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "mlx")]
 fn config(
     prompt: &str,
     negative: &str,
@@ -180,12 +200,14 @@ fn config(
 }
 
 /// Split `a=b` on its **first** `=`, so a prompt may contain one.
+#[cfg(feature = "mlx")]
 fn split_pair(spec: &str) -> Result<(String, String)> {
     spec.split_once('=')
         .map(|(a, b)| (a.to_string(), b.to_string()))
         .with_context(|| format!("{spec:?} should be `key=value`"))
 }
 
+#[cfg(feature = "mlx")]
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(

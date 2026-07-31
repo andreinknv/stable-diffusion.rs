@@ -12,7 +12,7 @@ env:
 
 jobs:
   seam:
-    name: seam (candle confined to sd-tensor)
+    name: seam (backend confined to sd-tensor)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +29,6 @@ jobs:
       # A native dependency arrives transitively, in someone else's manifest,
       # and nothing about the build looks different when it does.
       - run: ./scripts/check-native-deps.sh
-      - run: ./scripts/check-native-deps.sh cuda
 
   fmt:
     name: rustfmt
@@ -41,8 +40,12 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  clippy:
-    name: clippy
+  # Linux has no MLX, so it checks the half of the workspace that does not need
+  # one: the tokenizers, the scalar schedules, and the name mappings. That is a
+  # real check — those are shared code, and a break in them is a break
+  # everywhere — but it is not the product.
+  graph:
+    name: crate graph (no backend)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,44 +53,30 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      - run: cargo test --workspace --no-default-features
 
-  test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Golden-tensor tests skip themselves when reference data is absent.
-      # CI runs the structural tests; numerical verification happens locally
-      # against generated references. See xtask/golden/README.md.
-      - run: cargo test --workspace
-
-  metal:
-    name: metal (build + device tests)
+  # The real gate. `macos-latest` is Apple silicon, which is what MLX wants.
+  mlx:
+    name: mlx (build, lint, test)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Nothing else in this file compiles the Metal backend, so a
-      # Metal-only break — a cfg-gated branch that stops building, a
-      # signature that changed under a feature flag — shipped undetected.
-      # That is not hypothetical: every GPU defect found so far lived in
-      # code no CI job touched.
-      - name: build with metal
-        run: cargo clippy --workspace --all-targets --features metal -- -D warnings
-      # The device tests skip themselves when no Metal device is present, so
-      # this is a compile gate first and a device gate only where the runner
-      # provides one. Golden data is absent here, so the numerical tests skip
-      # exactly as they do on the other jobs.
-      - name: test with metal
-        run: cargo test --workspace --features metal
+      # MLX is a system library, not a crate. `build.rs` finds it through
+      # MLX_C_PREFIX/MLX_PREFIX or Homebrew and says so plainly when it cannot.
+      - name: install mlx
+        run: brew install mlx-c
+      - run: cargo clippy --workspace --all-targets --features mlx -- -D warnings
+      # The golden tests skip themselves when reference data is absent, so this
+      # is a compile-and-structure gate here. Numerical verification runs
+      # locally against generated references — see xtask/golden/README.md, and
+      # note that SD_REQUIRE_FIXTURES turns those skips into failures where the
+      # data does exist.
+      - run: cargo test --workspace --features mlx
 
   deny:
     name: cargo-deny (licenses, advisories)
