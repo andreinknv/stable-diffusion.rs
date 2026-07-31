@@ -100,6 +100,7 @@ unsafe extern "C" {
     fn mlx_multiply(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> i32;
     fn mlx_divide(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> i32;
     fn mlx_sigmoid(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
+    fn mlx_maximum(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> i32;
     fn mlx_erf(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
     fn mlx_sqrt(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> i32;
 
@@ -478,6 +479,16 @@ impl Array {
 
     pub fn sigmoid(&self, stream: &Stream) -> Result<Self> {
         self.unary(stream, "sigmoid", mlx_sigmoid)
+    }
+
+    /// Elementwise `max(self, rhs)`.
+    pub fn maximum(&self, rhs: &Self, stream: &Stream) -> Result<Self> {
+        self.binary(rhs, stream, "maximum", mlx_maximum)
+    }
+
+    /// ReLU, as `max(x, 0)`. `mlx-c` exposes no relu of its own.
+    pub fn relu(&self, stream: &Stream) -> Result<Self> {
+        self.maximum(&Self::scalar_f32(0.0)?, stream)
     }
 
     pub fn erf(&self, stream: &Stream) -> Result<Self> {
