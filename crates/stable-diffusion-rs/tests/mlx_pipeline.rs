@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use stable_diffusion_rs::mlx::{GroundedBox, MlxPipeline, SdxlPipeline};
+use stable_diffusion_rs::mlx::{GroundedBox, MlxPipeline, Sd3Paths, Sd3Pipeline, SdxlPipeline};
 use stable_diffusion_rs::pipeline::{SamplerKind, Strength, Txt2ImgConfig};
 use stable_diffusion_rs::tensor::mlx::Array;
 
@@ -633,5 +633,64 @@ fn an_ip_adapter_conditions_on_the_reference_image() {
     assert_eq!(
         zero, without,
         "an IP-Adapter at scale 0 changed the image; it must contribute exactly nothing"
+    );
+}
+
+// -- SD 3.5 -----------------------------------------------------------------
+
+/// **SD 3.5's pipeline is written but not end-to-end verified here**, because
+/// T5-XXL is not on this machine in safetensors — only as a 4-bit GGUF, which
+/// dequantises to 18.8 GB and does not fit beside the rest.
+///
+/// The candle `Sd3Pipeline` has no end-to-end test either; it is reachable only
+/// through the CLI. So what is pinned on both sides is the same thing: the
+/// models underneath (`mlx_golden_sd3`, `mlx_golden_t5`, `mlx_golden_flux_vae`
+/// for the 16-channel latent) and the layout the pipeline assembles them into.
+#[test]
+fn sd3_paths_name_every_piece_including_both_t5_shards() {
+    let root = PathBuf::from("/models/sd35");
+    let paths = Sd3Paths::in_dir(&root);
+    assert!(paths
+        .transformer
+        .ends_with("transformer/diffusion_pytorch_model.safetensors"));
+    assert!(paths.clip_l.ends_with("text_encoder/model.safetensors"));
+    assert!(paths.clip_g.ends_with("text_encoder_2/model.safetensors"));
+    // **Two shards.** T5-XXL does not fit in one file, and a single-file
+    // assumption drops half the encoder and surfaces as a missing tensor
+    // naming one arbitrary layer.
+    assert_eq!(paths.t5.len(), 2, "T5-XXL ships as two shards");
+    assert!(paths.t5[0].ends_with("model-00001-of-00002.safetensors"));
+    assert!(paths.t5[1].ends_with("model-00002-of-00002.safetensors"));
+    // T5's tokenizer is a sentencepiece model, not CLIP's tokenizer.json.
+    assert!(paths.t5_tokenizer.ends_with("tokenizer_3/spiece.model"));
+}
+
+/// A missing checkpoint is refused by name, not by whichever file is loaded
+/// first.
+#[test]
+fn sd3_refuses_a_directory_that_is_not_there() {
+    let err = Sd3Pipeline::load(&PathBuf::from("/nonexistent/sd35"));
+    assert!(err.is_err(), "a missing SD 3.5 directory must be refused");
+}
+
+/// **Flow matching's ladder is resolution-dependent**, which is the trap that
+/// distinguishes it from the k-diffusion schedules elsewhere in this project.
+///
+/// A ladder computed for a different image size still has the right length and
+/// still descends to zero, so only comparing two sizes catches it.
+#[test]
+fn the_flow_ladder_depends_on_the_image_size() {
+    use sd_sample::flow::{flow_sigmas, FlowMatchConfig};
+    let cfg = FlowMatchConfig::sd3();
+    // 1024 and 512 give 64x64 and 32x32 latents, so 32x32 and 16x16 patches.
+    let big = flow_sigmas(&cfg, 28, 32 * 32);
+    let small = flow_sigmas(&cfg, 28, 16 * 16);
+
+    assert_eq!(big.len(), 29, "steps + 1");
+    assert_eq!(*big.last().unwrap(), 0.0, "the ladder ends at zero");
+    assert_eq!(small.len(), big.len(), "the same length either way");
+    assert_ne!(
+        big, small,
+        "the two resolutions gave the same ladder; the sequence length is being ignored"
     );
 }

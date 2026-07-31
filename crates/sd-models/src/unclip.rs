@@ -59,7 +59,10 @@ const MAX_BETA: f64 = 0.999;
 /// prior's own scheduler is the same `squaredcos_cap_v2` over the same 1000
 /// steps. That is the one place the "this is not a sampler's schedule" note
 /// above stops applying: there it *is* one.
-pub(crate) fn cosine_alphas_cumprod(n: usize) -> Vec<f64> {
+/// Public because the MLX augmentation needs the same ladder, and it is scalar
+/// arithmetic over a cosine — the class of thing that must exist once so two
+/// backends cannot drift apart on it.
+pub fn cosine_alphas_cumprod(n: usize) -> Vec<f64> {
     // alpha_bar(t) = cos((t + 0.008) / 1.008 * pi / 2)^2
     let alpha_bar = |t: f64| {
         let x = (t + 0.008) / 1.008 * std::f64::consts::FRAC_PI_2;

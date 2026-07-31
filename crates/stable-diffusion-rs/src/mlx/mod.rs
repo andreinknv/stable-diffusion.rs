@@ -38,8 +38,10 @@ use sd_tensor::{Device, Tensor};
 
 use crate::pipeline::{PipelineError, SamplerKind, Strength, Txt2ImgConfig};
 
+pub mod sd3;
 pub mod sdxl;
 
+pub use sd3::{Sd3Paths, Sd3Pipeline, Sd3RunConfig};
 pub use sdxl::SdxlPipeline;
 
 /// `PipelineError` carries no free-form variant of its own, so a message goes

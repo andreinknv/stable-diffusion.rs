@@ -63,6 +63,19 @@ impl ClipConfig {
         }
     }
 
+    /// SD 3's first text encoder: SD 1.5's geometry with a projection head.
+    ///
+    /// The projection is the difference that matters. SD 1.5 ships a plain
+    /// `CLIPTextModel` and Flux takes its raw pooled hidden state; SD 3 ships
+    /// `CLIPTextModelWithProjection` and takes the *projected* one. The two are
+    /// different vectors and are not interchangeable.
+    pub fn sd3_l() -> Self {
+        Self {
+            projection: true,
+            ..Self::sd15()
+        }
+    }
+
     /// SD 2.x: OpenCLIP ViT-H/14.
     ///
     /// **23 layers, not 24.** SD 2.x conditions on the penultimate hidden
