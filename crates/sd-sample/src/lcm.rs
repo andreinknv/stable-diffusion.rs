@@ -28,8 +28,6 @@
 //! on an evenly spaced ladder asks it for a mapping it was never trained to
 //! make.
 
-use sd_tensor::{Result, Tensor};
-
 use crate::Schedule;
 
 /// Standard deviation the consistency parameterisation assumes for data.
@@ -117,42 +115,6 @@ pub fn boundary_conditions(timestep: f64) -> (f64, f64) {
     (SIGMA_DATA * SIGMA_DATA / denom, scaled / denom.sqrt())
 }
 
-/// One LCM step.
-///
-/// `x` is the current latent and `denoised` the model's predicted `x0`, both
-/// in the variance-exploding parameterisation the rest of this crate uses —
-/// which is already what the pipeline computes as
-/// `latent - noise_pred * sigma`, and is exactly diffusers'
-/// `predicted_original_sample`, so nothing is converted here.
-///
-/// `noise` must be standard normal and freshly drawn: unlike a solver, LCM
-/// re-noises to the next level on every step but the last, and reusing a draw
-/// correlates the steps in a way the model was not distilled for.
-pub fn lcm_step(
-    x: &Tensor,
-    denoised: &Tensor,
-    sigma: f64,
-    sigma_next: f64,
-    timestep: f64,
-    noise: &Tensor,
-) -> Result<Tensor> {
-    let (c_skip, c_out) = boundary_conditions(timestep);
-
-    // `c_skip` weights the sample in the *variance-preserving* scaling the
-    // consistency function is defined over, which is this crate's `x` divided
-    // by sqrt(sigma^2 + 1). Skipping that conversion leaves the blend wrong by
-    // a factor that grows with sigma — invisible at the bottom of the
-    // schedule, where c_skip is negligible anyway, and wrong at the top.
-    let vp = (x / (sigma * sigma + 1.0).sqrt())?;
-    let consistent = ((denoised * c_out)? + (vp * c_skip)?)?;
-
-    if sigma_next > 0.0 {
-        consistent + (noise * sigma_next)?
-    } else {
-        Ok(consistent)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,24 +163,6 @@ mod tests {
             (c_out - 1.0).abs() < 1e-6,
             "c_out should be ~1, got {c_out}"
         );
-    }
-
-    #[test]
-    fn the_last_step_adds_no_noise() {
-        // sigma_next == 0 is the landing, and adding noise there would leave a
-        // visibly grainy image — the failure this guard exists for.
-        let dev = sd_tensor::Device::Cpu;
-        let x = Tensor::ones((1, 4, 8, 8), sd_tensor::DType::F32, &dev).unwrap();
-        let denoised =
-            (Tensor::ones((1, 4, 8, 8), sd_tensor::DType::F32, &dev).unwrap() * 0.5).unwrap();
-        let noise = Tensor::ones((1, 4, 8, 8), sd_tensor::DType::F32, &dev).unwrap();
-
-        let out = lcm_step(&x, &denoised, 1.0, 0.0, 0.0, &noise).unwrap();
-        // At timestep 0 the function is the identity on the VP sample, so the
-        // result is x / sqrt(2) and carries none of the noise.
-        let expected = 1.0 / 2f32.sqrt();
-        let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
-        assert!((got - expected).abs() < 1e-6, "got {got}, want {expected}");
     }
 
     #[test]

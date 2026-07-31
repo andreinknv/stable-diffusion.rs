@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use sd_models::mlx::vae::{self, VaeConfig, TILE_LATENT_EDGE};
 use sd_tensor::mlx::{load_safetensors, Array, Stream};
 use sd_tensor::rng::SeededRng;
-use sd_tensor::{Device, Tensor};
 
 fn weights() -> Option<sd_models::mlx::Weights> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -29,20 +28,7 @@ fn weights() -> Option<sd_models::mlx::Weights> {
 
 /// A seeded latent, NHWC.
 fn latent(seed: u64, edge: usize) -> Array {
-    let t: Tensor = SeededRng::new(seed)
-        .randn((1, 4, edge, edge), &Device::Cpu)
-        .unwrap();
-    let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-    // NCHW -> NHWC.
-    let mut out = vec![0.0f32; v.len()];
-    for c in 0..4 {
-        for y in 0..edge {
-            for x in 0..edge {
-                out[(y * edge + x) * 4 + c] = v[c * edge * edge + y * edge + x];
-            }
-        }
-    }
-    Array::from_slice_f32(&out, &[1, edge, edge, 4]).unwrap()
+    sd_tensor::rng::randn_nhwc(&mut SeededRng::new(seed), 1, 4, edge, edge).unwrap()
 }
 
 /// Below the tile edge, tiling must be exactly the untiled decode — not merely

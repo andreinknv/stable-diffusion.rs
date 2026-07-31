@@ -38,40 +38,34 @@ Three things this implementation provides:
 ## Design
 
 Models, samplers, and loaders are implemented here. The tensor math is
-[candle](https://github.com/huggingface/candle), which sits behind a seam:
+[MLX](https://github.com/ml-explore/mlx), which sits behind a seam:
 
 ```
 sd-cli ──┐
          ├── sd-models ──┐
-sd ──────┤   sd-sample   ├── sd-tensor ── candle
+sd ──────┤   sd-sample   ├── sd-tensor ── MLX
          └── sd-loader ──┘      ▲
-                                └── the only crate that names candle
+                                └── the only crate that names a backend
 ```
 
-`sd-tensor` is a thin re-export surface plus the handful of ops candle lacks.
+`sd-tensor` binds `mlx-c` directly — hand-written, because `bindgen` would put
+libclang in every build of the crate for a few dozen declarations.
 Everything else goes through it, enforced in CI by
 [`scripts/check-seam.sh`](scripts/check-seam.sh).
 
-**Caveat on "pure Rust":** our code is 100% Rust, but one transitive dependency
-compiles C. `candle-core` depends on `tokenizers` with the `onig` feature,
-which builds `onig_sys` — the oniguruma C regex library — so a C compiler is
-required. You never invoke it yourself, and there is still no cmake or
-submodule ceremony.
-
-This is **fixable in one line upstream**, and we have verified the fix. It is
-also the *only* native code in a CPU build — audited and enforced in CI by
+**Caveat on "pure Rust":** our code is 100% Rust, and no dependency compiles C.
+`tokenizers` needs a regex backend and we ask for `fancy-regex`, which is pure
+Rust, rather than `onig`, which is not. Audited and enforced in CI by
 [`scripts/check-native-deps.sh`](scripts/check-native-deps.sh), which fails if
-anything else starts compiling C. GPU builds additionally contain CUDA C++ /
-Metal shader kernels, which no dependency choice can make Rust. Full audit in
+anything starts compiling C. MLX itself is a system library — installed with
+`brew install mlx-c`, linked, not built here — and its kernels are Metal, which
+no dependency choice can make Rust. Full audit in
 [docs/native-deps.md](docs/native-deps.md).
 
-That keeps one option open: candle is pre-1.0, maintained largely by one
-person, and — like ggml — tuned for language models rather than diffusion. If a
-kernel becomes the bottleneck, we replace it in one crate instead of rewriting
-every model. Cheap to keep, impossible to add later.
-
-Why candle and not burn, cubecl or rust-gpu — with benchmarks, and an honest
-account of what the seam does *not* protect against — is in
+The seam is not decoration: **the backend has already been replaced once.** It
+was candle until 2026, and the swap touched `sd-tensor` plus new model code
+rather than the 102 files that use tensors. Why MLX, what the move cost and
+what the seam does *not* protect against are in
 [docs/backends.md](docs/backends.md).
 
 ## Build
@@ -213,7 +207,7 @@ Builds on the work of others — see [Standing on](#standing-on) below and
 [NOTICE](NOTICE) for the details. Briefly:
 [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (MIT,
 © 2023 leejet) for architecture and quantization groundwork,
-[candle](https://github.com/huggingface/candle) (MIT/Apache-2.0) for compute,
+[MLX](https://github.com/ml-explore/mlx) (MIT) for compute,
 and [diffusers](https://github.com/huggingface/diffusers) (Apache-2.0) as the
 numerical reference.
 
@@ -225,10 +219,14 @@ runs.*
 
 What this project uses, and for what:
 
-- **[candle](https://github.com/huggingface/candle)** — tensor and compute
+- **[MLX](https://github.com/ml-explore/mlx)** and
+  **[mlx-c](https://github.com/ml-explore/mlx-c)** — tensor and compute
   backend, reached only through `sd-tensor`. Its fused kernels are used where
-  they apply: `ops::sdpa` for attention and `rotary_emb::rope_i` for Flux's
-  positional encoding.
+  they apply: `scaled_dot_product_attention`, `layer_norm`, `rms_norm` and
+  quantised matmul.
+- **[candle](https://github.com/huggingface/candle)** — the backend until
+  2026, and the reference the MLX port was checked against tensor by tensor
+  while both existed.
 - **[diffusers](https://github.com/huggingface/diffusers)** and
   **[transformers](https://github.com/huggingface/transformers)** — the
   reference implementations every component here is compared against, tensor

@@ -1,6 +1,6 @@
 [package]
 name = "sd-tensor"
-description = "Tensor/compute seam for stable-diffusion.rs. The only crate permitted to depend on candle."
+description = "Tensor/compute seam for stable-diffusion.rs. The only crate permitted to name a backend."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,28 +9,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-candle-core.workspace = true
 # Pure bindings, no C compiled — asks the OS how much memory is free. See
 # src/sysmem.rs for why a fixed budget is not enough.
 libc = "0.2"
-candle-nn.workspace = true
 thiserror.workspace = true
-# Not a new dependency in the build graph: this already compiles as part of
-# every `--features metal` build, via candle-core/metal. Naming it directly
-# lets `src/fused.rs` compile our own Metal source at runtime and encode it
-# onto the command stream candle is already using, without forking candle.
-candle-metal-kernels = { version = "=0.11.0", optional = true }
-# Same: already in the tree via candle-metal-kernels. Needed for `MTLSize`,
-# which candle re-exports the encoder for but not the type it takes.
-objc2-metal = { version = "0.3.2", optional = true }
-# Bindings to MetalPerformanceShadersGraph, which ships in macOS — the
-# framework is already on every Mac, this is only the Rust declaration of it.
-# Added to measure Apple's tuned convolution against candle's im2col, which
-# moves up to 566 MB per call at ~25 GB/s. See docs/roadmap.md.
-objc2-metal-performance-shaders-graph = { version = "0.3.2", optional = true }
-objc2-metal-performance-shaders = { version = "0.3.2", optional = true }
-objc2-foundation = { version = "0.3.2", optional = true }
-objc2 = { version = "0.6", optional = true }
 
 [features]
 default = []
@@ -38,31 +20,3 @@ default = []
 # `mlx` on the system; build.rs finds them via MLX_C_PREFIX/MLX_PREFIX or
 # Homebrew, and links nothing at all when this feature is off.
 mlx = []
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels", "dep:objc2-metal", "dep:objc2-metal-performance-shaders-graph", "dep:objc2-metal-performance-shaders", "dep:objc2-foundation", "dep:objc2"]
-# Apple's Accelerate: 1.7-1.9x on CPU (SD 1.5 512, 4 steps, interleaved:
-# 19.1/20.6 s against 34.6/35.0 s), output agreeing to 1/255. It links a
-# system framework and compiles nothing.
-#
-# **Opt-in, and it must stay opt-in until f16 is handled.** candle's Accelerate
-# CPU backend does not implement f16 matmul at all — it bails with "the
-# accelerate backend does not support f16 matmul" (cpu_backend/mod.rs) — so
-# enabling this breaks any CPU path that keeps weights in f16. T5 loaded from
-# GGUF trips it today; SDXL's f16 weights are the other candidate. Turning it
-# on by default would trade a capability for a speed-up.
-#
-# Making it default is otherwise ready: a target-scoped dependency covers
-# macOS in one line without touching other platforms, and the golden
-# tolerances it used to break have been corrected against measurement (see
-# UNET_RTOL in golden_unet.rs). f16 is the only thing left.
-accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
-
-# Deliberately NOT exposing candle's `mkl` feature.
-#
-# It pulls `intel-mkl-src`, which publishes no license field at all, and Intel
-# MKL itself ships under Intel's proprietary Simplified Software License. This
-# project advertises a fully permissive dependency tree; silently pulling
-# proprietary code in behind a feature flag would make that claim false.
-#
-# Users who accept Intel's terms can enable it downstream by depending on
-# candle directly. See docs/seam.md.

@@ -7,154 +7,45 @@ Saying **go** means: read this file, take the first unchecked item under
 
 ### Start here
 
-Steps 1–3 are done and the port is most of the way through step 4. What is left
-is at the bottom of this list; the crossed-out items are kept because their
-findings still bind.
+**candle is gone.** The migration is complete: every model, every pipeline and
+every orchestration feature runs on MLX, and `Cargo.lock` holds no candle
+entry. What follows is what the next reader needs, not a plan.
 
-1. ~~**Decide the fork.**~~ — **decided 2026-07-30: (b), MLX's own shape.**
-   `sd-tensor` does *not* emulate candle's API. See [The fork to decide before
-   writing any code](#the-fork-to-decide-before-writing-any-code) for the
-   reasoning, which turned on `mlx-c`'s actual signatures rather than on taste.
-
-2. ~~**Spike GGUF before binding anything.**~~ — **done 2026-07-30, and it
-   does not block.** Reading and dequantising GGUF needs one Python library and
-   no candle. SD 3.5 medium dequantises to 4.9 GB of f16 and needs nothing
-   else; Flux schnell would be 23.8 GB and has to stay quantised, which costs a
-   cosine of ~0.995 through MLX's own 4-bit. Full numbers and the
-   double-quantisation trap under [Order of work](#order-of-work).
-
-3. ~~**Bind `mlx-c` behind `sd-tensor`.**~~ — **done.** `crates/sd-tensor/src/mlx.rs`
-   carries the hand-written FFI: `Array`, `Stream`, ~45 ops, safetensors
-   loading, and the thread-local error trampoline that the first draft owed.
-   `build.rs` links mlx-c/mlx only under `--features mlx`, via
-   `MLX_C_PREFIX`/`MLX_PREFIX` or Homebrew. `scripts/check-seam.sh` still
-   passes: nothing outside `sd-tensor` names either backend.
-
-4. **Port the models.** Everything below is green against the same golden
-   fixtures the candle path uses, at the same measured tolerances:
-
-   | model | gate | worst |
-   |---|---|---|
-   | SD 1.5 UNet | `mlx_golden_unet` | 3.353e-4 excess |
-   | SD 2.x / SDXL / unCLIP UNets | `mlx_golden_unet` | within `UNET_TOL` |
-   | VAE encoder + decoder | `mlx_golden_vae` | 1.9e-5 |
-   | CLIP text tower | `mlx_golden_clip` | within f32 ULP at peak 851 |
-   | T5 v1.1 | `mlx_golden_t5` | 2.6e-5 |
-   | SD 3.5 MMDiT | `mlx_golden_sd3` | 3.75e-6 |
-   | Flux DiT | `mlx_golden_flux` | 3.49e-6 |
-   | TAESD | `mlx_golden_taesd` | 7.42e-6 decode, 3.21e-6 encode |
-   | Real-ESRGAN | `mlx_golden_esrgan` | 2.205e-6 |
-   | ControlNet | `mlx_golden_controlnet` | 2.038e-5 |
-   | LoRA | `mlx_lora` | bit-identical to `sd-loader` |
-   | IP-Adapter | `mlx_golden_ip_adapter` | 1.200e-5 |
-   | GLIGEN | `mlx_golden_gligen` | 1.049e-5 |
-   | AnimateDiff | `mlx_golden_motion` | 7.63e-6 module, 4.59e-5 whole UNet |
-   | SDXL text encoder 2 | `mlx_golden_sdxl_text_encoder` | 1.909e-4 excess |
-   | CLIP vision (ViT-H) | `mlx_golden_clip_vision` | 1.509e-4 excess |
-   | Flux VAE | `mlx_golden_flux_vae` | 2.83e-5 decode |
-   | SDXL ControlNet | `mlx_golden_controlnet_sdxl` | 4.53e-5 mid |
-   | unCLIP prior | `mlx_golden_prior` | 2.85e-6 masked |
-   | Tiled VAE | `mlx_vae_tiled` | mean_abs 0.008 against whole |
-   | GGUF reader | `mlx_gguf_agrees_with_candle` | bit-exact |
-   | GGUF models | `mlx_gguf_models` | 1.000000 from f16 |
-
-5. **img2img and inpainting** — **done**, `mlx_img2img`. `vae::encode` gives
-   the distribution's mean, `sample::noise_to_sigma` noises it to where
-   `strength` starts, `sample::latent_mask` reduces a pixel mask 8x8 by *max*,
-   and `sample::restore_outside_mask` runs the composite inside the loop. See
-   [img2img and inpainting on MLX](#img2img-and-inpainting-on-mlx).
-
-6. **Quantised-at-rest inference exists**, and with it the last blocker is
-   gone. `crates/sd-models/src/mlx/quantized.rs`.
-
-   MLX's own affine quantisation, bound directly. A weight is held packed with
-   its scales and never materialised; the dequantisation happens inside the
-   matmul kernel a tile at a time. The GGUF loader is a **loop over the tensor
-   directory** rather than `load` followed by a conversion — each tensor is
-   dequantised, requantised and dropped, so the peak is one tensor and not the
-   model. The eager form is one line shorter and needs 47.6 GB.
-
-   **Two things cannot be quantised at all**, and both were found by running:
-
-   - Tensors that are **indexed rather than multiplied** — embedding tables,
-     the relative-attention bias, positional tables. `take` reads rows
-     directly and there is no kernel to fuse a dequantisation into.
-   - SD 3's **patch embedding**, a convolution kernel the forward reshapes
-     into a linear. It ships already flattened to 2-D, which is exactly the
-     shape that would otherwise be quantised.
-
-   `WeightSource::dense` refuses to reach past `linear` into a quantised
-   tensor, which is what caught both.
-
-   **4-bit everywhere is not good enough**, measured on flux-mini as
-   whole-transformer cosine against the same weights dense:
-
-   ```text
-     4-bit everywhere            0.9334   15.6 % of dense
-     8-bit everywhere            0.9993   28.1 %
-     sensitive layers dense      0.9924   39.0 %   worse than 8-bit
-     sensitive layers at 8       0.9919   19.1 %   <- the default
-   ```
-
-   A modulation layer emits the shift, scale and gate that *multiply* the
-   residual stream, so an error there is multiplied by everything downstream.
-   Keeping those dense recovers the accuracy and costs more than simply using
-   8 bits throughout — which is why the policy assigns a bit width rather than
-   a boolean.
-
-   **Both large models now run end to end**, `mlx_flux_end_to_end`:
-
-   | model | resident | dense f32 | result |
-   |---|---|---|---|
-   | Flux schnell + T5-XXL | **13.32 GB** | 66 GB | image, 18.7 s |
-   | SD 3.5 medium + T5-XXL | **10.07 GB** | ~40 GB | image |
-
-   T5-XXL's fp16 weights and `google/t5-v1_1-xxl`'s `spiece.model` are now on
-   the AI MODELS volume. `tests/golden/flux/t5-tokenizer.json` was already
-   there — an earlier note in this file claimed no T5 tokenizer existed, which
-   was wrong; it was found by searching for `spiece.model` and missing the
-   `.json`.
-
-   **SD 3.5 ships under two namings.** Stability's single-file release uses
-   the original `x_embedder`/`final_layer` names under a
-   `model.diffusion_model.` prefix; the `diffusers` directory renames them to
-   `pos_embed.proj`, `norm_out.linear` and so on. This port targets the former.
-
-   Still only on the candle path, all orchestration rather than models: step
-   caching, region/area prompts, two-pass hires, model placement, progress
-   reporting and cancellation, textual inversion, upscaling.
-
-7. **Run both backends in parallel** until every golden test passes on MLX.
-   Delete candle in one commit, not gradually.
-
-Verification, unchanged and non-negotiable:
+The verification command:
 
 ```bash
 SD_REQUIRE_FIXTURES=1 SD_TEST_MODEL_DIR=$(pwd)/models/sd15 \
 SD_TEST_SDXL_DIR=$(pwd)/models/sdxl \
 SD_TEST_INIT_IMAGE=$(pwd)/assets/controlnet-crab-canny-512.png \
 SD_TEST_CONTROLNET=<a ControlNet .safetensors, e.g. lllyasviel/sd-controlnet-canny> \
-cargo test --release --workspace --features metal --no-fail-fast
+cargo test --release --workspace --features mlx --no-fail-fast -- --test-threads=1
 ```
 
-**Swap `--features metal` for `--features mlx` to verify the other backend.**
-Both must pass while the two exist. `--features mlx` did not build at all until
-2026-07-31 — see [The workspace would not build under
-`--features mlx`](#the-workspace-would-not-build-under---features-mlx-at-all).
+Without those variables the suite reports failures that are only unset paths,
+and `cargo test` stops at the first failing binary — so a truncated run looks
+like a clean one. `--no-fail-fast` is not optional. **`--test-threads=1` is
+not either**: several binaries load three or four multi-gigabyte models, and
+two at once took swap to 21.6 GB of 22.5 GB and got a test binary SIGKILLed.
 
-Without those variables the suite reports 14 failures that are only unset
-paths, and `cargo test` stops at the first failing binary — so a truncated run
-looks like a clean one. `--no-fail-fast` is not optional.
+What runs, all gated against `diffusers`/`transformers` at measured tolerances:
 
-**`SD_TEST_CONTROLNET` was missing from this block until 2026-07-30**, which
-made the command fail one test by construction:
-`control_maps_must_match_the_attached_controlnets` needs it, and with
-`SD_REQUIRE_FIXTURES=1` a skip is a failure — by design, and the design is
-right. With it set the run is 405 passed, 0 failed. It wants the `.safetensors`
-**file**, not the directory containing it; a directory fails with
-`expected a .safetensors file`.
+| pipeline | state |
+|---|---|
+| SD 1.5 / 2.x | txt2img, img2img, inpaint |
+| SDXL | txt2img, img2img, at native 1024 in 24 s |
+| unCLIP | image variations |
+| SD 3.5 medium | txt2img, **10.07 GB** resident quantised |
+| Flux schnell | txt2img, **13.32 GB** resident quantised |
 
-## Decision: the backend moves to MLX
+Conditioning: ControlNet (stacking, scale 0 exactly zero), LoRA (errors rather
+than half-applying), IP-Adapter, GLIGEN, AnimateDiff clips, textual inversion.
+Orchestration: progress, cancellation, step caching, region prompts, two-pass
+hires, ESRGAN upscaling.
+
+**Quantised at rest** is what makes the last two rows possible —
+`crates/sd-models/src/mlx/quantized.rs`. Flux schnell is 47.6 GB dense in f32.
+
+## Why the backend moved to MLX (done)
 
 Taken deliberately, after measuring the alternative. The evidence both ways is
 in [roadmap.md](roadmap.md); this section is what to do about it.

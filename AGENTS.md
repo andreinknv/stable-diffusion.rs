@@ -22,19 +22,19 @@ no test.
 
 If you believe a test is genuinely wrong: **stop and say so.** Do not change it.
 
-### 2. Never import candle outside `sd-tensor`
+### 2. Never import a compute backend outside `sd-tensor`
 
 Forbidden everywhere except `crates/sd-tensor/`:
 
 ```rust
 use candle_core::...;   // NO
-use candle_nn::...;     // NO
+use mlx_sys::...;       // NO — the rule is about any backend
 ```
 
-Also forbidden: adding `candle-core` or `candle-nn` to any other crate's
+Also forbidden: adding `candle-*` or `mlx-*` to any other crate's
 `Cargo.toml`.
 
-CI fails on this (`scripts/check-seam.sh`). If you need something candle has
+CI fails on this (`scripts/check-seam.sh`). If you need something the backend has
 and `sd-tensor` doesn't expose, **add it to `crates/sd-tensor/src/lib.rs`**,
 then use it from there. Your task file says whether that is expected.
 
@@ -53,7 +53,8 @@ not to improve something you noticed.
 
 Only use functions listed in "Available API" below or already used in existing
 code. If you cannot find a function that does what you need, **do not guess a
-plausible name.** candle's API is not what you would expect it to be.
+plausible name.** `sd-tensor`'s MLX surface is hand-written and covers what
+the models needed, not everything MLX offers.
 
 Check what exists:
 
@@ -108,12 +109,9 @@ are checked against the same 2 GiB budget before anything is allocated —
 for a deliberate experiment on a machine you know can take it, not for clearing
 an obstacle. If your task needs a larger latent, stop and say so.
 
-Two things chunking does *not* do. It does not make large decodes fast — it is
-the same arithmetic in tiles, and the Metal cliff at 512x512 is unchanged. And
-it does not mean a fused kernel is in play: candle 0.11 ships one for Metal but
-it declines every shape in this workspace (f32 at `head_dim=512` is excluded,
-and it wants a mask materialised to `[batch, heads, seq_q, seq_k]`).
-`ops::attention_with_path` reports which path served a call; check it rather
+One thing chunking does *not* do: it does not make large decodes fast — it is
+the same arithmetic in tiles. What it buys is a decode that completes at all,
+by keeping the largest single allocation to one tile's worth. `vae::decode_tiled`
 than assuming.
 
 The general form of this rule: before running anything parameterised by a size,
@@ -164,36 +162,51 @@ scaled_dot_product_attention(&q, &k, &v)   -> Result<Tensor>   // NO MASK SUPPOR
 **`scaled_dot_product_attention` takes no mask.** If your task needs causal
 masking, the task file tells you to add a masked variant to `sd-tensor`.
 
-### Tensor methods (from candle, available on `Tensor`)
+### Array methods (`sd_tensor::mlx::Array`)
+
+Every op takes a `&Stream` as its last argument — MLX schedules onto a stream
+and the handle is how a caller says which. `Stream::gpu()` is the one to use.
 
 ```
-reshape(shape)?   transpose(d1, d2)?   permute(dims)?   contiguous()?
-squeeze(dim)?     unsqueeze(dim)?      narrow(dim, start, len)?
-matmul(&other)?   broadcast_add(&o)?   broadcast_mul(&o)?   broadcast_sub(&o)?
-to_dtype(dtype)?  to_device(dev)?      flatten_all()?   flatten_from(dim)?
-dims()            dims2()?  dims3()?  dims4()?   dim(i)?   rank()   elem_count()
-affine(mul, add)? clamp(min, max)?     abs()?    sqr()?   sqrt()?   exp()?
-neg()?  cos()?  sin()?  max(dim)?  min(dim)?  sum(dim)?  mean(dim)?
-upsample_nearest2d(h, w)?    cat(&[..], dim)     get(idx)?
-Tensor::zeros(shape, dtype, dev)?    Tensor::ones(...)?
-Tensor::new(data, dev)?              Tensor::arange(start, end, dev)?
-Tensor::from_vec(vec, shape, dev)?   Tensor::cat(&[&a, &b], dim)?
+reshape(&[..], s)?   transpose(&[..], s)?   contiguous(s)?
+narrow(axis, start, len, s)?   broadcast_to(&[..], s)?   take(&idx, axis, s)?
+matmul(&other, s)?   add(&o, s)?   sub(&o, s)?   mul(&o, s)?   div(&o, s)?
+sum(&axes, keepdims, s)?   mean(&axes, keepdims, s)?   max(&axes, keepdims, s)?
+abs(s)?  exp(s)?  sqrt(s)?  rsqrt(s)?  cos(s)?  sin(s)?  log(s)?  tanh(s)?
+silu(s)?  gelu(s)?  gelu_approx(s)?  quick_gelu(s)?  relu(s)?  sigmoid(s)?
+maximum(&o, s)?   erf(s)?   astype(dtype, s)?   to_f32(s)?
+layer_norm(w, b, eps, s)?   rms_norm(w, eps, s)?   group_norm(n, eps, w, b, s)?
+sdpa(&k, &v, scale, s)?     sdpa_causal(..)?    sdpa_masked(.., &mask, s)?
+conv2d(&kernel, stride, padding, dilation, groups, s)?
+shape()   elem_count()   to_vec_f32(s)?
+Array::from_slice_f32(&data, &shape)?   Array::from_slice_i32(..)?
+Array::scalar_f32(v)?   concat(&[&a, &b], axis, s)?   eval(&[&a])?
 ```
 
-Arithmetic: `(&a + &b)?`, `(&a * &b)?`, `(&a - &b)?`, `(&a / &b)?`,
-and with scalars: `(&a * 2.0f64)?`, `(&a + 1.0)?`.
+**`shape()` returns `Vec<usize>`**, so destructure it:
+`let [n, h, w, c] = x.shape()[..] else { return Err(...) };`
+
+**Weights are NHWC-consuming but stored NCHW.** A `diffusers` convolution
+kernel arrives as `(out, in, kh, kw)` and MLX wants `(out, kh, kw, in)`; the
+`conv` helper in `sd_models::mlx` transposes at the point of use, so the maps
+hold the original layout. Do not transpose them at load.
+
+**MLX is lazy.** Nothing computes until `eval` or a read. That is usually
+invisible and occasionally decisive: a graph holding references to tensors you
+meant to drop keeps them alive. `quantized::from_gguf` documents the case where
+it mattered.
 
 ### Random noise — `use sd_tensor::rng::SeededRng`
 
 ```
 SeededRng::new(seed: u64) -> SeededRng
-    .randn(shape, &device) -> Result<Tensor>   // standard normal
     .normals(n: usize) -> Vec<f32>
+sd_tensor::rng::randn_nhwc(&mut rng, n, c, h, w) -> Result<Array>   // NHWC
 ```
 
-**Use this, never `Device::set_seed`.** candle's `set_seed` returns an error on
-CPU ("cannot seed the CPU rng"), and its GPU generator would not match CPU
-output anyway. `SeededRng` gives bit-identical *noise* across devices.
+**Draw order is the promise.** `randn_nhwc` fills NCHW-major then re-orders,
+because that is the order the seed pins — drawing straight into NHWC would give
+a different picture from the same seed.
 
 The noise, not the image. f32 reduction order differs per backend, and twenty
 UNet steps compound it: the same seed on CPU and Metal gives images that are

@@ -15,11 +15,6 @@ use std::path::PathBuf;
 
 use sd_models::mlx::lora::Lora as MlxLora;
 use sd_tensor::mlx::{load_safetensors, Array, Stream};
-use sd_tensor::{DType, Device, Tensor};
-
-const MULTIPLIER: f64 = 0.8;
-/// f32 in a different order on a different device.
-const TOL: f32 = 2e-6;
 
 fn lora_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -28,77 +23,6 @@ fn lora_path() -> PathBuf {
 
 fn unet_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/unet_full/unet.safetensors")
-}
-
-#[test]
-fn the_mlx_merge_matches_sd_loaders() {
-    if !lora_path().exists() || !unet_path().exists() {
-        sd_tensor::skip_missing_fixture!("SKIP: needs the lora and unet_full fixtures.");
-        return;
-    }
-    let s = Stream::gpu();
-    let dev = Device::Cpu;
-
-    // candle side.
-    let mut candle_weights: HashMap<String, Tensor> =
-        sd_tensor::safetensors::load(unet_path(), &dev).expect("unet");
-    let candle_lora = sd_loader::Lora::load(lora_path(), &dev).expect("lora");
-    let candle_applied = candle_lora
-        .merge_into(&mut candle_weights, MULTIPLIER)
-        .expect("candle merge");
-
-    // MLX side.
-    let mut mlx_weights = load_safetensors(&unet_path()).expect("unet");
-    let mlx_raw = load_safetensors(&lora_path()).expect("lora");
-    let mlx_lora = MlxLora::from_weights(&mlx_raw, &s).expect("parse");
-    let mlx_applied = mlx_lora
-        .merge_into(&mut mlx_weights, MULTIPLIER as f32, &s)
-        .expect("mlx merge");
-
-    eprintln!(
-        "candle merged {} unmatched {} | mlx merged {} unmatched {}",
-        candle_applied.merged,
-        candle_applied.unmatched.len(),
-        mlx_applied.merged,
-        mlx_applied.unmatched.len()
-    );
-    assert!(
-        mlx_applied.merged > 0,
-        "nothing merged; the mapping missed entirely"
-    );
-    assert_eq!(
-        mlx_applied.merged, candle_applied.merged,
-        "the two merges touched different numbers of weights, so the flatten rules have drifted"
-    );
-    assert_eq!(
-        mlx_applied.unmatched.len(),
-        candle_applied.unmatched.len(),
-        "different unmatched counts"
-    );
-
-    // Every merged weight must agree, not just the count.
-    let mut checked = 0usize;
-    let mut worst = 0.0f32;
-    for (name, want) in &candle_weights {
-        let Some(got) = mlx_weights.get(name) else {
-            panic!("mlx lost the weight {name}");
-        };
-        let w: Vec<f32> = want
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let g = got.to_vec_f32(&s).unwrap();
-        assert_eq!(g.len(), w.len(), "{name}: element count");
-        for (a, b) in g.iter().zip(&w) {
-            worst = worst.max((a - b).abs());
-        }
-        checked += 1;
-    }
-    eprintln!("compared {checked} weights, worst {worst:.3e}");
-    assert!(worst <= TOL, "merged weights differ by {worst:.3e}");
 }
 
 /// A multiplier of 0 must leave every weight untouched **bit for bit** — the
@@ -165,10 +89,8 @@ fn a_missing_alpha_means_no_rescaling_not_no_effect() {
     }
 }
 
-/// **Coverage, stated absolutely rather than by agreement with candle.**
 ///
 /// `the_mlx_merge_matches_sd_loaders` above checks that the two backends agree,
-/// which is the right check while both exist and is worth nothing once candle
 /// is gone. The name mapping is where a LoRA silently half-applies, and a
 /// half-applied adapter still renders a plausible image — so the assertion is
 /// coverage, and it needs its own anchor.

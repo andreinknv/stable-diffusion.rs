@@ -16,13 +16,6 @@
 //! - `attn_rel_b` belongs to block 0 only, matching where transformers keeps
 //!   the relative attention bias. Every other block shares it.
 
-use std::collections::HashMap;
-
-use sd_tensor::{DType, Device, Tensor, VarBuilder};
-
-use crate::gguf::GgufInfo;
-use crate::LoadError;
-
 /// The HuggingFace name for a llama.cpp T5 tensor name, if we recognise it.
 ///
 /// Returns `None` for anything unrecognised — decoder blocks in particular,
@@ -57,119 +50,6 @@ pub fn t5_key(key: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!("encoder.block.{index}.{mapped}"))
-}
-
-/// Load a T5 encoder from a llama.cpp-layout GGUF.
-pub fn t5_var_builder_from_gguf<'a>(
-    path: impl AsRef<std::path::Path>,
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'a>, LoadError> {
-    let info = GgufInfo::open(&path)?;
-
-    // Size the guard on what will actually be expanded. A T5-XXL encoder is
-    // 4.7B parameters — 18.8 GB at f32 — so this is the check that decides
-    // whether the machine survives, not a formality.
-    let params: u64 = info
-        .tensors
-        .iter()
-        .filter(|(k, _)| t5_key(k).is_some())
-        .map(|(_, (shape, _))| shape.iter().map(|&d| d as u64).product::<u64>())
-        .sum();
-    if params == 0 {
-        return Err(LoadError::Unsupported {
-            path: info.path.clone(),
-            reason: "no T5 encoder tensors found; expected llama.cpp names like \
-                     `enc.blk.0.attn_q.weight`"
-                .to_string(),
-        });
-    }
-    sd_tensor::sysmem::check_headroom(
-        params.saturating_mul(dtype.size_in_bytes() as u64),
-        &format!("dequantising the T5 encoder from {}", info.path.display()),
-    )?;
-
-    let mut file = std::fs::File::open(&info.path).map_err(|e| LoadError::Unsupported {
-        path: info.path.clone(),
-        reason: format!("cannot open: {e}"),
-    })?;
-    crate::gguf::preflight(&mut file, &info.path)?;
-    let content = candle_content(&mut file)?;
-
-    let mut tensors: HashMap<String, Tensor> = HashMap::new();
-    for name in content.tensor_infos.keys() {
-        let Some(mapped) = t5_key(name) else { continue };
-        let t = content
-            .tensor(&mut file, name, device)?
-            .dequantize(device)?
-            .to_dtype(dtype)?;
-        tensors.insert(mapped, t);
-    }
-
-    tracing::debug!(tensors = tensors.len(), "loaded T5 encoder from gguf");
-    Ok(VarBuilder::from_tensors(tensors, dtype, device))
-}
-
-fn candle_content(file: &mut std::fs::File) -> Result<sd_tensor::gguf::Content, LoadError> {
-    Ok(sd_tensor::gguf::Content::read(file)?)
-}
-
-/// Quantised T5 weights, keyed by HuggingFace name.
-///
-/// Unlike [`t5_var_builder_from_gguf`] this does **not** dequantise. The
-/// tensors stay in their GGUF block format and are expanded per matmul by
-/// [`sd_tensor::quantized::QLinear`].
-///
-/// That is not only a memory saving. T5's activations reach tens of thousands
-/// and f16 tops out at 65504, so a dequantise-to-f16 load produces NaN partway
-/// up the stack; keeping the weights quantised means every activation is f32
-/// and the range problem does not arise. bf16 would also solve it, but
-/// candle's CPU backend has no bf16 matmul.
-pub fn t5_qtensors_from_gguf(
-    path: impl AsRef<std::path::Path>,
-    device: &Device,
-) -> Result<std::collections::HashMap<String, std::sync::Arc<sd_tensor::gguf::QTensor>>, LoadError>
-{
-    let info = GgufInfo::open(&path)?;
-
-    // Sized on the *quantised* footprint, which is what is actually held.
-    let bytes: u64 = info
-        .tensors
-        .iter()
-        .filter(|(k, _)| t5_key(k).is_some())
-        .map(|(_, (shape, dtype))| {
-            let n: u64 = shape.iter().map(|&d| d as u64).product();
-            n * dtype.type_size() as u64 / dtype.block_size() as u64
-        })
-        .sum();
-    sd_tensor::sysmem::check_headroom(
-        bytes,
-        &format!("T5 encoder weights from {}", info.path.display()),
-    )?;
-
-    let mut file = std::fs::File::open(&info.path).map_err(|e| LoadError::Unsupported {
-        path: info.path.clone(),
-        reason: format!("cannot open: {e}"),
-    })?;
-    crate::gguf::preflight(&mut file, &info.path)?;
-    let content = candle_content(&mut file)?;
-
-    let mut out = std::collections::HashMap::new();
-    for name in content.tensor_infos.keys() {
-        let Some(mapped) = t5_key(name) else { continue };
-        out.insert(
-            mapped,
-            std::sync::Arc::new(content.tensor(&mut file, name, device)?),
-        );
-    }
-    if out.is_empty() {
-        return Err(LoadError::Unsupported {
-            path: info.path.clone(),
-            reason: "no T5 encoder tensors found".to_string(),
-        });
-    }
-    tracing::debug!(tensors = out.len(), "loaded quantised T5 encoder");
-    Ok(out)
 }
 
 #[cfg(test)]

@@ -1,32 +1,34 @@
-//! Diffusion model architectures.
+//! The models, on MLX.
 //!
-//! Parameter names follow HuggingFace `diffusers` conventions so that
-//! pretrained weights load without a conversion table. Where a model ships in
-//! the original CompVis/LDM layout, conversion belongs in `sd-loader`, not
-//! here.
+//! Every architecture this project runs — SD 1.5, SD 2.x, SDXL, unCLIP, SD 3.5,
+//! Flux, plus the encoders, adapters and upscalers around them — lives under
+//! [`mlx`], each gated against `diffusers` or `transformers` at a measured
+//! tolerance by the `mlx_golden_*` tests.
 //!
-//! # Build order
+//! What is *not* under `mlx` is the work that never touches a tensor:
 //!
-//! 1. [`vae`] — decoder first. It produces a *visible* result from a known
-//!    latent, which validates conv2d, group norm, attention and upsampling
-//!    before anything depends on them.
-//! 2. [`clip`] — text encoder.
-//! 3. [`unet`] — the large one. Verify block by block, never whole-model.
+//! - [`clip`] and [`t5`]'s tokenizers, which turn text into ids.
+//! - [`schedules`], the scalar ladders unCLIP's noise augmentation and the
+//!   prior's DDPM step are computed from.
+//!
+//! They are apart because a second copy of a schedule is how two
+//! implementations come to disagree about what step 7 of 20 means.
 
+/// CLIP's tokenizer.
 pub mod clip;
-pub mod controlnet;
-pub mod esrgan;
-pub mod flux;
-pub mod gligen;
-pub mod image;
-pub mod ip_adapter;
-/// SD 1.5 on MLX. See docs/handoff.md.
-#[cfg(feature = "mlx")]
+/// The models.
 pub mod mlx;
-pub mod prior;
-pub mod sd3;
+/// Scalar schedules, shared and tensor-free.
+pub mod schedules;
+/// T5's tokenizer.
 pub mod t5;
-pub mod unclip;
-pub mod unet;
-pub mod vae;
-pub mod weights;
+
+/// Kept as `prior` because callers name it that; the contents are scalar.
+pub mod prior {
+    pub use crate::schedules::{PriorScheduler, StepCoefficients};
+}
+
+/// Kept as `unclip` for the same reason.
+pub mod unclip {
+    pub use crate::schedules::{cosine_alphas_cumprod, TRAIN_TIMESTEPS};
+}

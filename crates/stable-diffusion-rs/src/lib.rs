@@ -9,8 +9,8 @@
 //! use stable_diffusion_rs as sd;
 //! ```
 //!
-//! Milestone 1 is VAE decoding; text-to-image lands once CLIP and the UNet
-//! are verified against the golden harness. See `docs/roadmap.md`.
+//! Runs on MLX. `sd-tensor` is the only crate that names a backend, and
+//! `scripts/check-seam.sh` enforces it.
 
 pub use sd_loader as loader;
 pub use sd_models as models;
@@ -20,16 +20,15 @@ pub use sd_tensor as tensor;
 pub mod canny;
 /// Generation settings, backend-free.
 pub mod config;
-pub mod image_io;
-/// The generation pipeline on MLX.
-///
-/// Parallel to [`pipeline`] rather than generic over the backend: `sd-tensor`
-/// presents MLX with its own shape rather than emulating candle's API, so one
-/// pipeline cannot serve both. This is what replaces [`pipeline`] when candle
-/// goes.
+/// The generation pipelines.
 #[cfg(feature = "mlx")]
 pub mod mlx;
-pub mod pipeline;
+
+/// Kept as `pipeline` because that is what callers import; the settings are
+/// backend-free and live in [`config`].
+pub mod pipeline {
+    pub use crate::config::*;
+}
 
 /// Crate version, for `--version` and bug reports.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -22,7 +22,6 @@ use sd_models::mlx::{clip, sample, unet_forward, vae, UNetConfig};
 use sd_sample::{sigmas_for_steps, Schedule};
 use sd_tensor::mlx::{load_safetensors, Array, Stream};
 use sd_tensor::rng::SeededRng;
-use sd_tensor::{Device, Tensor};
 
 /// The SD VAE's convention. TAESD's is 1.0; using the wrong one is a plausible
 /// image in wrong colours.
@@ -50,8 +49,9 @@ fn have(paths: &[PathBuf]) -> bool {
 /// This is deliberate: it makes the two backends see *identical* draws, so a
 /// difference between their images is the models and not the dice.
 fn seeded_noise(rng: &mut SeededRng, shape: (usize, usize, usize, usize)) -> Vec<f32> {
-    let t: Tensor = rng.randn(shape, &Device::Cpu).expect("randn");
-    t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    // NCHW-major, which is the order `nchw_to_nhwc` below expects — and the
+    // order a seed pins.
+    rng.normals(shape.0 * shape.1 * shape.2 * shape.3)
 }
 
 /// NCHW `[1,4,h,w]` values into MLX's NHWC.

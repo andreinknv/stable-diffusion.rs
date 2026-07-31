@@ -42,7 +42,6 @@ fn config() -> Txt2ImgConfig {
         cfg_scale: 7.5,
         seed: 42,
         sampler: SamplerKind::EulerAncestral,
-        ..Default::default()
     }
 }
 
@@ -676,25 +675,36 @@ fn sd3_refuses_a_directory_that_is_not_there() {
     assert!(err.is_err(), "a missing SD 3.5 directory must be refused");
 }
 
-/// **Flow matching's ladder is resolution-dependent**, which is the trap that
-/// distinguishes it from the k-diffusion schedules elsewhere in this project.
+/// **Dynamic shifting is what makes a flow ladder resolution-dependent, and
+/// only Flux turns it on.**
 ///
-/// A ladder computed for a different image size still has the right length and
-/// still descends to zero, so only comparing two sizes catches it.
+/// This test asserted the opposite and was wrong: SD 3 sets
+/// `use_dynamic_shifting: false`, so `mu` is never consulted and its ladder is
+/// the same at every size. Flux sets it true and warps the ladder by the token
+/// count. Getting that backwards is silent — both produce a descending ladder
+/// of the right length — so the two are checked against each other.
 #[test]
-fn the_flow_ladder_depends_on_the_image_size() {
+fn only_flux_warps_its_ladder_by_the_image_size() {
     use sd_sample::flow::{flow_sigmas, FlowMatchConfig};
-    let cfg = FlowMatchConfig::sd3();
     // 1024 and 512 give 64x64 and 32x32 latents, so 32x32 and 16x16 patches.
-    let big = flow_sigmas(&cfg, 28, 32 * 32);
-    let small = flow_sigmas(&cfg, 28, 16 * 16);
+    let (big, small) = (32 * 32, 16 * 16);
 
-    assert_eq!(big.len(), 29, "steps + 1");
-    assert_eq!(*big.last().unwrap(), 0.0, "the ladder ends at zero");
-    assert_eq!(small.len(), big.len(), "the same length either way");
+    let sd3 = FlowMatchConfig::sd3();
+    assert!(!sd3.use_dynamic_shifting, "SD 3 does not shift dynamically");
+    assert_eq!(
+        flow_sigmas(&sd3, 28, big),
+        flow_sigmas(&sd3, 28, small),
+        "SD 3's ladder must not depend on the image size"
+    );
+
+    let flux = FlowMatchConfig::flux();
+    assert!(flux.use_dynamic_shifting, "Flux does");
+    let (fb, fs) = (flow_sigmas(&flux, 28, big), flow_sigmas(&flux, 28, small));
+    assert_eq!(fb.len(), 29, "steps + 1");
+    assert_eq!(*fb.last().unwrap(), 0.0, "the ladder ends at zero");
     assert_ne!(
-        big, small,
-        "the two resolutions gave the same ladder; the sequence length is being ignored"
+        fb, fs,
+        "Flux's ladder must depend on the image size; `mu` is being ignored"
     );
 }
 

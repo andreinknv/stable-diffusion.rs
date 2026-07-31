@@ -1,1010 +1,192 @@
-//! `sdrs` — command-line interface.
+//! `sdrs` — diffusion inference from the command line, on MLX.
+//!
+//! One subcommand per kind of generation. The flags describe *generation*, not
+//! a backend, which is why they are unchanged from the candle CLI this
+//! replaces — a command that worked before works now.
+
+mod mlx_cli;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-
-// The umbrella crate is `stable-diffusion-rs`; `sd` was already taken on
-// crates.io. Aliasing keeps call sites short — users can do the same.
 use stable_diffusion_rs as sd;
-
-use std::path::Path;
-
-use sd::models::vae::{AutoencoderKlDecoder, VaeConfig};
-use sd::pipeline::{Img2ImgConfig, SamplerKind, Strength, Txt2ImgConfig, Txt2ImgPipeline};
-use sd_tensor::{device, DType, Tensor};
+use stable_diffusion_rs::config::Txt2ImgConfig;
 
 #[derive(Parser)]
 #[command(
     name = "sdrs",
     version,
-    about = "Diffusion model inference in pure Rust",
-    long_about = None
+    about = "Diffusion inference in pure Rust, on MLX"
 )]
 struct Cli {
-    /// Force CPU even when a GPU backend is compiled in.
-    #[arg(long, global = true)]
-    cpu: bool,
-
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
-// A clap command enum is one value, parsed once, at startup. The variants
-// differ in size because `txt2img` has grown a lot of flags, and boxing it
-// would put an allocation and a deref in front of every field access in the
-// match arm to save bytes on a value that exists once per process.
-#[allow(clippy::large_enum_variant)]
 enum Command {
-    /// Decode a latent tensor to an image using the VAE decoder.
-    ///
-    /// This is milestone 1. txt2img lands once CLIP and the UNet are verified.
-    Decode {
-        /// VAE weights (`.safetensors`).
-        #[arg(long)]
-        vae: String,
-
-        /// Latent tensor `[1, 4, h, w]` stored as safetensors under key `latent`.
-        #[arg(long)]
-        latent: String,
-
-        /// Output PNG path.
-        #[arg(short, long, default_value = "out.png")]
-        output: String,
-
-        /// Treat the latent as already unscaled (skip `scaling_factor`).
-        #[arg(long)]
-        raw: bool,
-    },
-
     /// Generate an image from a text prompt.
-    ///
-    /// Named explicitly: clap would otherwise derive `txt2-img` from the
-    /// variant name, which is not what anyone will type.
     #[command(name = "txt2img")]
     Txt2Img {
         /// Model directory in the standard diffusers layout.
-        #[arg(long, conflicts_with = "gguf")]
-        model: Option<String>,
-
-        /// A single LDM-layout `.gguf` checkpoint instead of a directory.
-        ///
-        /// These carry no tokenizer — stable-diffusion.cpp writes no GGUF
-        /// metadata at all — so `--tokenizer` is required with it.
-        #[arg(long, requires = "tokenizer")]
-        gguf: Option<String>,
-
-        /// `tokenizer.json`, for `--gguf`. Copy it from
-        /// `openai/clip-vit-large-patch14`.
         #[arg(long)]
-        tokenizer: Option<String>,
-
+        model: String,
         #[arg(long)]
         prompt: String,
-
         #[arg(long, default_value = "")]
         negative_prompt: String,
-
         #[arg(long, default_value_t = 512)]
         width: usize,
-
         #[arg(long, default_value_t = 512)]
         height: usize,
-
         #[arg(long, default_value_t = 20)]
         steps: usize,
-
         #[arg(long, default_value_t = 7.5)]
         cfg_scale: f64,
-
         #[arg(long, default_value_t = 42)]
         seed: u64,
-
         /// `euler-a`, `dpmpp2m`, or `lcm` (needs an LCM model or --lora).
         #[arg(long, default_value = "euler-a")]
         sampler: String,
-
         #[arg(short, long, default_value = "out.png")]
         output: String,
-
         /// Treat the model directory as SDXL (two text encoders).
         #[arg(long)]
         sdxl: bool,
-
-        /// LoRA adapter to merge into the UNet. SD 1.5 only for now.
+        /// LoRA adapter to merge into the UNet.
         #[arg(long)]
         lora: Option<String>,
-
-        /// LoRA strength. 0 is identical to not passing --lora.
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f64,
-
-        /// Reuse the model's prediction between steps when the latent has
-        /// barely moved. 0 is off and bit-identical to not using it.
-        ///
-        /// 0.05-0.15 is the useful band. The saving is in steps skipped, so
-        /// watch the step log rather than assuming a value bought anything.
-        #[arg(long, default_value_t = 0.0)]
-        cache_threshold: f64,
-
-        /// Generate this many frames as one clip, denoised together.
-        ///
-        /// Without a motion adapter this is a batch of independent images
-        /// sharing a schedule, not an animation. `--output clip.png` writes
-        /// `clip-000.png`, `clip-001.png`, ... when this is above 1.
-        #[arg(long, default_value_t = 1)]
-        frames: usize,
-
-        /// AnimateDiff motion adapter, so frames become one motion rather
-        /// than independent images.
-        ///
-        /// Needs --frames above 1: temporal attention over a sequence of one
-        /// is close to inert.
+        /// ControlNet weights, with `--control-map`.
+        #[arg(long, requires = "control_map")]
+        controlnet: Option<String>,
+        /// The control map, at the run's own size.
         #[arg(long)]
-        motion_adapter: Option<String>,
-
-        /// Two-pass generation: compose at --width/--height, then add detail
-        /// at this size. `1024x1024`, or `1024` for a square.
-        ///
-        /// Not the same as generating big. A model composes at its training
-        /// resolution and duplicates subjects above it — two heads, two
-        /// horizons. Two passes avoid that.
-        #[arg(long, value_name = "WxH")]
-        hires: Option<String>,
-
-        /// How much of the schedule the second pass re-runs. 0.5-0.7 is usual.
-        #[arg(long, default_value_t = 0.55)]
-        hires_strength: f64,
-
-        /// How the first pass is enlarged: latent-nearest, latent-bilinear,
-        /// or pixel-lanczos.
-        ///
-        /// Nearest introduces no colours that were not already there, which
-        /// matters for anything with a fixed palette.
-        #[arg(long, default_value = "latent-nearest")]
-        hires_upscale: String,
-
-        /// Textual-inversion embedding, triggered by its file stem. Repeatable.
-        ///
-        /// Kilobytes rather than gigabytes: the cheapest way to bring a style.
-        /// `--embedding styles/mystyle.safetensors` makes `mystyle` a prompt
-        /// word.
-        #[arg(long)]
-        embedding: Vec<String>,
-
-        /// Condition on a reference image (IP-Adapter). Path to
-        /// `ip-adapter_sd15.safetensors`.
-        ///
-        /// Needs --ip-image and --image-encoder. The reference supplies style
-        /// and identity; the prompt still supplies content.
-        #[arg(long)]
-        ip_adapter: Option<String>,
-
-        /// The reference image for --ip-adapter.
-        #[arg(long)]
-        ip_image: Option<String>,
-
-        /// CLIP vision tower directory (h94/IP-Adapter's models/image_encoder).
-        #[arg(long)]
-        image_encoder: Option<String>,
-
-        /// IP-Adapter strength. 0 contributes exactly nothing.
-        #[arg(long, default_value_t = 1.0)]
-        ip_scale: f64,
-
-        /// Make the image tile seamlessly, by padding every convolution
-        /// circularly so the model never sees an edge.
-        ///
-        /// `x`, `y` or `xy`. Per-axis because a scrolling parallax layer wants
-        /// horizontal wrapping only — forcing vertical wrap makes its sky
-        /// bleed into its floor.
-        #[arg(long, value_name = "AXES")]
-        seamless: Option<String>,
-
-        /// Write a preview image every N steps, beside --output.
-        ///
-        /// Costs a full decode each time, so this is worth having with
-        /// --taesd and expensive without it.
-        #[arg(long)]
-        preview_every: Option<usize>,
-
-        /// Decode with TAESD instead of the VAE (a ~5 MB .safetensors).
-        ///
-        /// Much smaller and much lighter — a 512 decode drops from 3.4 GB to
-        /// 0.5 — and lossier, so fine detail softens. **SDXL needs `taesdxl`
-        /// and SD 1.5 needs `taesd`**; the two share an architecture, so the
-        /// wrong one loads happily and decodes in visibly wrong colours.
-        #[arg(long)]
-        taesd: Option<String>,
-    },
-
-    /// Generate with Flux (schnell, dev, or flux-mini).
-    ///
-    /// `--model` is a *directory*, not a file. Flux needs four checkpoints —
-    /// transformer, T5, CLIP-L and VAE — plus two tokenizers, and naming each
-    /// on the command line would be six flags nobody can remember. The layout
-    /// is the one `paths_in` expects; run `sdrs flux --model <dir>` and any
-    /// missing file is named in the error.
-    #[command(name = "flux")]
-    Flux {
-        #[arg(long)]
-        model: String,
-
-        #[arg(long)]
-        prompt: String,
-
-        #[arg(long, default_value_t = 4)]
-        steps: usize,
-
-        #[arg(long, default_value_t = 512)]
-        width: usize,
-
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-
-        /// Distilled guidance, *not* a CFG weight. Ignored by schnell, which
-        /// has none; 3.5 is what dev is distilled around.
-        #[arg(long, default_value_t = 3.5)]
-        guidance: f64,
-
-        /// Keep the transformer's blocks in host memory, copying each in as
-        /// it is reached. For a device too small to hold the model.
-        #[arg(long)]
-        stream: bool,
-
-        /// Decode with `madebyollin/taef1` — 16-channel, not `taesd`.
-        #[arg(long)]
-        taesd: Option<String>,
-
-        #[arg(long)]
-        preview_every: Option<usize>,
-
-        #[arg(long, short, default_value = "flux.png")]
-        output: String,
-    },
-
-    /// Generate with SD 3.x.
-    ///
-    /// `--model` is a directory, for the same reason as `flux`: SD 3 needs six
-    /// files. Note `sd3_paths_in` looks for the shared CLIP tokenizer and T5
-    /// alongside in `../flux`, since both architectures use them.
-    #[command(name = "sd3")]
-    Sd3 {
-        #[arg(long)]
-        model: String,
-
-        #[arg(long)]
-        prompt: String,
-
-        #[arg(long, default_value = "")]
-        negative_prompt: String,
-
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
-
-        #[arg(long, default_value_t = 512)]
-        width: usize,
-
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-
-        #[arg(long, default_value_t = 4.5)]
-        cfg_scale: f64,
-
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-
-        /// Run the three text encoders on the CPU. They execute once and then
-        /// hold more memory than the transformer does.
-        #[arg(long)]
-        encoders_on_cpu: bool,
-
-        #[arg(long)]
-        stream: bool,
-
-        /// Decode with `madebyollin/taesd3` — 16-channel, not `taesd`.
-        #[arg(long)]
-        taesd: Option<String>,
-
-        #[arg(long)]
-        preview_every: Option<usize>,
-
-        #[arg(long, short, default_value = "sd3.png")]
-        output: String,
-    },
-
-    /// Place objects by bounding box (GLIGEN).
-    ///
-    /// The only conditioning here that addresses *placement*: text cannot do
-    /// it reliably and a ControlNet needs a picture of the layout. Needs a
-    /// GLIGEN checkpoint, not an ordinary SD 1.5 one.
-    #[command(name = "ground")]
-    Ground {
-        #[arg(long)]
-        model: String,
-
-        #[arg(long)]
-        prompt: String,
-
-        /// `x0,y0,x1,y1=phrase`, coordinates in 0..1 rather than pixels.
-        /// Repeatable.
-        #[arg(long, value_name = "BOX=PHRASE")]
-        r#box: Vec<String>,
-
-        /// Fraction of the schedule to ground for. GLIGEN grounds early and
-        /// finishes free; holding it throughout costs image quality.
-        #[arg(long, default_value_t = 0.3)]
-        grounding_fraction: f64,
-
-        #[arg(long, default_value = "")]
-        negative_prompt: String,
-
-        #[arg(long, default_value_t = 512)]
-        width: usize,
-
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
-
-        #[arg(long, default_value_t = 7.5)]
-        cfg_scale: f64,
-
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-
-        #[arg(long, default_value = "euler_a")]
-        sampler: String,
-
-        #[arg(long, short, default_value = "grounded.png")]
-        output: String,
-    },
-
-    /// Edit an image by instruction: "change the sky to sunset".
-    ///
-    /// Different from img2img, which takes a description of the *result* and a
-    /// strength. This takes a description of the **change**, and holds the
-    /// rest of the image through the model's own conditioning rather than by
-    /// stopping the schedule early.
-    #[command(name = "instruct")]
-    Instruct {
-        /// An InstructPix2Pix checkpoint (8-channel UNet), e.g.
-        /// `timbrooks/instruct-pix2pix`.
-        #[arg(long)]
-        model: String,
-
-        /// The instruction, not a description of the result.
-        #[arg(long)]
-        prompt: String,
-
-        #[arg(long)]
-        init_image: String,
-
-        /// How strongly to keep the source image. 1.5 is the published
-        /// default; higher holds more of the original.
-        #[arg(long, default_value_t = 1.5)]
-        image_guidance: f64,
-
-        #[arg(long, default_value = "")]
-        negative_prompt: String,
-
-        #[arg(long, default_value_t = 512)]
-        width: usize,
-
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
-
-        /// How strongly to follow the instruction. 7.5 is the default.
-        #[arg(long, default_value_t = 7.5)]
-        cfg_scale: f64,
-
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-
-        #[arg(long, default_value = "euler_a")]
-        sampler: String,
-
-        #[arg(long, short, default_value = "edited.png")]
-        output: String,
-    },
-
-    /// Generate a variation of an image: its subject, not its pixels.
-    ///
-    /// Needs an unCLIP checkpoint, e.g.
-    /// `diffusers/stable-diffusion-2-1-unclip-i2i-h`. Unlike img2img, no pixel
-    /// of the reference reaches the model — only a single CLIP embedding of
-    /// the whole image — so the result is composed from scratch and shares the
-    /// subject rather than the layout.
-    #[command(name = "unclip")]
-    Unclip {
-        /// An unCLIP checkpoint: an SD 2.x UNet with a `class_embedding`,
-        /// plus `image_encoder/` and `image_normalizer/`.
-        #[arg(long)]
-        model: String,
-
-        /// The image to take the embedding from. Read at 224x224 whatever
-        /// size the output is.
-        ///
-        /// Omit it to generate from the prompt alone: the checkpoint's prior
-        /// samples an image embedding from the text, which needs a
-        /// text-to-image unCLIP model such as
-        /// `diffusers/stable-diffusion-2-1-unclip-t2i-l`.
-        #[arg(long)]
-        init_image: Option<String>,
-
-        /// Required without --init-image; optional with one, where an empty
-        /// prompt is the usual choice for a pure variation.
-        #[arg(long, default_value = "")]
-        prompt: String,
-
-        /// Denoising steps for the prior. Ignored with --init-image.
-        #[arg(long, default_value_t = 25)]
-        prior_steps: usize,
-
-        /// Guidance for the prior, separate from the image half's. Ignored
-        /// with --init-image.
-        #[arg(long, default_value_t = 4.0)]
-        prior_guidance: f64,
-
-        /// How much noise is mixed into the image embedding, 0..999.
-        ///
-        /// The dial between "this image" and "something like it". 0 is
-        /// tightest and is diffusers' default; a few hundred loosens it.
-        #[arg(long, default_value_t = 0)]
-        noise_level: usize,
-
-        #[arg(long, default_value = "")]
-        negative_prompt: String,
-
-        #[arg(long, default_value_t = 768)]
-        width: usize,
-
-        #[arg(long, default_value_t = 768)]
-        height: usize,
-
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
-
-        /// diffusers' published default, which pairs it with PNDM. With this
-        /// project's euler_a it runs to crushed blacks and hard vignetting
-        /// across every seed tried; 5.0 is warmer and flatter. Stylistic
-        /// rather than broken — try 5.0 if the output looks over-processed.
-        #[arg(long, default_value_t = 10.0)]
-        cfg_scale: f64,
-
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-
-        #[arg(long, default_value = "euler_a")]
-        sampler: String,
-
-        #[arg(long, short, default_value = "variation.png")]
-        output: String,
-    },
-
-    /// Generate with different prompts in different regions.
-    ///
-    /// Each `--region` is `MASK=PROMPT`, where MASK is an image whose white
-    /// area is where the prompt applies. Composed *before* sampling, so the
-    /// regions see each other and the joins are not visible — unlike
-    /// generating separately and compositing.
-    #[command(name = "area")]
-    Area {
-        #[arg(long)]
-        model: String,
-
-        /// The prompt outside every region.
-        #[arg(long)]
-        prompt: String,
-
-        /// `mask.png=a prompt for that area`. Repeatable.
-        #[arg(long, value_name = "MASK=PROMPT")]
-        region: Vec<String>,
-
-        #[arg(long, default_value = "")]
-        negative_prompt: String,
-
-        #[arg(long, default_value_t = 512)]
-        width: usize,
-
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
-
-        #[arg(long, default_value_t = 7.5)]
-        cfg_scale: f64,
-
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-
-        #[arg(long, default_value = "euler_a")]
-        sampler: String,
-
-        #[arg(long, short, default_value = "area.png")]
-        output: String,
-    },
-
-    /// Merge two checkpoints by weighted average.
-    ///
-    /// `(1 - alpha) * a + alpha * b`, tensor by tensor. Only meaningful
-    /// between checkpoints of the same architecture, and mismatches are
-    /// refused rather than skipped — an SD 1.5 and an SDXL share enough tensor
-    /// names to produce a file that loads and renders noise.
-    #[command(name = "merge")]
-    Merge {
-        #[arg(long)]
-        a: String,
-
-        #[arg(long)]
-        b: String,
-
-        /// Weight of --b. 0 is --a exactly, 1 is --b exactly.
-        #[arg(long, default_value_t = 0.5)]
-        alpha: f64,
-
-        /// Carry through tensors only one side has, instead of refusing.
-        #[arg(long)]
-        allow_unmatched: bool,
-
-        #[arg(long, short, default_value = "merged.safetensors")]
-        output: String,
-    },
-
-    /// Upscale an image 4x with Real-ESRGAN.
-    ///
-    /// Runs after generation and knows nothing about it, so it works on any
-    /// image — generated here or not.
-    #[command(name = "upscale")]
-    Upscale {
-        /// The Real-ESRGAN x4 weights as .safetensors.
-        ///
-        /// The published release is a pickled `.pth`; convert it with
-        /// `python3 xtask/golden/dump_reference.py esrgan --output tests/golden`,
-        /// which writes `tests/golden/esrgan/esrgan_x4.safetensors`.
-        #[arg(long)]
-        model: String,
-
-        #[arg(long)]
-        input: String,
-
-        #[arg(long, short, default_value = "upscaled.png")]
-        output: String,
-    },
-
-    /// Generate steered by a ControlNet, from an image's Canny edges.
-    #[command(name = "controlnet")]
-    ControlNet {
-        #[arg(long)]
-        model: String,
-
-        /// The ControlNet checkpoint (a single .safetensors).
-        #[arg(long)]
-        controlnet: String,
-
-        #[arg(long)]
-        prompt: String,
-
-        /// Image whose edges steer the generation. Resized to --width x --height.
-        ///
-        /// Its *shape* is used, not its content: the model sees only the edge
-        /// map. Pass --control-image instead to supply a control map directly.
-        #[arg(long)]
-        init_image: Option<String>,
-
-        /// A ready-made control map (edges, depth, pose), used as-is.
-        #[arg(long, conflicts_with = "init_image")]
-        control_image: Option<String>,
-
-        /// Control strength. 0 is exactly an uncontrolled generation.
+        control_map: Option<String>,
         #[arg(long, default_value_t = 1.0)]
         control_scale: f64,
-
-        /// Canny hysteresis thresholds on normalised gradient magnitude.
-        #[arg(long, default_value_t = 0.1)]
-        canny_low: f32,
-
-        #[arg(long, default_value_t = 0.2)]
-        canny_high: f32,
-
-        /// Also write the control map here, to see what the model was given.
+        /// Textual inversion, as `trigger=path.safetensors`. Repeatable.
         #[arg(long)]
-        save_hint: Option<String>,
-
-        #[arg(long, default_value = "")]
-        negative_prompt: String,
-
-        #[arg(long, default_value_t = 512)]
-        width: usize,
-
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
-
-        #[arg(long, default_value_t = 7.5)]
-        cfg_scale: f64,
-
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-
-        #[arg(long, default_value = "euler_a")]
-        sampler: String,
-
-        #[arg(long, short, default_value = "control.png")]
-        output: String,
+        embedding: Vec<String>,
+        /// AnimateDiff motion adapter, so frames become one motion.
+        #[arg(long, requires = "frames")]
+        motion_adapter: Option<String>,
+        /// Frames per clip. Above 1 writes `out-000.png`, `out-001.png`, ...
+        #[arg(long, default_value_t = 1)]
+        frames: usize,
+        /// Two-pass generation: compose at --width/--height, then refine at
+        /// this size. `1024x1024`, or `1024` for a square.
+        ///
+        /// **Not the same as generating big.** A model composes at its
+        /// training resolution and duplicates subjects above it.
+        #[arg(long, value_name = "WxH")]
+        hires: Option<String>,
+        #[arg(long, default_value_t = 0.55)]
+        hires_strength: f64,
+        /// Reuse the model's prediction while it is estimated not to have
+        /// moved much. 0 disables it. Needs a deterministic sampler.
+        #[arg(long, default_value_t = 0.0)]
+        cache_threshold: f64,
+        /// A region prompt, as `mask.png=a prompt`. Repeatable.
+        #[arg(long)]
+        region: Vec<String>,
+        /// Upscale the result 4x with these Real-ESRGAN weights.
+        #[arg(long)]
+        upscale: Option<String>,
     },
 
-    /// Repaint the masked region of an image, leaving the rest untouched.
-    #[command(name = "inpaint")]
-    Inpaint {
-        #[arg(long)]
-        model: String,
-
-        #[arg(long)]
-        prompt: String,
-
-        /// Source image. Resized to --width x --height.
-        #[arg(long)]
-        init_image: String,
-
-        /// Greyscale mask. **White repaints**, black is kept.
-        #[arg(long)]
-        mask: String,
-
-        /// How much of the schedule to replace inside the mask.
-        #[arg(long, default_value_t = 0.75)]
-        strength: f64,
-
-        #[arg(long, default_value = "")]
-        negative_prompt: String,
-
-        #[arg(long, default_value_t = 512)]
-        width: usize,
-
-        #[arg(long, default_value_t = 512)]
-        height: usize,
-
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
-
-        #[arg(long, default_value_t = 7.5)]
-        cfg_scale: f64,
-
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-
-        #[arg(long, default_value = "euler-a")]
-        sampler: String,
-
-        #[arg(short, long, default_value = "out.png")]
-        output: String,
-    },
-
-    /// Generate an image from a text prompt and an existing image.
+    /// Generate from an existing image.
     #[command(name = "img2img")]
     Img2Img {
         #[arg(long)]
         model: String,
-
+        #[arg(long)]
+        init: String,
         #[arg(long)]
         prompt: String,
-
-        /// Source image. Resized to --width x --height.
-        #[arg(long)]
-        init_image: String,
-
-        /// 0.0 returns the input, 1.0 ignores it.
-        #[arg(long, default_value_t = 0.75)]
-        strength: f64,
-
         #[arg(long, default_value = "")]
         negative_prompt: String,
-
+        /// How much of the schedule to replace. 0 returns the input.
+        #[arg(long, default_value_t = 0.75)]
+        strength: f64,
+        /// Repaint only where this mask is white.
+        #[arg(long)]
+        mask: Option<String>,
         #[arg(long, default_value_t = 512)]
         width: usize,
-
         #[arg(long, default_value_t = 512)]
         height: usize,
-
         #[arg(long, default_value_t = 20)]
         steps: usize,
-
         #[arg(long, default_value_t = 7.5)]
         cfg_scale: f64,
-
         #[arg(long, default_value_t = 42)]
         seed: u64,
-
         #[arg(long, default_value = "euler-a")]
         sampler: String,
-
         #[arg(short, long, default_value = "out.png")]
         output: String,
-
-        /// Treat the model directory as SDXL (two text encoders).
-        #[arg(long)]
-        sdxl: bool,
     },
 
-    /// Report what a GGUF checkpoint contains, without loading it.
-    Inspect {
-        /// Path to a `.gguf` file.
+    /// Upscale an image 4x with Real-ESRGAN.
+    Upscale {
+        /// A model directory, for the pipeline the upscaler runs on.
         #[arg(long)]
-        gguf: String,
-
-        /// Print every metadata key, not just the summary.
+        model: String,
+        /// Real-ESRGAN weights.
         #[arg(long)]
-        verbose: bool,
+        weights: String,
+        #[arg(long)]
+        input: String,
+        #[arg(short, long, default_value = "out.png")]
+        output: String,
     },
 
-    /// Report the active compute device and build configuration.
+    /// Report what is on this machine.
     Info,
 }
 
-/// A progress callback that logs and, every `every` steps, writes a preview.
-///
-/// A preview failure is reported and swallowed: a run that has spent two
-/// minutes denoising should not die because a directory is read-only.
-fn previewing<'a>(
-    pipeline: &'a Txt2ImgPipeline,
-    every: Option<usize>,
-    output: &'a str,
-) -> impl FnMut(sd::pipeline::Progress) + 'a {
-    previewing_with(move |t| pipeline.preview(t), every, output)
+#[allow(clippy::too_many_arguments)]
+fn config(
+    prompt: &str,
+    negative: &str,
+    width: usize,
+    height: usize,
+    steps: usize,
+    cfg_scale: f64,
+    seed: u64,
+    sampler: &str,
+) -> Result<Txt2ImgConfig> {
+    Ok(Txt2ImgConfig {
+        prompt: prompt.to_string(),
+        negative_prompt: negative.to_string(),
+        width,
+        height,
+        steps,
+        cfg_scale,
+        seed,
+        sampler: mlx_cli::parse_sampler(sampler)?,
+    })
 }
 
-/// The SDXL twin. The two pipelines share no trait, and inventing one for a
-/// single method would be more machinery than the duplication it removes.
-fn previewing_sdxl<'a>(
-    pipeline: &'a sd::pipeline::SdxlPipeline,
-    every: Option<usize>,
-    output: &'a str,
-) -> impl FnMut(sd::pipeline::Progress) + 'a {
-    previewing_with(move |t| pipeline.preview(t), every, output)
+/// Split `a=b` on its **first** `=`, so a prompt may contain one.
+fn split_pair(spec: &str) -> Result<(String, String)> {
+    spec.split_once('=')
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .with_context(|| format!("{spec:?} should be `key=value`"))
 }
-
-fn previewing_with<'a, F>(
-    decode: F,
-    every: Option<usize>,
-    output: &'a str,
-) -> impl FnMut(sd::pipeline::Progress) + 'a
-where
-    F: Fn(&sd_tensor::Tensor) -> Result<sd_tensor::Tensor, sd::pipeline::PipelineError> + 'a,
-{
-    move |p: sd::pipeline::Progress| {
-        tracing::info!(
-            step = p.step,
-            total = p.total,
-            // What the cache actually bought, exactly rather than by
-            // stopwatch: equal to `step` when caching is off.
-            evaluated = p.evaluated,
-            sigma = format!("{:.3}", p.sigma),
-            "denoise"
-        );
-        let Some(n) = every.filter(|n| *n > 0) else {
-            return;
-        };
-        if p.step % n != 0 && p.step != p.total {
-            return;
-        }
-        let path = preview_path(output, p.step);
-        let wrote = decode(p.denoised)
-            .map_err(anyhow::Error::from)
-            .and_then(|img| Ok(sd::image_io::save_png(&img, &path)?));
-        match wrote {
-            Ok(()) => tracing::info!(step = p.step, path = %path, "preview"),
-            Err(e) => tracing::warn!(step = p.step, error = %e, "preview failed"),
-        }
-    }
-}
-
-/// The progress callback for Flux and SD 3.
-///
-/// Generic over the pipeline because the two share no trait and the only thing
-/// wanted from either is `preview`; a trait for one method would be more
-/// machinery than the duplication it removes.
-fn flow_progress<'a, P, F>(
-    pipeline: &'a P,
-    every: Option<usize>,
-    output: &'a str,
-    preview: F,
-) -> impl FnMut(sd::pipeline::Progress) + 'a
-where
-    F: Fn(&'a P, &sd_tensor::Tensor) -> Result<sd_tensor::Tensor, sd::pipeline::PipelineError> + 'a,
-{
-    previewing_with(move |t| preview(pipeline, t), every, output)
-}
-
-/// Where a step preview is written: `out.png` -> `out-preview-005.png`.
-fn preview_path(output: &str, step: usize) -> String {
-    let p = Path::new(output);
-    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("preview");
-    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("png");
-    let name = format!("{stem}-preview-{step:03}.{ext}");
-    match p.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name).to_string_lossy().into_owned(),
-        _ => name,
-    }
-}
-
-/// Attach TAESD if asked, so the three txt2img branches share one line.
-fn with_taesd(pipeline: Txt2ImgPipeline, path: Option<&str>) -> anyhow::Result<Txt2ImgPipeline> {
-    match path {
-        Some(p) => {
-            tracing::info!(taesd = %p, "decoding with TAESD");
-            pipeline
-                .with_taesd(Path::new(p))
-                .with_context(|| format!("loading TAESD from {p}"))
-        }
-        None => Ok(pipeline),
-    }
-}
-
-/// `1024x768`, or `1024` for a square.
-fn parse_size(spec: &str) -> anyhow::Result<(usize, usize)> {
-    let (w, h) = match spec.split_once(['x', 'X']) {
-        Some((a, b)) => (a, b),
-        None => (spec, spec),
-    };
-    let parse = |v: &str| -> anyhow::Result<usize> {
-        v.trim()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("`{spec}` is not a size like 1024 or 1024x768"))
-    };
-    Ok((parse(w)?, parse(h)?))
-}
-
-fn parse_upscale(name: &str) -> anyhow::Result<sd::pipeline::Upscale> {
-    use sd::pipeline::Upscale;
-    match name {
-        "latent-nearest" => Ok(Upscale::LatentNearest),
-        "latent-bilinear" => Ok(Upscale::LatentBilinear),
-        "pixel-lanczos" => Ok(Upscale::PixelLanczos),
-        other => anyhow::bail!(
-            "unknown --hires-upscale `{other}`; expected latent-nearest, \
-             latent-bilinear or pixel-lanczos"
-        ),
-    }
-}
-
-fn parse_sampler(name: &str) -> Result<SamplerKind> {
-    match name {
-        "euler-a" | "euler_a" | "euler" => Ok(SamplerKind::EulerAncestral),
-        "dpmpp2m" | "dpm++2m" | "dpmpp-2m" => Ok(SamplerKind::DpmPlusPlus2M),
-        "lcm" => Ok(SamplerKind::Lcm),
-        other => anyhow::bail!(
-            "unknown sampler {other:?}; expected 'euler-a', 'dpmpp2m' or 'lcm'.\n\
-             'lcm' needs an LCM-distilled model or --lora, 4-8 steps, and --cfg-scale near 1."
-        ),
-    }
-}
-
-/// The MLX command line.
-#[cfg(feature = "mlx")]
-mod mlx_cli;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sd=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
-    let dev = if cli.cpu {
-        device::cpu()
-    } else {
-        device::best().context("selecting compute device")?
-    };
-
-    match cli.command {
-        Command::Inspect { gguf, verbose } => {
-            // Header only — no tensor data is read, so this is instant even
-            // for a checkpoint of several gigabytes.
-            let info =
-                sd::loader::GgufInfo::open(&gguf).with_context(|| format!("reading {gguf}"))?;
-            println!("file:         {}", info.path.display());
-            println!(
-                "architecture: {}",
-                info.architecture().unwrap_or("(not declared)")
-            );
-            println!("tensors:      {}", info.tensors.len());
-            println!("parameters:   {:.2} M", info.parameter_count() as f64 / 1e6);
-            // The number that matters before loading: there is no quantised
-            // inference path, so a 4-bit file costs what its expanded weights
-            // cost, not what the file does.
-            println!(
-                "as f32:       {:.2} GB in memory once dequantised",
-                info.dequantised_bytes(DType::F32) as f64 / 1e9
-            );
-            println!("quantisation:");
-            for (dtype, count) in info.quantisations() {
-                println!("  {count:>6} x {dtype:?}");
-            }
-            if verbose {
-                println!("metadata:");
-                if info.metadata.is_empty() {
-                    // Not hypothetical: stable-diffusion.cpp writes none.
-                    println!("  (none — the file declares nothing about itself)");
-                } else {
-                    let mut keys: Vec<_> = info.metadata.keys().collect();
-                    keys.sort();
-                    for k in keys {
-                        println!("  {k}");
-                    }
-                }
-                // Grouped by top-level prefix: 1131 individual names is not
-                // something anyone reads, but the prefixes say what is inside.
-                println!("tensor name prefixes:");
-                let mut groups: std::collections::BTreeMap<String, usize> = Default::default();
-                for name in info.tensors.keys() {
-                    let prefix: String = name.split('.').take(2).collect::<Vec<_>>().join(".");
-                    *groups.entry(prefix).or_default() += 1;
-                }
-                for (prefix, count) in groups {
-                    println!("  {count:>6}  {prefix}.*");
-                }
-            }
-        }
-
-        Command::Info => {
-            println!("stable-diffusion.rs {}", sd::VERSION);
-            println!("device:  {dev:?}");
-            println!(
-                "backends: cpu{}{}",
-                if cfg!(feature = "cuda") { ", cuda" } else { "" },
-                if cfg!(feature = "metal") {
-                    ", metal"
-                } else {
-                    ""
-                },
-            );
-        }
-
-        Command::Decode {
-            vae,
-            latent,
-            output,
-            raw,
-        } => {
-            let cfg = VaeConfig::sd15();
-            let vb = sd::loader::safetensors_var_builder(&[&vae], DType::F32, &dev)
-                .with_context(|| format!("loading VAE weights from {vae}"))?;
-            let decoder = AutoencoderKlDecoder::new(&cfg, vb).context("building VAE decoder")?;
-
-            let tensors = sd_tensor::safetensors::load(&latent, &dev)
-                .with_context(|| format!("loading latent from {latent}"))?;
-            let z = tensors
-                .get("latent")
-                .with_context(|| format!("{latent} has no tensor named 'latent'"))?
-                .to_dtype(DType::F32)?;
-
-            tracing::info!(shape = ?z.dims(), "decoding latent");
-            let img: Tensor = if raw {
-                decoder.decode_raw(&z)?
-            } else {
-                decoder.decode(&z)?
-            };
-
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            println!("wrote {output}");
-        }
-
+    match Cli::parse().command {
         Command::Txt2Img {
             model,
-            gguf,
-            tokenizer,
             prompt,
             negative_prompt,
             width,
@@ -1017,840 +199,66 @@ fn main() -> Result<()> {
             sdxl,
             lora,
             lora_scale,
-            cache_threshold,
+            controlnet,
+            control_map,
+            control_scale,
+            embedding,
             motion_adapter,
             frames,
             hires,
             hires_strength,
-            hires_upscale,
-            embedding,
-            ip_adapter,
-            ip_image,
-            image_encoder,
-            ip_scale,
-            seamless,
-            preview_every,
-            taesd,
+            cache_threshold,
+            region,
+            upscale,
         } => {
-            // **MLX is the backend when the feature is on.** The candle path
-            // below stays for as long as both exist; the flags mean the same
-            // thing either way, because they describe generation rather than a
-            // backend.
-            #[cfg(feature = "mlx")]
-            {
-                let cfg = sd::pipeline::Txt2ImgConfig {
-                    prompt: prompt.clone(),
-                    negative_prompt: negative_prompt.clone(),
-                    width,
-                    height,
-                    steps,
-                    cfg_scale,
-                    seed,
-                    sampler: mlx_cli::parse_sampler(&sampler)?,
-                    ..Default::default()
-                };
-                let hires_parsed = match &hires {
+            let cfg = config(
+                &prompt,
+                &negative_prompt,
+                width,
+                height,
+                steps,
+                cfg_scale,
+                seed,
+                &sampler,
+            )?;
+            let args = mlx_cli::Txt2ImgArgs {
+                model,
+                cfg,
+                output,
+                sdxl,
+                lora: lora.map(|p| (p, lora_scale)),
+                controlnet: match (controlnet, control_map) {
+                    (Some(w), Some(m)) => vec![(w, m, control_scale)],
+                    _ => Vec::new(),
+                },
+                embeddings: embedding
+                    .iter()
+                    .map(|s| split_pair(s))
+                    .collect::<Result<Vec<_>>>()?,
+                motion: motion_adapter.map(|p| (p, frames)),
+                hires: match &hires {
                     Some(spec) => Some((mlx_cli::parse_size(spec)?, hires_strength)),
                     None => None,
-                };
-                let args = mlx_cli::Txt2ImgArgs {
-                    model: model.clone().unwrap_or_default(),
-                    cfg,
-                    output: output.clone(),
-                    sdxl,
-                    lora: lora.clone().map(|p| (p, lora_scale)),
-                    controlnet: Vec::new(),
-                    embeddings: embedding
-                        .iter()
-                        .filter_map(|spec| {
-                            spec.split_once('=')
-                                .map(|(a, b)| (a.to_string(), b.to_string()))
-                        })
-                        .collect(),
-                    motion: motion_adapter.clone().map(|p| (p, frames)),
-                    hires: hires_parsed,
-                    cache_threshold,
-                    regions: Vec::new(),
-                    upscale: None,
-                };
-                let written = mlx_cli::run_txt2img(&args)?;
-                for path in &written {
-                    println!("wrote {}", path.display());
-                }
-                return Ok(());
-            }
-            #[allow(unreachable_code)]
-            let cfg = Txt2ImgConfig {
-                prompt,
-                negative_prompt,
-                width,
-                height,
-                steps,
-                cfg_scale,
-                seed,
-                sampler: parse_sampler(&sampler)?,
-                frames: frames.max(1),
-                cache_threshold: cache_threshold.max(0.0),
-                cancel: None,
-            };
-
-            // Held for the whole generation: the mode is read by every
-            // convolution and reverts when this drops.
-            let _tiling = match seamless.as_deref() {
-                None => None,
-                Some(axes) => {
-                    let (x, y) = (axes.contains('x'), axes.contains('y'));
-                    if !x && !y {
-                        anyhow::bail!("--seamless takes x, y or xy, got `{axes}`");
-                    }
-                    tracing::info!(wrap_x = x, wrap_y = y, "seamless");
-                    Some(sd_tensor::conv::seamless(x, y))
-                }
-            };
-
-            let source = gguf.clone().or_else(|| model.clone()).unwrap_or_default();
-            tracing::info!(model = %source, sdxl, gguf = gguf.is_some(), "loading pipeline");
-            let started = std::time::Instant::now();
-            // Each branch builds its own callback: it borrows that branch's
-            // pipeline, so it can decode a preview. A 20-step CPU run takes
-            // minutes, and without per-step output it looks hung.
-            let img = match (gguf.as_deref(), sdxl) {
-                (Some(_), true) => {
-                    anyhow::bail!("--gguf is SD 1.5 only; SDXL GGUF checkpoints are not supported")
-                }
-                (Some(g), false) => {
-                    let tok = tokenizer.as_deref().expect("clap requires it with --gguf");
-                    let pipeline = Txt2ImgPipeline::load_gguf(Path::new(g), Path::new(tok), &dev)
-                        .with_context(|| format!("loading pipeline from {g}"))?;
-                    let pipeline = with_taesd(pipeline, taesd.as_deref())?;
-                    let mut report = previewing(&pipeline, preview_every, &output);
-                    pipeline
-                        .run_with_progress(&cfg, &mut report)
-                        .context("running txt2img from gguf")?
-                }
-                (None, true) => {
-                    let m = model.as_deref().context("--model or --gguf is required")?;
-                    let pipeline = sd::pipeline::SdxlPipeline::load(Path::new(m), &dev)
-                        .with_context(|| format!("loading SDXL pipeline from {m}"))?;
-                    let pipeline = match taesd.as_deref() {
-                        Some(p) => {
-                            tracing::info!(taesd = %p, "decoding with TAESD");
-                            pipeline
-                                .with_taesd(Path::new(p))
-                                .with_context(|| format!("loading TAESD from {p}"))?
-                        }
-                        None => pipeline,
-                    };
-                    let mut report = previewing_sdxl(&pipeline, preview_every, &output);
-                    pipeline
-                        .run_with_progress(&cfg, &mut report)
-                        .context("running SDXL txt2img")?
-                }
-                (None, false) => {
-                    let m = model.as_deref().context("--model or --gguf is required")?;
-                    let pipeline = match lora.as_deref() {
-                        Some(l) => {
-                            tracing::info!(lora = %l, scale = lora_scale, "merging LoRA");
-                            Txt2ImgPipeline::load_with_lora(
-                                Path::new(m),
-                                &dev,
-                                Path::new(l),
-                                lora_scale,
-                            )
-                            .with_context(|| format!("loading {m} with LoRA {l}"))?
-                        }
-                        None if motion_adapter.is_some() => {
-                            let a = motion_adapter.as_deref().expect("checked");
-                            if frames <= 1 {
-                                tracing::warn!(
-                                    "--motion-adapter with --frames 1: temporal attention over \
-                                     a sequence of one is close to inert"
-                                );
-                            }
-                            tracing::info!(adapter = %a, frames, "motion adapter");
-                            Txt2ImgPipeline::load_with_motion_adapter(
-                                Path::new(m),
-                                &dev,
-                                Path::new(a),
-                            )
-                            .with_context(|| format!("loading {m} with motion adapter {a}"))?
-                        }
-                        None => match (&ip_adapter, &image_encoder) {
-                            (Some(a), Some(e)) => {
-                                tracing::info!(adapter = %a, scale = ip_scale, "IP-Adapter");
-                                Txt2ImgPipeline::load_with_ip_adapter(
-                                    Path::new(m),
-                                    &dev,
-                                    Path::new(a),
-                                    Path::new(e),
-                                )
-                                .with_context(|| format!("loading {m} with IP-Adapter {a}"))?
-                            }
-                            (None, None) => Txt2ImgPipeline::load(Path::new(m), &dev)
-                                .with_context(|| format!("loading pipeline from {m}"))?,
-                            _ => anyhow::bail!(
-                                "--ip-adapter and --image-encoder must be given together"
-                            ),
-                        },
-                    };
-                    let pipeline = with_taesd(pipeline, taesd.as_deref())?;
-                    let pipeline = embedding.iter().try_fold(pipeline, |p, e| {
-                        tracing::info!(embedding = %e, "textual inversion");
-                        p.with_embedding(Path::new(e))
-                            .with_context(|| format!("loading embedding {e}"))
-                    })?;
-                    let mut report = previewing(&pipeline, preview_every, &output);
-                    match ip_image.as_deref() {
-                        Some(path) if pipeline.has_ip_adapter() => {
-                            // 224 is the tower's input size; [0, 1] is its
-                            // range; and the shortest edge is scaled to it and
-                            // the rest cropped away, which is what CLIP's own
-                            // preprocessing does.
-                            let image = sd::image_io::load_clip_square(path, 224, &dev)
-                                .with_context(|| format!("reading {path}"))?;
-                            let cond = pipeline
-                                .encode_conditioning_with_image(
-                                    &cfg.prompt,
-                                    &cfg.negative_prompt,
-                                    &image,
-                                )
-                                .context("encoding the reference image")?;
-                            // Held for the run: the strength reaches sixteen
-                            // attention layers and reverts on drop.
-                            let _scale = sd::models::unet::ip::with_scale(ip_scale);
-                            pipeline
-                                .run_conditioned(&cfg, &[cond], &mut |_, _| 0, None, &mut report)
-                                .context("running txt2img with IP-Adapter")?
-                                .0
-                        }
-                        Some(_) => anyhow::bail!("--ip-image needs --ip-adapter"),
-                        None if pipeline.has_ip_adapter() => {
-                            anyhow::bail!("--ip-adapter needs --ip-image")
-                        }
-                        None => match &hires {
-                            Some(spec) => {
-                                let (hw, hh) = parse_size(spec)?;
-                                tracing::info!(
-                                    from = format!("{}x{}", cfg.width, cfg.height),
-                                    to = format!("{hw}x{hh}"),
-                                    strength = hires_strength,
-                                    "hires"
-                                );
-                                let hcfg = sd::pipeline::HiresConfig {
-                                    base: cfg.clone(),
-                                    width: hw,
-                                    height: hh,
-                                    strength: Strength::new(hires_strength),
-                                    upscale: parse_upscale(&hires_upscale)?,
-                                };
-                                pipeline
-                                    .run_hires_with_progress(&hcfg, &mut report)
-                                    .context("running hires")?
-                            }
-                            None => pipeline
-                                .run_with_progress(&cfg, &mut report)
-                                .context("running txt2img")?,
-                        },
-                    }
-                }
-            };
-
-            let written = sd::image_io::save_batch(&img, &output)
-                .with_context(|| format!("writing {output}"))?;
-            match written.len() {
-                1 => println!("wrote {} in {:.1?}", written[0], started.elapsed()),
-                n => println!(
-                    "wrote {n} frames, {} .. {}, in {:.1?}",
-                    written[0],
-                    written[n - 1],
-                    started.elapsed()
-                ),
-            }
-        }
-
-        Command::Flux {
-            model,
-            prompt,
-            steps,
-            width,
-            height,
-            seed,
-            guidance,
-            stream,
-            taesd,
-            preview_every,
-            output,
-        } => {
-            use sd::pipeline::{FluxConfigRun, FluxPipeline, Placement};
-            let paths = sd::pipeline::paths_in(Path::new(&model));
-            // Read the geometry from the checkpoint rather than assuming:
-            // schnell and dev are 19/38 blocks, flux-mini 5/10.
-            let cfg_model = if paths.transformer.extension().is_some_and(|e| e == "gguf") {
-                let (d, sgl) = sd::loader::flux_block_counts(&paths.transformer)?;
-                let guidance = sd::loader::flux_has_guidance(&paths.transformer)?;
-                tracing::info!(double = d, single = sgl, guidance, "checkpoint geometry");
-                sd::models::flux::FluxConfig {
-                    depth: d,
-                    depth_single_blocks: sgl,
-                    guidance_embed: guidance,
-                    ..sd::models::flux::FluxConfig::mini()
-                }
-            } else {
-                sd::models::flux::FluxConfig::mini()
-            };
-            let mut placement = Placement::on(&dev);
-            if stream {
-                placement = placement.with_streamed_diffusion();
-            }
-            let started = std::time::Instant::now();
-            let pipe = FluxPipeline::load_with_placement(&paths, &cfg_model, &placement)
-                .with_context(|| format!("loading Flux from {model}"))?;
-            let pipe = match taesd.as_deref() {
-                Some(p) => pipe
-                    .with_taesd(Path::new(p))
-                    .with_context(|| format!("loading TAESD from {p}"))?,
-                None => pipe,
-            };
-            tracing::info!(elapsed = ?started.elapsed(), "loaded");
-
-            let cfg = FluxConfigRun {
-                prompt,
-                width,
-                height,
-                steps,
-                guidance,
-                seed,
-            };
-            let t1 = std::time::Instant::now();
-            let mut report = flow_progress(&pipe, preview_every, &output, |p, t| p.preview(t));
-            let img = pipe
-                .run_with_progress(&cfg, &mut report)
-                .context("running Flux")?;
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            tracing::info!(elapsed = ?t1.elapsed(), output = %output, "done");
-        }
-
-        Command::Sd3 {
-            model,
-            prompt,
-            negative_prompt,
-            steps,
-            width,
-            height,
-            cfg_scale,
-            seed,
-            encoders_on_cpu,
-            stream,
-            taesd,
-            preview_every,
-            output,
-        } => {
-            use sd::pipeline::{Placement, Sd3Pipeline, Sd3RunConfig};
-            let paths = sd::pipeline::sd3_paths_in(Path::new(&model));
-            let mut placement = if encoders_on_cpu {
-                Placement::on(&dev).with_text_encoders_on(&sd_tensor::Device::Cpu)
-            } else {
-                Placement::on(&dev)
-            };
-            if stream {
-                placement = placement.with_streamed_diffusion();
-            }
-            let started = std::time::Instant::now();
-            let pipe = Sd3Pipeline::load_with_placement(
-                &paths,
-                &sd::models::sd3::Sd3Config::medium_35(),
-                &placement,
-            )
-            .with_context(|| format!("loading SD 3 from {model}"))?;
-            let pipe = match taesd.as_deref() {
-                Some(p) => pipe
-                    .with_taesd(Path::new(p))
-                    .with_context(|| format!("loading TAESD from {p}"))?,
-                None => pipe,
-            };
-            tracing::info!(elapsed = ?started.elapsed(), "loaded");
-
-            let cfg = Sd3RunConfig {
-                prompt,
-                negative_prompt,
-                width,
-                height,
-                steps,
-                cfg_scale,
-                seed,
-            };
-            let t1 = std::time::Instant::now();
-            let mut report = flow_progress(&pipe, preview_every, &output, |p, t| p.preview(t));
-            let img = pipe
-                .run_with_progress(&cfg, &mut report)
-                .context("running SD 3")?;
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            tracing::info!(elapsed = ?t1.elapsed(), output = %output, "done");
-        }
-
-        Command::Ground {
-            model,
-            prompt,
-            r#box,
-            grounding_fraction,
-            negative_prompt,
-            width,
-            height,
-            steps,
-            cfg_scale,
-            seed,
-            sampler,
-            output,
-        } => {
-            let boxes = r#box
-                .iter()
-                .map(|spec| {
-                    let (coords, phrase) = spec.split_once('=').ok_or_else(|| {
-                        anyhow::anyhow!("--box wants x0,y0,x1,y1=phrase, got `{spec}`")
-                    })?;
-                    let v: Vec<f32> = coords
-                        .split(',')
-                        .map(|c| c.trim().parse::<f32>())
-                        .collect::<Result<_, _>>()
-                        .map_err(|_| anyhow::anyhow!("`{coords}` is not four numbers"))?;
-                    let bbox: [f32; 4] = v.try_into().map_err(|_| {
-                        anyhow::anyhow!("a box is four numbers in 0..1, got `{coords}`")
-                    })?;
-                    if bbox.iter().any(|c| !(0.0..=1.0).contains(c)) {
-                        anyhow::bail!("box coordinates are relative (0..1), got `{coords}`");
-                    }
-                    tracing::info!(bbox = ?bbox, phrase = %phrase, "grounded box");
-                    Ok(sd::pipeline::GroundedBox {
-                        bbox,
-                        phrase: phrase.to_string(),
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-
-            let cfg = sd::pipeline::GroundingConfig {
-                base: Txt2ImgConfig {
-                    prompt,
-                    negative_prompt,
-                    width,
-                    height,
-                    steps,
-                    cfg_scale,
-                    seed,
-                    sampler: parse_sampler(&sampler)?,
-                    frames: 1,
-                    cache_threshold: 0.0,
-                    cancel: None,
                 },
-                boxes,
-                grounding_fraction,
+                cache_threshold,
+                regions: region
+                    .iter()
+                    .map(|s| split_pair(s))
+                    .collect::<Result<Vec<_>>>()?,
+                upscale,
             };
-            let started = std::time::Instant::now();
-            let mut report = |p: sd::pipeline::Progress| {
-                tracing::info!(step = p.step, total = p.total, "denoise");
-            };
-            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                .with_context(|| format!("loading pipeline from {model}"))?;
-            let img = pipeline
-                .run_grounded_with_progress(&cfg, &mut report)
-                .context("running grounded generation")?;
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
-        }
-
-        Command::Instruct {
-            model,
-            prompt,
-            init_image,
-            image_guidance,
-            negative_prompt,
-            width,
-            height,
-            steps,
-            cfg_scale,
-            seed,
-            sampler,
-            output,
-        } => {
-            let cfg = sd::pipeline::InstructConfig {
-                base: Txt2ImgConfig {
-                    prompt,
-                    negative_prompt,
-                    width,
-                    height,
-                    steps,
-                    cfg_scale,
-                    seed,
-                    sampler: parse_sampler(&sampler)?,
-                    frames: 1,
-                    cache_threshold: 0.0,
-                    cancel: None,
-                },
-                init_image: std::path::PathBuf::from(&init_image),
-                image_guidance,
-            };
-            tracing::info!(model = %model, init = %init_image, image_guidance, "instruct");
-            let started = std::time::Instant::now();
-            let mut report = |p: sd::pipeline::Progress| {
-                tracing::info!(step = p.step, total = p.total, "denoise");
-            };
-            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                .with_context(|| format!("loading pipeline from {model}"))?;
-            let img = pipeline
-                .run_instruct_with_progress(&cfg, &mut report)
-                .context("running instruct")?;
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
-        }
-
-        Command::Unclip {
-            model,
-            init_image,
-            prompt,
-            prior_steps,
-            prior_guidance,
-            noise_level,
-            negative_prompt,
-            width,
-            height,
-            steps,
-            cfg_scale,
-            seed,
-            sampler,
-            output,
-        } => {
-            if init_image.is_none() && prompt.is_empty() {
-                anyhow::bail!(
-                    "unclip needs either --init-image or a --prompt to build an image \
-                     embedding from"
-                );
+            for path in mlx_cli::run_txt2img(&args)? {
+                println!("wrote {}", path.display());
             }
-            let cfg = sd::pipeline::UnclipConfig {
-                base: Txt2ImgConfig {
-                    prompt,
-                    negative_prompt,
-                    width,
-                    height,
-                    steps,
-                    cfg_scale,
-                    seed,
-                    sampler: parse_sampler(&sampler)?,
-                    frames: 1,
-                    cache_threshold: 0.0,
-                    cancel: None,
-                },
-                init_image: init_image.as_deref().map(std::path::PathBuf::from),
-                prior_steps,
-                prior_guidance,
-                noise_level,
-            };
-            tracing::info!(
-                model = %model,
-                init = init_image.as_deref().unwrap_or("<prior>"),
-                noise_level,
-                "unclip"
-            );
-            let started = std::time::Instant::now();
-            let mut report = |p: sd::pipeline::Progress| {
-                tracing::info!(step = p.step, total = p.total, "denoise");
-            };
-            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                .with_context(|| format!("loading pipeline from {model}"))?;
-            // Only when it is needed: the prior is a second diffusion model
-            // and 4.6 GB, and an image-variation run never touches it.
-            let pipeline = match init_image {
-                Some(_) => pipeline,
-                None => pipeline
-                    .with_prior(Path::new(&model))
-                    .with_context(|| format!("attaching the prior from {model}"))?,
-            };
-            let img = pipeline
-                .run_unclip_with_progress(&cfg, &mut report)
-                .context("running unclip")?;
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
-        }
-
-        Command::Area {
-            model,
-            prompt,
-            region,
-            negative_prompt,
-            width,
-            height,
-            steps,
-            cfg_scale,
-            seed,
-            sampler,
-            output,
-        } => {
-            if region.is_empty() {
-                anyhow::bail!("--area needs at least one --region MASK=PROMPT");
-            }
-            let started = std::time::Instant::now();
-            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                .with_context(|| format!("loading pipeline from {model}"))?;
-
-            let base = Txt2ImgConfig {
-                prompt,
-                negative_prompt,
-                width,
-                height,
-                steps,
-                cfg_scale,
-                seed,
-                sampler: parse_sampler(&sampler)?,
-                frames: 1,
-                cache_threshold: 0.0,
-                cancel: None,
-            };
-            let regions = region
-                .iter()
-                .map(|spec| {
-                    let (mask_path, text) = spec.split_once('=').ok_or_else(|| {
-                        anyhow::anyhow!("--region wants MASK=PROMPT, got `{spec}`")
-                    })?;
-                    // White is where the prompt applies, matching the inpaint
-                    // mask convention rather than inventing a second one.
-                    let mask =
-                        sd::image_io::load_mask(mask_path, width as u32, height as u32, &dev)
-                            .with_context(|| format!("reading {mask_path}"))?;
-                    tracing::info!(mask = %mask_path, prompt = %text, "region");
-                    Ok(sd::pipeline::Region {
-                        mask,
-                        conditioning: pipeline.encode_conditioning(text, &base.negative_prompt)?,
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-
-            let mut report = |p: sd::pipeline::Progress| {
-                tracing::info!(step = p.step, total = p.total, "denoise");
-            };
-            let img = pipeline
-                .run_area_with_progress(&sd::pipeline::AreaConfig { base, regions }, &mut report)
-                .context("running area conditioning")?;
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
-        }
-
-        Command::Merge {
-            a,
-            b,
-            alpha,
-            allow_unmatched,
-            output,
-        } => {
-            // On the CPU regardless of the active device: this is file
-            // arithmetic, and moving gigabytes onto an accelerator to add them
-            // pays a transfer for no gain.
-            let cpu = sd_tensor::Device::Cpu;
-            let left = sd_tensor::safetensors::load(Path::new(&a), &cpu)
-                .with_context(|| format!("reading {a}"))?;
-            let right = sd_tensor::safetensors::load(Path::new(&b), &cpu)
-                .with_context(|| format!("reading {b}"))?;
-            tracing::info!(a = %a, b = %b, alpha, "merging");
-
-            let (merged, report) = sd::loader::merge::merge(
-                &left,
-                &right,
-                &sd::loader::merge::MergeOptions {
-                    alpha,
-                    allow_unmatched,
-                },
-            )
-            .context("merging")?;
-
-            sd_tensor::safetensors::save(&merged, Path::new(&output))
-                .with_context(|| format!("writing {output}"))?;
-            tracing::info!(
-                blended = report.blended,
-                carried = report.carried,
-                output = %output,
-                "done"
-            );
-        }
-
-        Command::Upscale {
-            model,
-            input,
-            output,
-        } => {
-            // [0, 1], not [-1, 1]: Real-ESRGAN was trained on the unsigned
-            // range, unlike everything else here.
-            let image = sd::image_io::load_rgb_unit(&input, &dev)
-                .with_context(|| format!("reading {input}"))?;
-            // ESRGAN takes the unsigned range, which is why the loader hands
-            // back a `UnitImage` rather than a bare tensor.
-            let tensor = image.tensor();
-            let (_, _, h, w) = tensor.dims4()?;
-
-            tracing::info!(
-                from = format!("{w}x{h}"),
-                to = format!("{}x{}", w * 4, h * 4),
-                "upscaling"
-            );
-            let started = std::time::Instant::now();
-            let vb = sd::loader::safetensors_var_builder(
-                &[Path::new(&model)],
-                sd_tensor::DType::F32,
-                &dev,
-            )
-            .with_context(|| format!("loading Real-ESRGAN from {model}"))?;
-            let net = sd::models::esrgan::RealEsrgan::new(vb).context("building Real-ESRGAN")?;
-            let out = net.upscale_tiled(tensor).context("upscaling")?;
-
-            // Back to the [-1, 1] convention save_png expects.
-            let signed = ((out * 2.0)? - 1.0)?;
-            sd::image_io::save_png(&signed, &output)
-                .with_context(|| format!("writing {output}"))?;
-            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
-        }
-
-        Command::ControlNet {
-            model,
-            controlnet,
-            prompt,
-            init_image,
-            control_image,
-            control_scale,
-            canny_low,
-            canny_high,
-            save_hint,
-            negative_prompt,
-            width,
-            height,
-            steps,
-            cfg_scale,
-            seed,
-            sampler,
-            output,
-        } => {
-            let hint = match (&init_image, &control_image) {
-                (Some(src), None) => sd::canny::hint_from_image(
-                    src,
-                    width as u32,
-                    height as u32,
-                    canny_low,
-                    canny_high,
-                    &dev,
-                )
-                .with_context(|| format!("detecting edges in {src}"))?,
-                (None, Some(src)) => {
-                    // A prepared map arrives in [0, 1] as an image; load_image
-                    // gives [-1, 1], so rescale rather than re-deriving it.
-                    let img = sd::image_io::load_image(src, width as u32, height as u32, &dev)
-                        .with_context(|| format!("reading {src}"))?;
-                    ((img + 1.0)? * 0.5)?
-                }
-                _ => anyhow::bail!("pass exactly one of --init-image or --control-image"),
-            };
-            if let Some(path) = &save_hint {
-                // Written through the [-1, 1] convention save_png expects.
-                let visible = ((&hint * 2.0)? - 1.0)?;
-                sd::image_io::save_png(&visible, path)
-                    .with_context(|| format!("writing {path}"))?;
-                tracing::info!(path = %path, "wrote control map");
-            }
-
-            let cfg = sd::pipeline::ControlConfig {
-                base: Txt2ImgConfig {
-                    prompt,
-                    negative_prompt,
-                    width,
-                    height,
-                    steps,
-                    cfg_scale,
-                    seed,
-                    sampler: parse_sampler(&sampler)?,
-                    frames: 1,
-                    cache_threshold: 0.0,
-                    cancel: None,
-                },
-                controls: vec![sd::pipeline::Control {
-                    hint,
-                    scale: control_scale,
-                }],
-            };
-            tracing::info!(model = %model, controlnet = %controlnet, scale = control_scale, "controlnet");
-            let started = std::time::Instant::now();
-            let mut report = |p: sd::pipeline::Progress| {
-                tracing::info!(
-                    step = p.step,
-                    total = p.total,
-                    sigma = format!("{:.3}", p.sigma),
-                    "denoise"
-                );
-            };
-            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                .with_context(|| format!("loading pipeline from {model}"))?
-                .with_controlnet(Path::new(&controlnet))
-                .with_context(|| format!("loading ControlNet from {controlnet}"))?;
-            let img = pipeline
-                .run_control_with_progress(&cfg, &mut report)
-                .context("running controlnet")?;
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
-        }
-
-        Command::Inpaint {
-            model,
-            prompt,
-            init_image,
-            mask,
-            strength,
-            negative_prompt,
-            width,
-            height,
-            steps,
-            cfg_scale,
-            seed,
-            sampler,
-            output,
-        } => {
-            let cfg = sd::pipeline::InpaintConfig {
-                base: Img2ImgConfig {
-                    base: Txt2ImgConfig {
-                        prompt,
-                        negative_prompt,
-                        width,
-                        height,
-                        steps,
-                        cfg_scale,
-                        seed,
-                        sampler: parse_sampler(&sampler)?,
-                        frames: 1,
-                        cache_threshold: 0.0,
-                        cancel: None,
-                    },
-                    init_image: std::path::PathBuf::from(&init_image),
-                    strength: Strength::new(strength),
-                },
-                mask: std::path::PathBuf::from(&mask),
-            };
-            tracing::info!(model = %model, init = %init_image, mask = %mask, "inpainting");
-            let started = std::time::Instant::now();
-            let mut report = |p: sd::pipeline::Progress| {
-                tracing::info!(
-                    step = p.step,
-                    total = p.total,
-                    sigma = format!("{:.3}", p.sigma),
-                    "denoise"
-                );
-            };
-            let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                .with_context(|| format!("loading pipeline from {model}"))?;
-            let img = pipeline
-                .run_inpaint_with_progress(&cfg, &mut report)
-                .context("running inpaint")?;
-            sd::image_io::save_png(&img, &output).with_context(|| format!("writing {output}"))?;
-            tracing::info!(elapsed = ?started.elapsed(), output = %output, "done");
         }
 
         Command::Img2Img {
             model,
+            init,
             prompt,
-            init_image,
-            strength,
             negative_prompt,
+            strength,
+            mask,
             width,
             height,
             steps,
@@ -1858,93 +266,43 @@ fn main() -> Result<()> {
             seed,
             sampler,
             output,
-            sdxl,
         } => {
-            let cfg = Img2ImgConfig {
-                base: Txt2ImgConfig {
-                    prompt,
-                    negative_prompt,
-                    width,
-                    height,
-                    steps,
-                    cfg_scale,
-                    seed,
-                    sampler: parse_sampler(&sampler)?,
-                    frames: 1,
-                    cache_threshold: 0.0,
-                    cancel: None,
-                },
-                init_image: std::path::PathBuf::from(&init_image),
-                strength: Strength::new(strength),
-            };
+            let cfg = config(
+                &prompt,
+                &negative_prompt,
+                width,
+                height,
+                steps,
+                cfg_scale,
+                seed,
+                &sampler,
+            )?;
+            for path in
+                mlx_cli::run_img2img(&model, &cfg, &init, strength, mask.as_deref(), &output)?
+            {
+                println!("wrote {}", path.display());
+            }
+        }
 
-            tracing::info!(model = %model, sdxl, "loading pipeline");
-            tracing::info!(
-                prompt = %cfg.base.prompt,
-                init = %init_image,
-                strength = cfg.strength.get(),
-                "generating"
-            );
-            let started = std::time::Instant::now();
-            let mut report = |p: sd::pipeline::Progress| {
-                tracing::info!(
-                    step = p.step,
-                    total = p.total,
-                    sigma = format!("{:.3}", p.sigma),
-                    "denoise"
-                );
-            };
-            let img = if sdxl {
-                let pipeline = sd::pipeline::SdxlPipeline::load(Path::new(&model), &dev)
-                    .with_context(|| format!("loading SDXL pipeline from {model}"))?;
-                pipeline
-                    .run_img2img_with_progress(&cfg, &mut report)
-                    .context("running SDXL img2img")?
-            } else {
-                let pipeline = Txt2ImgPipeline::load(Path::new(&model), &dev)
-                    .with_context(|| format!("loading pipeline from {model}"))?;
-                pipeline
-                    .run_img2img_with_progress(&cfg, &mut report)
-                    .context("running img2img")?
-            };
+        Command::Upscale {
+            model,
+            weights,
+            input,
+            output,
+        } => {
+            for path in mlx_cli::run_upscale(&model, &weights, &input, &output)? {
+                println!("wrote {}", path.display());
+            }
+        }
 
-            let written = sd::image_io::save_batch(&img, &output)
-                .with_context(|| format!("writing {output}"))?;
-            match written.len() {
-                1 => println!("wrote {} in {:.1?}", written[0], started.elapsed()),
-                n => println!(
-                    "wrote {n} frames, {} .. {}, in {:.1?}",
-                    written[0],
-                    written[n - 1],
-                    started.elapsed()
-                ),
+        Command::Info => {
+            println!("sdrs {}", sd::VERSION);
+            println!("backend: MLX");
+            match sd_tensor::sysmem::available_bytes() {
+                Some(free) => println!("free memory: {}", sd_tensor::ops::human_bytes(free)),
+                None => println!("free memory: unknown"),
             }
         }
     }
-
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::preview_path;
-
-    #[test]
-    fn previews_land_beside_the_output_not_in_the_working_directory() {
-        // A run writing to /tmp/out.png should not scatter previews into
-        // wherever the shell happens to be.
-        assert_eq!(
-            preview_path("/tmp/run/out.png", 5),
-            "/tmp/run/out-preview-005.png"
-        );
-        assert_eq!(preview_path("out.png", 20), "out-preview-020.png");
-        // Zero-padded so `ls` sorts them in run order rather than 1, 10, 2.
-        assert_eq!(preview_path("a.png", 1), "a-preview-001.png");
-        assert_eq!(preview_path("a.png", 100), "a-preview-100.png");
-    }
-
-    #[test]
-    fn an_output_with_no_extension_still_gets_one() {
-        assert_eq!(preview_path("out", 3), "out-preview-003.png");
-    }
 }

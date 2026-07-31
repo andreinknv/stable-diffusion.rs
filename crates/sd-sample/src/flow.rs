@@ -18,8 +18,6 @@
 //!
 //! [`shift`]: FlowMatchConfig::shift
 
-use sd_tensor::{Result, Tensor};
-
 /// Parameters of `FlowMatchEulerDiscreteScheduler`.
 #[derive(Debug, Clone, Copy)]
 pub struct FlowMatchConfig {
@@ -137,30 +135,6 @@ pub fn flow_timesteps(cfg: &FlowMatchConfig, sigmas: &[f64]) -> Vec<f64> {
         .take(sigmas.len().saturating_sub(1))
         .map(|s| s * cfg.num_train_timesteps as f64)
         .collect()
-}
-
-/// One Euler step along the flow.
-///
-/// `velocity` is the transformer's output. Unlike the DDPM samplers there is
-/// no division by sigma, so `sigma == 0` needs no special case — the step
-/// simply has zero length.
-pub fn flow_euler_step(
-    x: &Tensor,
-    velocity: &Tensor,
-    sigma: f64,
-    sigma_next: f64,
-) -> Result<Tensor> {
-    x + (velocity * (sigma_next - sigma))?
-}
-
-/// Mix an encoded image with noise at a given sigma, for img2img.
-///
-/// The forward process the model was trained on: `sigma * noise + (1 - sigma)
-/// * sample`. Note this is a genuine interpolation — at `sigma = 1` nothing of
-/// the image remains — unlike the DDPM formulation where the scaling is
-/// `sqrt(alpha_cumprod)` and the two coefficients do not sum to one.
-pub fn scale_noise(sample: &Tensor, noise: &Tensor, sigma: f64) -> Result<Tensor> {
-    (noise * sigma)? + (sample * (1.0 - sigma))?
 }
 
 #[cfg(test)]

@@ -1,70 +1,20 @@
-//! Weight loading for stable-diffusion.rs.
+//! Checkpoint naming, and nothing else.
 //!
-//! Milestone 1 supports `.safetensors`. GGUF (the format almost every
-//! quantised community model ships in) is the next target — see
-//! `docs/roadmap.md`.
+//! **Every function here is pure string work.** A checkpoint's tensors arrive
+//! under whatever name its exporter chose — CompVis/LDM, llama.cpp,
+//! `diffusers` old or new — and the models ask for one set of names. Deciding
+//! which is which is the whole job.
 //!
-//! # Safety note
-//!
-//! This crate parses files that users download from the internet. Memory
-//! safety here is a feature of the project, not an incidental benefit: the
-//! equivalent C++ parsers have a CVE history. Keep `unsafe` confined to the
-//! mmap call below and justify any addition.
+//! It lives apart from the backend deliberately: a second copy of a name
+//! mapping is exactly how two implementations come to disagree about which
+//! tensor is which, and that failure loads cleanly and produces noise.
 
-pub mod embedding;
-pub mod merge;
-
-pub mod flux_gguf;
-pub mod gguf;
+/// CompVis/LDM names to `diffusers` ones.
 pub mod ldm;
-pub mod lora;
+/// llama.cpp's T5 names to `transformers` ones.
 pub mod t5_gguf;
 
-pub use flux_gguf::{
-    flux_block_counts, flux_has_guidance, flux_qtensors_from_gguf, sd3_qtensors_from_gguf,
-};
-pub use gguf::{
-    clip_var_builder_from_gguf, gguf_var_builder, unet_var_builder_from_gguf,
-    vae_var_builder_from_gguf, GgufInfo, Layout,
-};
-pub use lora::{Applied as LoraApplied, Lora};
-pub use t5_gguf::{t5_key, t5_qtensors_from_gguf, t5_var_builder_from_gguf};
-
-use std::path::{Path, PathBuf};
-
-use sd_tensor::{DType, Device, VarBuilder};
-
-#[derive(Debug, thiserror::Error)]
-pub enum LoadError {
-    #[error("model file not found: {0}")]
-    NotFound(PathBuf),
-    #[error("unsupported model format for {path}: {reason}")]
-    Unsupported { path: PathBuf, reason: String },
-    #[error(transparent)]
-    Tensor(#[from] sd_tensor::Error),
-}
-
-pub type Result<T> = std::result::Result<T, LoadError>;
-
-/// Weight file formats we can recognise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    Safetensors,
-    Gguf,
-    Ckpt,
-}
-
-impl Format {
-    /// Detect format from the file extension.
-    pub fn detect(path: &Path) -> Option<Self> {
-        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-            "safetensors" => Some(Self::Safetensors),
-            "gguf" => Some(Self::Gguf),
-            "ckpt" | "pt" | "pth" | "bin" => Some(Self::Ckpt),
-            _ => None,
-        }
-    }
-}
+pub use t5_gguf::t5_key;
 
 /// Attention parameter names, modern diffusers -> the legacy layout.
 ///
@@ -83,7 +33,10 @@ const LEGACY_ATTENTION_KEYS: [(&str, &str); 4] = [
 ];
 
 /// Only appears in the legacy layout, so its presence identifies one.
-const LEGACY_SENTINEL: &str = "proj_attn";
+///
+/// Public because a loader that wants to *ask* which layout a checkpoint uses
+/// needs it, and there is exactly one right answer to that question.
+pub const LEGACY_SENTINEL: &str = "proj_attn";
 
 /// Rewrite a modern attention key to its legacy equivalent.
 ///
@@ -108,156 +61,27 @@ pub fn modern_attention_key(name: &str) -> Option<String> {
         .map(|(modern, legacy)| name.replace(legacy, modern))
 }
 
-/// Whether any file names a tensor using the legacy attention layout.
-///
-/// Reads only the safetensors headers — no tensor data is touched, so this is
-/// cheap even against a multi-gigabyte UNet.
-fn uses_legacy_attention_names(paths: &[PathBuf]) -> Result<bool> {
-    for path in paths {
-        // SAFETY: same contract as the caller's — the file must not be mutated
-        // while mapped. Dropped before returning.
-        let mapped = unsafe { sd_tensor::safetensors::MmapedSafetensors::new(path)? };
-        if mapped
-            .tensors()
-            .iter()
-            .any(|(name, _)| name.contains(LEGACY_SENTINEL))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Bytes these checkpoints will occupy once loaded at `dtype`.
-///
-/// Reads only the safetensors headers, so this is cheap even for a
-/// multi-gigabyte UNet and can be asked *before* committing to the load.
-///
-/// Not the file size: a fp16 checkpoint loaded as f32 occupies twice what it
-/// takes on disk, and that doubling is precisely what made SDXL fail to fit.
-pub fn resident_bytes<P: AsRef<Path>>(paths: &[P], dtype: DType) -> Result<u64> {
-    let mut total: u64 = 0;
-    for path in paths {
-        let path = path.as_ref();
-        // SAFETY: mapped read-only for the duration of this call and dropped
-        // before returning; the caller's contract is the same as elsewhere.
-        let mapped = unsafe { sd_tensor::safetensors::MmapedSafetensors::new(path)? };
-        for (_, view) in mapped.tensors() {
-            let elems: u64 = view.shape().iter().map(|&d| d as u64).product();
-            total = total.saturating_add(elems.saturating_mul(dtype.size_in_bytes() as u64));
-        }
-    }
-    Ok(total)
-}
-
-/// Open one or more `.safetensors` files as a [`VarBuilder`].
-///
-/// Checkpoints using the legacy diffusers attention names are adapted
-/// transparently, so model code only ever asks for the modern names. Detection
-/// is per-load and header-only; a modern checkpoint pays one header parse and
-/// is otherwise untouched.
-///
-/// # Safety
-///
-/// Uses `mmap`. The caller must not modify the files while the returned
-/// `VarBuilder` is alive.
-/// A `VarBuilder` over safetensors with a LoRA already merged in.
-///
-/// Separate from [`safetensors_var_builder`] because it cannot mmap: merging
-/// rewrites the weights, so they have to be materialised. That costs full
-/// dense residency — 4.26 GB for SD 1.5 at f32 — which is the price of the
-/// adapter and is why the plain path is left alone.
-///
-/// Returns what was merged so the caller can refuse a partial application
-/// rather than render with one. See [`lora::Applied`].
-pub fn safetensors_var_builder_with_lora<'a, P: AsRef<Path>>(
-    paths: &[P],
-    dtype: DType,
-    device: &Device,
-    lora: &lora::Lora,
-    multiplier: f64,
-) -> Result<(VarBuilder<'a>, lora::Applied)> {
-    let mut tensors = std::collections::HashMap::new();
-    for p in paths {
-        let p = p.as_ref();
-        if !p.exists() {
-            return Err(LoadError::NotFound(p.to_path_buf()));
-        }
-        for (name, tensor) in sd_tensor::safetensors::load(p, device)? {
-            tensors.insert(name, tensor.to_dtype(dtype)?);
-        }
-    }
-    let applied = lora.merge_into(&mut tensors, multiplier)?;
-    Ok((VarBuilder::from_tensors(tensors, dtype, device), applied))
-}
-
-pub fn safetensors_var_builder<'a, P: AsRef<Path>>(
-    paths: &[P],
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'a>> {
-    let owned: Vec<PathBuf> = paths.iter().map(|p| p.as_ref().to_path_buf()).collect();
-    for p in &owned {
-        if !p.exists() {
-            return Err(LoadError::NotFound(p.clone()));
-        }
-        if Format::detect(p) != Some(Format::Safetensors) {
-            return Err(LoadError::Unsupported {
-                path: p.clone(),
-                reason: "expected a .safetensors file".to_string(),
-            });
-        }
-    }
-    tracing::debug!(count = owned.len(), ?dtype, "loading safetensors");
-    // SAFETY: documented in this function's contract — files must not be
-    // mutated for the lifetime of the returned VarBuilder.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&owned, dtype, device)? };
-
-    if uses_legacy_attention_names(&owned)? {
-        tracing::debug!("legacy attention names detected; adapting");
-        // `rename_f` maps the name the model *asks for* onto the name that is
-        // *stored*, which is the direction needed here.
-        return Ok(vb.rename_f(|name: &str| {
-            legacy_attention_key(name).unwrap_or_else(|| name.to_string())
-        }));
-    }
-    Ok(vb)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The rename is exact in both directions and leaves everything else
+    /// alone.
     #[test]
-    fn detects_formats_by_extension() {
+    fn the_attention_renames_round_trip() {
+        for (modern, legacy) in LEGACY_ATTENTION_KEYS {
+            let m = format!("decoder.mid_block.attentions.0{modern}weight");
+            let l = format!("decoder.mid_block.attentions.0{legacy}weight");
+            assert_eq!(legacy_attention_key(&m).as_deref(), Some(l.as_str()));
+            assert_eq!(modern_attention_key(&l).as_deref(), Some(m.as_str()));
+            // And each is a no-op on the other layout's own names.
+            assert_eq!(modern_attention_key(&m), None);
+            assert_eq!(legacy_attention_key(&l), None);
+        }
+        // A GroupNorm is not an attention projection.
         assert_eq!(
-            Format::detect(Path::new("m.safetensors")),
-            Some(Format::Safetensors)
+            modern_attention_key("decoder.mid_block.attentions.0.group_norm.weight"),
+            None
         );
-        assert_eq!(Format::detect(Path::new("m.gguf")), Some(Format::Gguf));
-        assert_eq!(Format::detect(Path::new("m.ckpt")), Some(Format::Ckpt));
-        assert_eq!(Format::detect(Path::new("README.md")), None);
-        assert_eq!(Format::detect(Path::new("noext")), None);
-    }
-
-    #[test]
-    fn missing_file_is_reported_as_not_found() {
-        // VarBuilder has no Debug impl, so match on the Result directly
-        // rather than using unwrap_err().
-        let res = safetensors_var_builder(
-            &["definitely-not-here.safetensors"],
-            DType::F32,
-            &Device::Cpu,
-        );
-        assert!(matches!(res, Err(LoadError::NotFound(_))));
-    }
-
-    #[test]
-    fn wrong_extension_is_rejected_before_mmap() {
-        // Cargo runs tests with CWD set to the crate root, so this file
-        // exists — which is what we need to get past the NotFound check and
-        // exercise the format check.
-        let res = safetensors_var_builder(&["Cargo.toml"], DType::F32, &Device::Cpu);
-        assert!(matches!(res, Err(LoadError::Unsupported { .. })));
     }
 }

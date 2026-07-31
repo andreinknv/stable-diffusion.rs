@@ -2,8 +2,27 @@
 
 ## Rule
 
-Only `sd-tensor` may name candle. Enforced by `scripts/check-seam.sh` in CI, at
-both the source level (`use candle_core`) and the manifest level.
+Only `sd-tensor` may name a compute backend. Enforced by
+`scripts/check-seam.sh` in CI, at both the source level (`use candle_core`,
+`use mlx_sys`) and the manifest level.
+
+The rule names candle as well as MLX deliberately. It is about *any* backend,
+not whichever one is current — a crate reaching straight for MLX is the same
+mistake reaching for candle would have been.
+
+## It was tested, and it held
+
+The backend moved from candle to MLX in 2026. **102 files used tensors and one
+of them named the library**, so the swap was bounded to `sd-tensor` plus new
+model code — not a workspace-wide rewrite. The seam is the reason that was
+possible, and this is the evidence that the rule earns its cost rather than
+being a tidiness preference.
+
+One thing the swap revealed: the rule kept *source* clean but a dependency can
+still leak through a feature. `tokenizers` needed a regex backend that candle
+had been enabling transitively; removing candle turned that into a build
+error. Which is the good direction — the dependency was always real and is now
+named.
 
 ## Why
 

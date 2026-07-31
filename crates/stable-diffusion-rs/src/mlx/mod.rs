@@ -35,7 +35,6 @@ use sd_models::mlx::{
 use sd_sample::{sigmas_for_steps, Schedule};
 use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
 use sd_tensor::rng::SeededRng;
-use sd_tensor::{Device, Tensor};
 
 use crate::pipeline::{cache_rescale, PipelineError, SamplerKind, Strength, Txt2ImgConfig};
 
@@ -462,8 +461,9 @@ impl MlxPipeline {
 
         let mut rng = SeededRng::new(cfg.seed);
         let dim = embeds.shape()[1];
-        let t: Tensor = rng.randn((1, dim, 1, 1), &Device::Cpu)?;
-        let noise = Array::from_slice_f32(&t.flatten_all()?.to_vec1::<f32>()?, &[1, dim])?;
+        // `[1, dim]`, drawn in the same order the image path draws in so a
+        // seed means one thing across the crate.
+        let noise = Array::from_slice_f32(&rng.normals(dim), &[1, dim])?;
 
         let alphas = sd_models::unclip::cosine_alphas_cumprod(unclip::TRAIN_TIMESTEPS);
         let conditioned = unclip::augment(&embeds, level, &noise, &alphas, normalizer, s)?;

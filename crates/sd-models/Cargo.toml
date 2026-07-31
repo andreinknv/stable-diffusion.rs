@@ -17,9 +17,5 @@ tokenizers.workspace = true
 
 [features]
 # The MLX port of the models, per docs/handoff.md decision (b).
-# Additive: the candle path is untouched and stays the default.
 mlx = ["sd-tensor/mlx"]
 default = []
-cuda = ["sd-tensor/cuda", "sd-loader/cuda"]
-metal = ["sd-tensor/metal", "sd-loader/metal"]
-accelerate = ["sd-tensor/accelerate", "sd-loader/accelerate"]

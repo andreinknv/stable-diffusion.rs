@@ -25,10 +25,13 @@
 //! # Flow matching, not diffusion
 //!
 //! The model predicts a **velocity**, and a step is `x + v * (sigma_next -
-//! sigma)`. There is no epsilon, no `denoised`, and no ancestral noise. The
-//! sigma ladder is resolution-dependent — `flow_sigmas` takes the image
-//! sequence length — so a ladder computed for a different size is wrong in a
-//! way that still runs.
+//! sigma)`. There is no epsilon, no `denoised`, and no ancestral noise.
+//!
+//! `flow_sigmas` takes the image sequence length, but **SD 3 sets
+//! `use_dynamic_shifting: false`**, so it is not consulted and the ladder is
+//! the same at every size. That is Flux's property, not this one — the two
+//! configurations are otherwise identical, which is exactly why it is easy to
+//! attribute to the wrong model.
 //!
 //! All of that arithmetic is `sd_sample::flow`, which returns `Vec<f64>` and
 //! touches no tensor, so both backends call it. Only the step itself is here.
@@ -337,8 +340,8 @@ impl Sd3Pipeline {
         let s = &self.stream;
         let (lh, lw) = (cfg.height / 8, cfg.width / 8);
         let p = self.cfg.patch_size;
-        // The sigma ladder is resolution-dependent, so this is the run's own
-        // token count and not a constant.
+        // Passed for the shape of the call; SD 3 does not shift dynamically,
+        // so the ladder does not actually vary with it.
         let seq_len = (lh / p) * (lw / p);
 
         let (cond, cond_pooled) = self.conditioning(&cfg.prompt)?;

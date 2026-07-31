@@ -182,14 +182,19 @@ pub fn canny(img: &Gray<'_>, low: f32, high: f32) -> Vec<f32> {
 /// The edges are detected *at the target resolution* rather than detected and
 /// then resized — resampling a one-pixel skeleton is what turns crisp edges
 /// into grey smears, and the ControlNet reads a smear as a different shape.
+/// A canny edge map as an MLX control hint, `[1, h, w, 3]` in `[-1, 1]`.
+///
+/// **NHWC and signed**, which is what a ControlNet's `conv_in` takes here.
+/// The edge map is greyscale by construction and replicated across three
+/// channels, because the canny ControlNets were trained on RGB.
+#[cfg(feature = "mlx")]
 pub fn hint_from_image<P: AsRef<std::path::Path>>(
     path: P,
     width: u32,
     height: u32,
     low: f32,
     high: f32,
-    device: &sd_tensor::Device,
-) -> sd_tensor::Result<sd_tensor::Tensor> {
+) -> sd_tensor::Result<sd_tensor::mlx::Array> {
     let img = image::open(path.as_ref())
         .map_err(|e| sd_tensor::Error::Msg(format!("failed to read image: {e}")))?;
     let img = img
@@ -206,13 +211,15 @@ pub fn hint_from_image<P: AsRef<std::path::Path>>(
         low,
         high,
     );
-    // Replicated across three channels: the canny ControlNets take an RGB
-    // control map, and the edge map is greyscale by construction.
+    // Interleaved, not planar: NHWC wants the three channels adjacent per
+    // pixel, where NCHW wanted three whole planes. The values are in `[0, 1]`
+    // and the ControlNet takes `[-1, 1]`.
     let mut rgb = Vec::with_capacity(edges.len() * 3);
-    for _ in 0..3 {
-        rgb.extend_from_slice(&edges);
+    for e in &edges {
+        let v = e * 2.0 - 1.0;
+        rgb.extend_from_slice(&[v, v, v]);
     }
-    sd_tensor::Tensor::from_vec(rgb, (1, 3, height as usize, width as usize), device)
+    sd_tensor::mlx::Array::from_slice_f32(&rgb, &[1, height as usize, width as usize, 3])
 }
 
 #[cfg(test)]

@@ -1,3 +1,10 @@
+> **Outcome, 2026.** The backend moved from candle to MLX. Everything below
+> is the reasoning that led there and is kept as the record of it — including
+> the parts that argued for candle, which were right at the time. What changed
+> was not the analysis but the machine: every performance win this project
+> found had to be hand-written, and MLX fuses that class of thing
+> automatically. See `docs/handoff.md` for what the move cost and measured.
+
 # Backend evaluation
 
 Why candle, what the alternatives are, and what the seam does — and does not —

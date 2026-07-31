@@ -19,10 +19,6 @@ homepage = "https://github.com/andreinknv/stable-diffusion.rs"
 authors = ["stable-diffusion.rs contributors"]
 
 [workspace.dependencies]
-# Pinned exactly: candle is pre-1.0 and breaks between minor versions.
-# Only sd-tensor may depend on these. See docs/seam.md.
-candle-core = "=0.11.0"
-candle-nn = "=0.11.0"
 
 sd-tensor = { path = "crates/sd-tensor", version = "0.0.1" }
 sd-loader = { path = "crates/sd-loader", version = "0.0.1" }
@@ -44,14 +40,15 @@ memmap2 = "0.9"
 # undo this project's "no C toolchain" property. The pure-Rust path is enough
 # to load a tokenizer.json and encode.
 #
-# **Held at 0.22 to match candle, not through neglect.** candle-core 0.11.0
-# depends on tokenizers 0.22 itself, so asking for 0.23 here does not upgrade
-# anything — it compiles *both*, and 0.23 additionally makes a regex backend
-# mandatory, adding `fancy-regex` to the tree. Measured before reverting: the
-# 0.23 tokenizer produces byte-identical ids against the HuggingFace reference,
-# so the whole trade was two copies of a large crate for no observable change.
-# Revisit when candle moves.
-tokenizers = { version = "0.22", default-features = false }
+# **`fancy-regex`, not `onig`.** A regex backend is mandatory, and onig is a C
+# library — which would undo this project's "no C toolchain" property for the
+# sake of loading a tokenizer.json. fancy-regex is pure Rust and does the job.
+#
+# It was implicit until candle went: candle pulled tokenizers with a backend
+# already enabled, so nothing here had to name one. Removing candle made that
+# a hard error at build time, which is the good direction — the dependency was
+# always real and is now visible.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 
 [profile.release]
 opt-level = 3

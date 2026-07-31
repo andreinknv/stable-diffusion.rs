@@ -23,7 +23,6 @@ use sd_models::mlx::{clip, sample, unet_forward, vae, UNetConfig};
 use sd_sample::{sigmas_for_steps, Schedule};
 use sd_tensor::mlx::{concat, load_safetensors, Array, Stream};
 use sd_tensor::rng::SeededRng;
-use sd_tensor::{Device, Tensor};
 use stable_diffusion_rs::pipeline::Strength;
 
 const VAE_SCALE: f32 = 0.18215;
@@ -39,8 +38,9 @@ fn golden(sub: &str) -> PathBuf {
 }
 
 fn seeded_noise(rng: &mut SeededRng, shape: (usize, usize, usize, usize)) -> Vec<f32> {
-    let t: Tensor = rng.randn(shape, &Device::Cpu).expect("randn");
-    t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    // NCHW-major, which is the order `nchw_to_nhwc` below expects — and the
+    // order a seed pins.
+    rng.normals(shape.0 * shape.1 * shape.2 * shape.3)
 }
 
 fn nchw_to_nhwc(data: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {

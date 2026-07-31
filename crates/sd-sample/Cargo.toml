@@ -14,6 +14,3 @@ thiserror.workspace = true
 
 [features]
 default = []
-cuda = ["sd-tensor/cuda"]
-metal = ["sd-tensor/metal"]
-accelerate = ["sd-tensor/accelerate"]
