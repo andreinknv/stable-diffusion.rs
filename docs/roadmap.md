@@ -563,7 +563,34 @@ In rough order of cost, cheapest first:
   What remains per model is the transformer itself, its VAE, and its golden
   references. Qwen-Image is 60 joint blocks with QK-norm — closest to the
   already-verified SD 3.5 MMDiT of anything here.
-- **FLUX.2** is a new generation, not a variant.
+- ~~**FLUX.2**~~ — **the transformer is ported and verified**, `max_abs`
+  2.936e-6 against `diffusers` on a small randomly-initialised model. Its text
+  encoder is the one above, unchanged: `FLUX.2-klein`'s `text_encoder/config.json`
+  is Qwen3 at hidden 2560, 36 layers, 32/8 heads — `LlmConfig::qwen3_4b()`
+  exactly.
+
+  **It is not Flux.1 with different numbers**, which is what sd.cpp's config
+  struct makes it look like. Read out of `FLUX.2-klein-4B`'s own safetensors
+  header before writing anything: diffusers naming rather than
+  black-forest-labs', separate q/k/v instead of one fused projection, a gated
+  SiLU MLP whose `linear_in` is twice the hidden width, per-head QK RMSNorm,
+  four rotary axes instead of three, no pooled CLIP, and no biases anywhere.
+
+  **The modulation is three tensors for the whole model.** Flux.1 has an
+  `img_mod.lin` per block; FLUX.2 computes six vectors once from the timestep
+  embedding and every one of its double blocks uses the same six, with three
+  more shared across every single block. Fifteen for a 25-block model. The
+  shapes look like a bug the first time you see them.
+
+  The bug that cost the time was smaller and worse: **`AdaLayerNormContinuous`
+  chunks `(scale, shift)` where `Flux2Modulation` emits `(shift, scale,
+  gate)`.** Two orders in one model. Getting the output head's pair backwards
+  left the transformer 1.405e-1 out against a peak of 1.501 — about 10%,
+  which is far too small to look like a broken port and far too large to be
+  right. Fixing that one swap took it to 2.936e-6.
+
+  What remains for a running pipeline: the FLUX.2 VAE (32 latent channels,
+  patch size 1 over 128 input channels) and the plumbing.
 - **The video models** are the largest by a wide margin: a temporal axis
   through every block, a 3D VAE, and memory characteristics this machine has
   not been asked for before.

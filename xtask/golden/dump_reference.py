@@ -318,6 +318,93 @@ def dump_llm(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out}/reference.safetensors ({len(tensors)} tensors) and llm.safetensors")
 
 
+def dump_flux2(output: pathlib.Path, model_id: str) -> None:
+    """FLUX.2's transformer, at a size that fits in a fixture.
+
+    **Randomly initialised at a small width**, not the published 4B. The
+    architecture is what is being verified, and every published FLUX.2 is
+    3072 wide with 25 blocks — a reference for one would be gigabytes. The
+    same split `dump_t5` uses: check the forward here, then load real weights
+    and find only name-mapping bugs.
+
+    The structure was read out of `FLUX.2-klein-4B`'s own safetensors header
+    before writing any of this, and the small model reproduces it exactly:
+    separate `to_q`/`to_k`/`to_v` with per-head QK RMSNorm, a gated MLP whose
+    `linear_in` is twice the hidden width, and **three modulation tensors for
+    the whole model** rather than one per block.
+
+    `img_ids` and `txt_ids` are **four**-axis here, not Flux.1's three.
+    """
+    torch = _require("torch")
+    from diffusers import Flux2Transformer2DModel
+    from safetensors.torch import save_file
+
+    out = output / "flux2"
+    out.mkdir(parents=True, exist_ok=True)
+
+    heads, head_dim = 4, 32
+    hidden = heads * head_dim
+    model = Flux2Transformer2DModel(
+        patch_size=1,
+        in_channels=16,
+        num_layers=2,
+        num_single_layers=2,
+        attention_head_dim=head_dim,
+        num_attention_heads=heads,
+        joint_attention_dim=48,
+        axes_dims_rope=(8, 8, 8, 8),
+        mlp_ratio=3.0,
+        rope_theta=2000,
+        timestep_guidance_channels=256,
+        eps=1e-6,
+    ).eval()
+    print(f"  hidden={hidden} heads={heads} head_dim={head_dim} layers=2 single=2")
+
+    gen = torch.Generator().manual_seed(SEED)
+    img_tokens, txt_tokens = 12, 5
+    hidden_states = torch.randn(1, img_tokens, 16, generator=gen)
+    encoder_hidden_states = torch.randn(1, txt_tokens, 48, generator=gen)
+    timestep = torch.tensor([0.7])
+    # **Not optional, unlike Flux.1's.** FLUX.2 embeds the timestep and the
+    # guidance scale *together* through `time_guidance_embed`, so a run always
+    # supplies one — `guidance_embeds: false` in the published config refers to
+    # a separate `guidance_in` that FLUX.2 does not have, not to this.
+    guidance = torch.tensor([3.5])
+
+    # Four axes. Text ids are zero; image ids walk a 3x4 grid on axes 1 and 2,
+    # which is what a packed latent produces.
+    img_ids = torch.zeros(img_tokens, 4)
+    for i in range(img_tokens):
+        img_ids[i, 1] = i // 4
+        img_ids[i, 2] = i % 4
+    txt_ids = torch.zeros(txt_tokens, 4)
+
+    with torch.no_grad():
+        result = model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+            guidance=guidance,
+            return_dict=False,
+        )[0]
+
+    tensors = {
+        "hidden_states": hidden_states.contiguous(),
+        "encoder_hidden_states": encoder_hidden_states.contiguous(),
+        "timestep": timestep.contiguous(),
+        "guidance": guidance.contiguous(),
+        "img_ids": img_ids.contiguous(),
+        "txt_ids": txt_ids.contiguous(),
+        "output": result.detach().contiguous().clone(),
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    weights = {k: v.detach().contiguous().clone() for k, v in model.state_dict().items()}
+    save_file(weights, str(out / "flux2.safetensors"))
+    print(f"wrote {out}/reference.safetensors and flux2.safetensors ({len(weights)} tensors)")
+
+
 def dump_flux_transformer(output: pathlib.Path, model_id: str) -> None:
     """Flux's MMDiT against diffusers.
 
@@ -355,6 +442,11 @@ def dump_flux_transformer(output: pathlib.Path, model_id: str) -> None:
     encoder_hidden = torch.randn(1, txt_len, 4096, generator=gen)
     pooled = torch.randn(1, 768, generator=gen)
     timestep = torch.tensor([0.7])
+    # **Not optional, unlike Flux.1's.** FLUX.2 embeds the timestep and the
+    # guidance scale *together* through `time_guidance_embed`, so a run always
+    # supplies one — `guidance_embeds: false` in the published config refers to
+    # a separate `guidance_in` that FLUX.2 does not have, not to this.
+    guidance = torch.tensor([3.5])
     guidance = torch.tensor([3.5])
 
     # diffusers expects ids as [seq, 3] and builds the image grid itself.
@@ -380,6 +472,7 @@ def dump_flux_transformer(output: pathlib.Path, model_id: str) -> None:
         "encoder_hidden_states": encoder_hidden.contiguous(),
         "pooled_projections": pooled.contiguous(),
         "timestep": timestep.contiguous(),
+        "guidance": guidance.contiguous(),
         "guidance": guidance.contiguous(),
         "latent_h": torch.tensor([lat_h], dtype=torch.float32),
         "latent_w": torch.tensor([lat_w], dtype=torch.float32),
@@ -524,6 +617,7 @@ def dump_sd3(output: pathlib.Path, model_id: str) -> None:
             "context": context.contiguous(),
             "pooled": pooled.contiguous(),
             "timestep": timestep.contiguous(),
+        "guidance": guidance.contiguous(),
             "output": result.detach().contiguous().clone(),
         },
         str(out / "reference.safetensors"),
@@ -981,6 +1075,7 @@ def dump_unet_full(output: pathlib.Path, model_id: str) -> None:
     tensors = {
         "sample": sample.contiguous(),
         "timestep": timestep.contiguous(),
+        "guidance": guidance.contiguous(),
         "context": context.contiguous(),
         "output": result.detach().contiguous().clone(),
         **mid_out,
@@ -1053,6 +1148,7 @@ def dump_controlnet(output: pathlib.Path, model_id: str) -> None:
     tensors = {
         "sample": sample.contiguous(),
         "timestep": timestep.contiguous(),
+        "guidance": guidance.contiguous(),
         "context": context.contiguous(),
         "hint": hint.contiguous(),
         "mid": result.mid_block_res_sample.detach().contiguous().clone(),
@@ -1341,6 +1437,7 @@ def dump_ip_adapter(output: pathlib.Path, model_id: str) -> None:
     tensors = {
         "sample": sample.contiguous(),
         "timestep": timestep.contiguous(),
+        "guidance": guidance.contiguous(),
         "text": text.contiguous(),
         "image_embeds": image_embeds.contiguous(),
         "image_tokens": image_tokens.detach().contiguous().clone(),
@@ -2064,6 +2161,7 @@ def dump_controlnet_sdxl(output: pathlib.Path, model_id: str) -> None:
     tensors = {
         "sample": sample.contiguous(),
         "timestep": timestep.contiguous(),
+        "guidance": guidance.contiguous(),
         "context": context.contiguous(),
         "hint": hint.contiguous(),
         "pooled": pooled.contiguous(),
@@ -2290,6 +2388,7 @@ def dump_sdxl_unet(output: pathlib.Path, model_id: str) -> None:
     tensors = {
         "sample": sample.contiguous(),
         "timestep": timestep.contiguous(),
+        "guidance": guidance.contiguous(),
         "context": context.contiguous(),
         "pooled": pooled.contiguous(),
         "time_ids": time_ids.contiguous(),
@@ -2383,6 +2482,10 @@ def main() -> None:
     # matter to what this verifies.
     llm.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
     llm.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
+    flux2 = sub.add_parser("flux2", help="dump FLUX.2 transformer references")
+    flux2.add_argument("--model-id", default="(random init)")
+    flux2.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
     fluxt = sub.add_parser("flux_transformer", help="dump Flux MMDiT references")
     fluxt.add_argument("--model-id", default="TencentARC/flux-mini")
@@ -2541,6 +2644,8 @@ def main() -> None:
         dump_t5(args.output, args.model_id)
     elif args.component == "llm":
         dump_llm(args.output, args.model_id)
+    elif args.component == "flux2":
+        dump_flux2(args.output, args.model_id)
     elif args.component == "flux_transformer":
         dump_flux_transformer(args.output, args.model_id)
     elif args.component == "flux_sampling":
