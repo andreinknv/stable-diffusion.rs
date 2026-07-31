@@ -19,6 +19,9 @@
 //! in `mlx-examples` and reported as ml-explore/mlx-examples#1434, worth
 //! 5.6e-4 at the UNet output.
 
+/// The VAE decoder. Its epsilon is 1e-6, not the UNet's 1e-5.
+pub mod vae;
+
 use std::collections::HashMap;
 
 use sd_tensor::mlx::{Array, Stream};
@@ -36,13 +39,13 @@ pub const NORM_GROUPS: usize = 32;
 /// The tensors of a checkpoint, by their diffusers names.
 pub type Weights = HashMap<String, Array>;
 
-fn get<'a>(w: &'a Weights, key: &str) -> Result<&'a Array> {
+pub(crate) fn get<'a>(w: &'a Weights, key: &str) -> Result<&'a Array> {
     w.get(key)
         .ok_or_else(|| Error::Msg(format!("mlx: checkpoint has no `{key}`")))
 }
 
 /// `x @ w.T + b`, the diffusers `Linear` convention where `w` is `(out, in)`.
-fn linear(x: &Array, w: &Array, b: Option<&Array>, s: &Stream) -> Result<Array> {
+pub(crate) fn linear(x: &Array, w: &Array, b: Option<&Array>, s: &Stream) -> Result<Array> {
     let wt = w.transpose(&[1, 0], s)?;
     let y = x.matmul(&wt, s)?;
     match b {
@@ -69,7 +72,7 @@ fn conv_strided(
     }
 }
 
-fn conv(x: &Array, w: &Array, b: Option<&Array>, padding: usize, s: &Stream) -> Result<Array> {
+pub fn conv(x: &Array, w: &Array, b: Option<&Array>, padding: usize, s: &Stream) -> Result<Array> {
     conv_strided(x, w, b, 1, padding, s)
 }
 
