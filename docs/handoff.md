@@ -924,6 +924,19 @@ Worth recording, because in each case the instinct was to suspect the port:
 four were fixed by reading `xtask/golden/dump_reference.py` rather than by
 changing any code.
 
+### Two release test runs at once will exhaust this machine
+
+Measured 2026-07-31, running `--workspace` and a single test binary
+concurrently, both `--release`: **swap reached 21.6 GB of 22.5 GB and free
+pages fell to 80 MB.** Killing the narrower run took swap back to 7.2 GB
+immediately.
+
+Nothing crashed, but `memory/machine-memory-limits` records that this machine
+has been taken down before, and the handoff already documents swap
+contamination producing 10x timing variance. **Run one suite at a time.** The
+models are gigabytes each and several test binaries load three or four of
+them.
+
 ### The ledger, so the next reader does not have to rebuild it
 
 28 MLX test binaries against 43 candle ones. The gap is not 15 ports:
