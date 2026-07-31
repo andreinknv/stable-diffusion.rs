@@ -318,6 +318,90 @@ def dump_llm(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out}/reference.safetensors ({len(tensors)} tensors) and llm.safetensors")
 
 
+def dump_qwen_image(output: pathlib.Path, model_id: str) -> None:
+    """Qwen-Image's transformer, at a size that fits in a fixture.
+
+    Randomly initialised and small; every published Qwen-Image is 3072 wide
+    with 60 joint blocks.
+
+    **The rotary positions are captured too.** Qwen-Image centres its spatial
+    coordinates — a 4-row grid runs `[-2, -1, 0, 1]`, not `[0, 1, 2, 3]` —
+    and the text stream starts past the image's largest index. Z-Image cost an
+    afternoon on exactly this class of off-by-one, found only by dumping the
+    reference's own ids rather than reading its source.
+    """
+    torch = _require("torch")
+    from diffusers import QwenImageTransformer2DModel
+    from safetensors.torch import save_file
+
+    out = output / "qwen_image"
+    out.mkdir(parents=True, exist_ok=True)
+
+    torch.manual_seed(SEED)
+    heads, head_dim, cap_dim = 4, 32, 48
+    model = QwenImageTransformer2DModel(
+        patch_size=2,
+        in_channels=64,
+        out_channels=16,
+        num_layers=2,
+        attention_head_dim=head_dim,
+        num_attention_heads=heads,
+        joint_attention_dim=cap_dim,
+        axes_dims_rope=(8, 12, 12),
+    ).eval()
+    print(f"  dim={heads * head_dim} heads={heads} head_dim={head_dim} layers=2")
+
+    gen = torch.Generator().manual_seed(SEED)
+    frame, ph, pw = 1, 4, 3
+    img_tokens = frame * ph * pw
+    txt_tokens = 5
+    hidden_states = torch.randn(1, img_tokens, 64, generator=gen)
+    encoder_hidden_states = torch.randn(1, txt_tokens, cap_dim, generator=gen)
+    mask = torch.ones(1, txt_tokens, dtype=torch.long)
+    timestep = torch.tensor([0.7])
+
+    stages = {}
+
+    def grab(name):
+        def hook(_m, _i, o):
+            stages[name] = (o[0] if isinstance(o, tuple) else o).detach().contiguous().clone()
+
+        return hook
+
+    handles = [model.transformer_blocks[0].register_forward_hook(grab("after_block0"))]
+    with torch.no_grad():
+        vid_freqs, txt_freqs = model.pos_embed([(frame, ph, pw)], [txt_tokens], torch.device("cpu"))
+        result = model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_mask=mask,
+            timestep=timestep,
+            img_shapes=[(frame, ph, pw)],
+            txt_seq_lens=[txt_tokens],
+            return_dict=False,
+        )[0]
+    for h in handles:
+        h.remove()
+
+    tensors = {
+        "hidden_states": hidden_states.contiguous(),
+        "encoder_hidden_states": encoder_hidden_states.contiguous(),
+        "timestep": timestep.contiguous(),
+        "output": result.detach().contiguous().clone(),
+        # Complex frequencies, split into real and imaginary so they survive a
+        # safetensors round trip.
+        "vid_freqs_real": torch.view_as_real(vid_freqs)[..., 0].contiguous().clone(),
+        "vid_freqs_imag": torch.view_as_real(vid_freqs)[..., 1].contiguous().clone(),
+        "txt_freqs_real": torch.view_as_real(txt_freqs)[..., 0].contiguous().clone(),
+        "txt_freqs_imag": torch.view_as_real(txt_freqs)[..., 1].contiguous().clone(),
+        **stages,
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    weights = {k: v.detach().contiguous().clone() for k, v in model.state_dict().items()}
+    save_file(weights, str(out / "qwen_image.safetensors"))
+    print(f"wrote {out}/reference.safetensors and qwen_image.safetensors ({len(weights)} tensors)")
+
+
 def dump_z_image(output: pathlib.Path, model_id: str) -> None:
     """Z-Image's transformer, at a size that fits in a fixture.
 
@@ -2615,6 +2699,10 @@ def main() -> None:
     llm.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
     llm.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    qwen = sub.add_parser("qwen_image", help="dump Qwen-Image transformer references")
+    qwen.add_argument("--model-id", default="(random init)")
+    qwen.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     zimg = sub.add_parser("z_image", help="dump Z-Image transformer references")
     zimg.add_argument("--model-id", default="(random init)")
     zimg.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -2780,6 +2868,8 @@ def main() -> None:
         dump_t5(args.output, args.model_id)
     elif args.component == "llm":
         dump_llm(args.output, args.model_id)
+    elif args.component == "qwen_image":
+        dump_qwen_image(args.output, args.model_id)
     elif args.component == "z_image":
         dump_z_image(args.output, args.model_id)
     elif args.component == "flux2":
