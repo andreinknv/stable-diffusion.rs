@@ -53,13 +53,24 @@ fn linear(x: &Array, w: &Array, b: Option<&Array>, s: &Stream) -> Result<Array> 
 
 /// A convolution whose weights arrive in diffusers' `(out, in, kh, kw)` and are
 /// used in MLX's `(out, kh, kw, in)`.
-fn conv(x: &Array, w: &Array, b: Option<&Array>, padding: usize, s: &Stream) -> Result<Array> {
+fn conv_strided(
+    x: &Array,
+    w: &Array,
+    b: Option<&Array>,
+    stride: usize,
+    padding: usize,
+    s: &Stream,
+) -> Result<Array> {
     let k = w.transpose(&[0, 2, 3, 1], s)?;
-    let y = x.conv2d(&k, (1, 1), (padding, padding), (1, 1), 1, s)?;
+    let y = x.conv2d(&k, (stride, stride), (padding, padding), (1, 1), 1, s)?;
     match b {
         Some(b) => y.add(b, s),
         None => Ok(y),
     }
+}
+
+fn conv(x: &Array, w: &Array, b: Option<&Array>, padding: usize, s: &Stream) -> Result<Array> {
+    conv_strided(x, w, b, 1, padding, s)
 }
 
 /// diffusers' `ResnetBlock2D`.
@@ -353,4 +364,114 @@ pub fn timestep_embedding(
         Some(get(w, "time_embedding.linear_2.bias")?),
         s,
     )
+}
+
+/// diffusers' `Downsample2D`: a 3x3 convolution at stride 2.
+///
+/// `padding: 1` here, not the asymmetric pad diffusers uses for
+/// `padding=0` downsamplers — SD 1.5's UNet configures `downsample_padding: 1`,
+/// so this is the symmetric case. The VAE's is the asymmetric one, and getting
+/// that wrong is the bug `docs/handoff.md` records at 17.32.
+fn downsample(x: &Array, w: &Weights, prefix: &str, s: &Stream) -> Result<Array> {
+    conv_strided(
+        x,
+        get(w, &format!("{prefix}.conv.weight"))?,
+        Some(get(w, &format!("{prefix}.conv.bias"))?),
+        2,
+        1,
+        s,
+    )
+}
+
+/// One down block: `layers` resnets, each optionally followed by a transformer,
+/// then an optional downsampler.
+///
+/// Returns the block output and the skip entries it contributes, in the order
+/// `golden_unet.rs` expects them — one per resnet(+attention) pair, then one
+/// for the downsampler.
+pub fn down_block(
+    x: &Array,
+    temb: &Array,
+    context: &Array,
+    w: &Weights,
+    prefix: &str,
+    layers: usize,
+    heads: Option<usize>,
+    has_downsample: bool,
+    s: &Stream,
+) -> Result<(Array, Vec<Array>)> {
+    let mut h = x.contiguous(s)?;
+    let mut skips = Vec::with_capacity(layers + usize::from(has_downsample));
+
+    for i in 0..layers {
+        h = resnet_block(&h, temb, w, &format!("{prefix}.resnets.{i}"), s)?;
+        if let Some(heads) = heads {
+            h = transformer_2d(
+                &h,
+                context,
+                heads,
+                1,
+                w,
+                &format!("{prefix}.attentions.{i}"),
+                s,
+            )?;
+        }
+        skips.push(h.contiguous(s)?);
+    }
+
+    if has_downsample {
+        h = downsample(&h, w, &format!("{prefix}.downsamplers.0"), s)?;
+        skips.push(h.contiguous(s)?);
+    }
+    Ok((h, skips))
+}
+
+/// The whole down pass: `conv_in` and the four down blocks.
+///
+/// Returns the deepest activation and the twelve skip entries, which is exactly
+/// the stack `skip_stack_has_twelve_entries` describes — one for `conv_in`,
+/// then per block two resnets plus a downsampler, except the deepest block
+/// which has neither attention nor a downsampler.
+pub fn down_pass(
+    sample_nhwc: &Array,
+    temb: &Array,
+    context: &Array,
+    w: &Weights,
+    s: &Stream,
+) -> Result<(Array, Vec<Array>)> {
+    let mut h = conv(
+        sample_nhwc,
+        get(w, "conv_in.weight")?,
+        Some(get(w, "conv_in.bias")?),
+        1,
+        s,
+    )?;
+    let mut skips = vec![h.contiguous(s)?];
+
+    // SD 1.5 attends on every block but the deepest, and the deepest has no
+    // downsampler either.
+    for (i, (heads, has_down)) in [
+        (Some(8), true),
+        (Some(8), true),
+        (Some(8), true),
+        (None, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (out, mut block_skips) = down_block(
+            &h,
+            temb,
+            context,
+            w,
+            &format!("down_blocks.{i}"),
+            2,
+            heads,
+            has_down,
+            s,
+        )?;
+        h = out;
+        skips.append(&mut block_skips);
+    }
+    Ok((h, skips))
 }

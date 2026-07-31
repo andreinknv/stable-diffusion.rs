@@ -67,12 +67,21 @@ Verification, unchanged and non-negotiable:
 SD_REQUIRE_FIXTURES=1 SD_TEST_MODEL_DIR=$(pwd)/models/sd15 \
 SD_TEST_SDXL_DIR=$(pwd)/models/sdxl \
 SD_TEST_INIT_IMAGE=$(pwd)/assets/controlnet-crab-canny-512.png \
+SD_TEST_CONTROLNET=<a ControlNet .safetensors, e.g. lllyasviel/sd-controlnet-canny> \
 cargo test --release --workspace --features metal --no-fail-fast
 ```
 
 Without those variables the suite reports 14 failures that are only unset
 paths, and `cargo test` stops at the first failing binary — so a truncated run
 looks like a clean one. `--no-fail-fast` is not optional.
+
+**`SD_TEST_CONTROLNET` was missing from this block until 2026-07-30**, which
+made the command fail one test by construction:
+`control_maps_must_match_the_attached_controlnets` needs it, and with
+`SD_REQUIRE_FIXTURES=1` a skip is a failure — by design, and the design is
+right. With it set the run is 405 passed, 0 failed. It wants the `.safetensors`
+**file**, not the directory containing it; a directory fails with
+`expected a .safetensors file`.
 
 ## Decision: the backend moves to MLX
 
