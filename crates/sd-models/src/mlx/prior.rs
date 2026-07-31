@@ -251,6 +251,7 @@ pub fn attention_mask(
 /// `[b, num_embeddings, embedding_dim]`.
 ///
 /// The prediction is the **sample**, not the noise.
+#[allow(clippy::too_many_arguments)]
 pub fn forward(
     latents: &Array,
     timestep: &Array,
