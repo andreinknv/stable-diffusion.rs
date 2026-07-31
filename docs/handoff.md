@@ -64,44 +64,64 @@ findings still bind.
    and `sample::restore_outside_mask` runs the composite inside the loop. See
    [img2img and inpainting on MLX](#img2img-and-inpainting-on-mlx).
 
-6. **What is actually left.**
+6. **Quantised-at-rest inference exists**, and with it the last blocker is
+   gone. `crates/sd-models/src/mlx/quantized.rs`.
 
-   **Quantised-at-rest inference does not exist on MLX**, so full-size Flux and
-   T5-XXL cannot leave candle. The MLX GGUF loader dequantises to f32; Flux
-   schnell is 11.89B parameters, which is **47.6 GB** dense and does not fit on
-   this machine. The candle path keeps those weights quantised and dequantises
-   per operation — `FluxTransformer::from_quantized`, `resident_bytes` — and
-   MLX has its own scheme with no equivalent built here.
+   MLX's own affine quantisation, bound directly. A weight is held packed with
+   its scales and never materialised; the dequantisation happens inside the
+   matmul kernel a tile at a time. The GGUF loader is a **loop over the tensor
+   directory** rather than `load` followed by a conversion — each tensor is
+   dequantised, requantised and dropped, so the peak is one tensor and not the
+   model. The eager form is one line shorter and needs 47.6 GB.
 
-   `mlx_gguf_large` pins that as a test rather than a promise: the geometry of
-   both checkpoints is verified from the tensor directory, and the dense
-   footprint is asserted to *not* fit. If that assertion ever fails, the
-   limitation is stale and the test says so.
+   **Two things cannot be quantised at all**, and both were found by running:
 
-   What it would cost is measured, under [Order of work](#order-of-work):
-   requantising into MLX's own 4-bit scheme at a cosine of ~0.995 — and
-   **quantise from the original f16 checkpoint, not from the GGUF**, or the
-   error sits on top of Q4_K's own. `flux_schnell_gguf`'s tolerance would then
-   have to be re-derived from `xtask/golden/reference_precision.py`.
+   - Tensors that are **indexed rather than multiplied** — embedding tables,
+     the relative-attention bias, positional tables. `take` reads rows
+     directly and there is no kernel to fuse a dequantisation into.
+   - SD 3's **patch embedding**, a convolution kernel the forward reshapes
+     into a linear. It ships already flattened to 2-D, which is exactly the
+     shape that would otherwise be quantised.
 
-   **The pipeline layer is done**, `crates/stable-diffusion-rs/src/mlx/`:
+   `WeightSource::dense` refuses to reach past `linear` into a quantised
+   tensor, which is what caught both.
 
-   | pipeline | state |
-   |---|---|
-   | SD 1.5 / 2.x | txt2img, img2img, inpaint, verified end to end |
-   | SDXL | txt2img, img2img, verified at 1024 in 24 s |
-   | unCLIP | image variations, verified |
-   | SD 3.5 | written; **not** verified end to end — no T5-XXL safetensors here |
-   | Flux | written; **not** verified end to end — same reason |
+   **4-bit everywhere is not good enough**, measured on flux-mini as
+   whole-transformer cosine against the same weights dense:
 
-   Conditioning, all reachable and all verified: ControlNet (several stack,
-   scale 0 exactly zero), LoRA (errors rather than half-applying), IP-Adapter,
-   GLIGEN, AnimateDiff clips. SD 3.5 and Flux are in the same position their
-   candle counterparts are — neither has an end-to-end test on either side,
-   because both need weights this machine does not hold.
+   ```text
+     4-bit everywhere            0.9334   15.6 % of dense
+     8-bit everywhere            0.9993   28.1 %
+     sensitive layers dense      0.9924   39.0 %   worse than 8-bit
+     sensitive layers at 8       0.9919   19.1 %   <- the default
+   ```
 
-   Still only on the candle path, and all orchestration rather than models:
-   step caching, region/area prompts, two-pass hires, model placement, progress
+   A modulation layer emits the shift, scale and gate that *multiply* the
+   residual stream, so an error there is multiplied by everything downstream.
+   Keeping those dense recovers the accuracy and costs more than simply using
+   8 bits throughout — which is why the policy assigns a bit width rather than
+   a boolean.
+
+   **Both large models now run end to end**, `mlx_flux_end_to_end`:
+
+   | model | resident | dense f32 | result |
+   |---|---|---|---|
+   | Flux schnell + T5-XXL | **13.32 GB** | 66 GB | image, 18.7 s |
+   | SD 3.5 medium + T5-XXL | **10.07 GB** | ~40 GB | image |
+
+   T5-XXL's fp16 weights and `google/t5-v1_1-xxl`'s `spiece.model` are now on
+   the AI MODELS volume. `tests/golden/flux/t5-tokenizer.json` was already
+   there — an earlier note in this file claimed no T5 tokenizer existed, which
+   was wrong; it was found by searching for `spiece.model` and missing the
+   `.json`.
+
+   **SD 3.5 ships under two namings.** Stability's single-file release uses
+   the original `x_embedder`/`final_layer` names under a
+   `model.diffusion_model.` prefix; the `diffusers` directory renames them to
+   `pos_embed.proj`, `norm_out.linear` and so on. This port targets the former.
+
+   Still only on the candle path, all orchestration rather than models: step
+   caching, region/area prompts, two-pass hires, model placement, progress
    reporting and cancellation, textual inversion, upscaling.
 
 7. **Run both backends in parallel** until every golden test passes on MLX.
