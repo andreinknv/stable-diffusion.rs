@@ -1190,4 +1190,5 @@ pub fn unet_forward_adapters(
     )
 }
 pub mod qwen_image;
+pub mod wan;
 pub mod z_image;

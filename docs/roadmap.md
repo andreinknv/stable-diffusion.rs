@@ -621,9 +621,35 @@ In rough order of cost, cheapest first:
   vocabulary table. `model.embed_tokens.weight` is reached by `take`, one row
   per token, not by a matmul — quantising it is both wrong and the largest
   dequantisation in the model for no gain.
-- **The video models** are the largest by a wide margin: a temporal axis
-  through every block, a 3D VAE, and memory characteristics this machine has
-  not been asked for before.
+- **Wan's transformer is ported and verified**, `max_abs` 2.2e-6 against
+  `diffusers`, first try — the first model here with a frame axis. It is a
+  different shape from every image DiT in the crate:
+
+  **Cross-attention, not joint.** `attn1` is self-attention over the video
+  tokens with rotary positions; `attn2` attends to the text with none, and the
+  text is never updated. There is no second stream to modulate.
+
+  **The modulation is a learned table plus the timestep.** Each block carries a
+  `scale_shift_table` of `[1, 6, dim]` *added* to one six-way projection shared
+  by every block, where SD 3 and Qwen-Image project separately per block.
+
+  **QK-norm is across heads.** `norm_q` is `[dim]` — the whole width, applied
+  before the head split. Every other model here norms per head with a
+  `[head_dim]` weight, and at a glance the two are the same tensor.
+
+  **The rotary split is uneven**: height and width take `2 * (head_dim / 6)`
+  each and time takes the remainder, so at 128 it is `(44, 42, 42)`.
+
+  And the trap this project has now paid for twice: **patchify and unpatchify
+  are not inverses.** The input side feeds a convolution kernel stored
+  `(out, in, pt, ph, pw)` so a patch runs channel-first; `proj_out` emits
+  channel-last. The obvious round-trip assertion fails on correct code, and
+  "fixing" either end breaks a transformer verified to 2.2e-6. There is a test
+  saying so.
+
+  **What remains for video is the 3D VAE**, which is genuinely new machinery
+  rather than another transformer — a temporal axis through the encoder and
+  decoder, and memory characteristics this machine has not been asked for.
 
 **Kontext is done, structurally.** It was the one worth taking first for the
 reason given — it reuses the Flux transformer unmodified — and that turned out

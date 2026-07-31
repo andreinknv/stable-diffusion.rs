@@ -318,6 +318,82 @@ def dump_llm(output: pathlib.Path, model_id: str) -> None:
     print(f"wrote {out}/reference.safetensors ({len(tensors)} tensors) and llm.safetensors")
 
 
+def dump_wan(output: pathlib.Path, model_id: str) -> None:
+    """Wan's video transformer, at a size that fits in a fixture.
+
+    **The first video model here**, and the first with a frame axis running
+    through every block. Randomly initialised and small; the published Wan 2.1
+    is 5120 wide with 40 layers.
+
+    Wan is a *cross*-attention DiT, not a joint one: `attn1` is self-attention
+    over the video tokens with rotary positions, `attn2` attends to the text
+    with none. Its modulation comes from a learned per-block `scale_shift_table`
+    added to the timestep projection, rather than from a projection per block.
+    """
+    torch = _require("torch")
+    from diffusers import WanTransformer3DModel
+    from safetensors.torch import save_file
+
+    out = output / "wan"
+    out.mkdir(parents=True, exist_ok=True)
+
+    torch.manual_seed(SEED)
+    heads, head_dim, text_dim = 4, 32, 48
+    model = WanTransformer3DModel(
+        patch_size=(1, 2, 2),
+        num_attention_heads=heads,
+        attention_head_dim=head_dim,
+        in_channels=16,
+        out_channels=16,
+        text_dim=text_dim,
+        freq_dim=256,
+        ffn_dim=256,
+        num_layers=2,
+        rope_max_seq_len=64,
+    ).eval()
+    print(f"  dim={heads * head_dim} heads={heads} head_dim={head_dim} layers=2")
+
+    gen = torch.Generator().manual_seed(SEED)
+    frames, height, width = 2, 8, 6
+    latent = torch.randn(1, 16, frames, height, width, generator=gen)
+    text = torch.randn(1, 5, text_dim, generator=gen)
+    timestep = torch.tensor([700.0])
+
+    stages = {}
+
+    def grab(name):
+        def hook(_m, _i, o):
+            stages[name] = (o[0] if isinstance(o, tuple) else o).detach().contiguous().clone()
+
+        return hook
+
+    handles = [model.blocks[0].register_forward_hook(grab("after_block0"))]
+    with torch.no_grad():
+        cos, sin = model.rope(latent)
+        result = model(
+            hidden_states=latent,
+            timestep=timestep,
+            encoder_hidden_states=text,
+            return_dict=False,
+        )[0]
+    for h in handles:
+        h.remove()
+
+    tensors = {
+        "latent": latent.contiguous(),
+        "text": text.contiguous(),
+        "timestep": timestep.contiguous(),
+        "output": result.detach().contiguous().clone(),
+        "rope_cos": cos.detach().contiguous().clone(),
+        "rope_sin": sin.detach().contiguous().clone(),
+        **stages,
+    }
+    save_file(tensors, str(out / "reference.safetensors"))
+    weights = {k: v.detach().contiguous().clone() for k, v in model.state_dict().items()}
+    save_file(weights, str(out / "wan.safetensors"))
+    print(f"wrote {out}/reference.safetensors and wan.safetensors ({len(weights)} tensors)")
+
+
 def dump_qwen_image(output: pathlib.Path, model_id: str) -> None:
     """Qwen-Image's transformer, at a size that fits in a fixture.
 
@@ -2699,6 +2775,10 @@ def main() -> None:
     llm.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
     llm.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
 
+    wan = sub.add_parser("wan", help="dump Wan video transformer references")
+    wan.add_argument("--model-id", default="(random init)")
+    wan.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
+
     qwen = sub.add_parser("qwen_image", help="dump Qwen-Image transformer references")
     qwen.add_argument("--model-id", default="(random init)")
     qwen.add_argument("--output", type=pathlib.Path, default=pathlib.Path("tests/golden"))
@@ -2868,6 +2948,8 @@ def main() -> None:
         dump_t5(args.output, args.model_id)
     elif args.component == "llm":
         dump_llm(args.output, args.model_id)
+    elif args.component == "wan":
+        dump_wan(args.output, args.model_id)
     elif args.component == "qwen_image":
         dump_qwen_image(args.output, args.model_id)
     elif args.component == "z_image":
